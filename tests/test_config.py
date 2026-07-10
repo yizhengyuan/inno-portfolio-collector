@@ -243,7 +243,8 @@ class DomainModelTests(unittest.TestCase):
             (IngestResult, "valid rejected"),
             (
                 ProjectRunResult,
-                "project account discovered downloaded skipped failed status error",
+                "project account discovered downloaded skipped failed status error "
+                "last_sync",
             ),
             (
                 PipelineRunResult,

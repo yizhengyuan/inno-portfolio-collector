@@ -52,6 +52,7 @@ class ProjectRunResult:
     failed: int
     status: str
     error: str
+    last_sync: str = ""
 
 
 @dataclass(frozen=True, slots=True)

@@ -19,7 +19,15 @@ from .models import NormalizedArticle, ProjectRunResult, VaultApplyResult
 from .state import ManifestStore
 
 
-_UNSAFE_FILENAME = re.compile(r'[/\\:*?"<>|\[\]]')
+class AttachmentSyncError(RuntimeError):
+    pass
+
+
+class ManifestPathCollisionError(RuntimeError):
+    pass
+
+
+_UNSAFE_FILENAME = re.compile(r'[/\\:*?"<>|\[\]#^]')
 _SHA256_KEY = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 _PUBLISHED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _IMAGE_LINK = re.compile(r"(!\[[^\]\n]*\]\()([^\)\n]+)(\))")
@@ -70,12 +78,54 @@ def _safe_filename(value: str, fallback: str, limit: int = 96) -> str:
     return "".join(pieces).rstrip(". ") or fallback
 
 
-def _key_suffix(key: str) -> str:
+def _identity_digest(key: str) -> str:
     match = _SHA256_KEY.fullmatch(key)
     if match is not None:
-        key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-        return f"{match.group(1).lower()}-{key_digest}"
+        return match.group(1).lower()
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def _key_suffixes(keys: object) -> dict[str, str]:
+    ordered_keys = sorted(set(str(key) for key in keys))
+    digests = {key: _identity_digest(key) for key in ordered_keys}
+    groups: dict[str, list[str]] = {}
+    for key in ordered_keys:
+        groups.setdefault(digests[key][:8], []).append(key)
+
+    suffixes: dict[str, str] = {}
+    for group in groups.values():
+        if len(group) == 1:
+            suffixes[group[0]] = digests[group[0]][:8]
+            continue
+        for key in group:
+            digest = digests[key]
+            for length in range(9, len(digest) + 1):
+                if sum(
+                    digests[other].startswith(digest[:length])
+                    for other in group
+                ) == 1:
+                    suffixes[key] = digest[:length]
+                    break
+            else:
+                identical = [other for other in group if digests[other] == digest]
+                key_hashes = {
+                    other: hashlib.sha256(other.encode("utf-8")).hexdigest()
+                    for other in identical
+                }
+                for length in range(8, 65):
+                    if sum(
+                        value.startswith(key_hashes[key][:length])
+                        for value in key_hashes.values()
+                    ) == 1:
+                        suffixes[key] = f"{digest}-{key_hashes[key][:length]}"
+                        break
+                else:
+                    raise ValueError("unable to allocate unique key suffix")
+    return suffixes
+
+
+def _key_suffix(key: str) -> str:
+    return _key_suffixes([key])[key]
 
 
 def _safe_relative_path(value: object) -> PurePosixPath | None:
@@ -208,7 +258,8 @@ def _directory_snapshots_equal(first: Path, second: Path) -> bool:
 
 
 def _new_backup_path(parent: Path, asset_name: str) -> Path:
-    candidate = parent / f".{asset_name}.backup-{uuid.uuid4().hex}"
+    digest = hashlib.sha256(asset_name.encode("utf-8")).hexdigest()[:12]
+    candidate = parent / f".v.backup-{digest}-{uuid.uuid4().hex[:12]}"
     try:
         candidate.lstat()
     except FileNotFoundError:
@@ -407,8 +458,8 @@ def _redact_error(value: object) -> str:
 def _table(project_results: list[ProjectRunResult]) -> str:
     rows = [
         "| project | account | discovered | downloaded | skipped | failed | "
-        "status | error |",
-        "|---|---|---:|---:|---:|---:|---|---|",
+        "status | error | last_sync |",
+        "|---|---|---:|---:|---:|---:|---|---|---|",
     ]
     for result in project_results:
         rows.append(
@@ -423,6 +474,7 @@ def _table(project_results: list[ProjectRunResult]) -> str:
                     str(result.failed),
                     _plain_cell(result.status),
                     _plain_cell(_redact_error(result.error)),
+                    _plain_cell(result.last_sync),
                 )
             )
             + " |"
@@ -473,12 +525,15 @@ class VaultWriter:
             raise ValueError("unsafe vault path") from None
         return candidate
 
-    def _new_article_path(self, article: NormalizedArticle) -> PurePosixPath:
+    def _new_article_path(
+        self, article: NormalizedArticle, suffix: str | None = None
+    ) -> PurePosixPath:
         return self._new_record_path(
             article.key,
             article.project,
             article.title,
             article.published,
+            suffix,
         )
 
     def _new_record_path(
@@ -487,6 +542,7 @@ class VaultWriter:
         project_value: object,
         title_value: object,
         published_value: object,
+        suffix: str | None = None,
     ) -> PurePosixPath:
         project = _safe_filename(str(project_value), "未命名项目", 80)
         title = _safe_filename(str(title_value), "未命名文章", 96)
@@ -496,7 +552,7 @@ class VaultWriter:
             if _PUBLISHED_DATE.fullmatch(published_text)
             else "0000-00-00"
         )
-        filename = f"{published}-{title}-{_key_suffix(key)}.md"
+        filename = f"{published}-{title}-{suffix or _key_suffix(key)}.md"
         return PurePosixPath("03-文章", project, filename)
 
     def _path_collision_key(self, path: PurePosixPath) -> str:
@@ -507,12 +563,14 @@ class VaultWriter:
         key: str,
         record: dict[str, object],
         occupied: set[str],
+        suffix: str | None = None,
     ) -> PurePosixPath:
         candidate = self._new_record_path(
             key,
             record.get("project", ""),
             record.get("title", ""),
             record.get("published", ""),
+            suffix,
         )
         collision_key = self._path_collision_key(candidate)
         if collision_key not in occupied:
@@ -529,35 +587,52 @@ class VaultWriter:
                 return extended
         raise ValueError("unable to allocate unique article path")
 
-    def _resolve_manifest_path_collisions(self, store: ManifestStore) -> None:
+    def _resolve_manifest_path_collisions(
+        self,
+        store: ManifestStore,
+        suffixes: dict[str, str],
+        incoming_keys: set[str],
+    ) -> None:
         groups: dict[str, list[str]] = {}
         for key, record in store.data["articles"].items():
             path = _article_relative_path(record.get("path"))
             if path is not None:
                 groups.setdefault(self._path_collision_key(path), []).append(key)
+        collision_groups = [keys for keys in groups.values() if len(keys) > 1]
+        if any(not incoming_keys.intersection(keys) for keys in collision_groups):
+            raise ManifestPathCollisionError(
+                "manifest path collision requires refetch"
+            )
         occupied = {
             collision_key
             for collision_key, keys in groups.items()
             if len(keys) == 1
         }
-        for keys in groups.values():
-            if len(keys) < 2:
-                continue
-            for key in sorted(keys):
+        for keys in collision_groups:
+            incoming = incoming_keys.intersection(keys)
+            if len(incoming) < len(keys):
+                existing_path = _article_relative_path(
+                    store.data["articles"][keys[0]].get("path")
+                )
+                assert existing_path is not None
+                occupied.add(self._path_collision_key(existing_path))
+            for key in sorted(incoming):
                 record = store.data["articles"][key]
                 record["path"] = self._allocated_record_path(
-                    key, record, occupied
+                    key, record, occupied, suffixes.get(key)
                 ).as_posix()
 
-    def _attachment_root(self, article: NormalizedArticle) -> PurePosixPath:
+    def _attachment_root(
+        self, article: NormalizedArticle, suffix: str | None = None
+    ) -> PurePosixPath:
         project = _safe_filename(article.project, "未命名项目", 80)
         title = _safe_filename(article.title, "未命名文章", 80)
         return PurePosixPath(
-            "04-附件", project, f"{title}-{_key_suffix(article.key)}"
+            "04-附件", project, f"{title}-{suffix or _key_suffix(article.key)}"
         )
 
     def _copy_attachments(
-        self, article: NormalizedArticle
+        self, article: NormalizedArticle, suffix: str | None = None
     ) -> tuple[
         list[str],
         dict[str, PurePosixPath],
@@ -570,12 +645,12 @@ class VaultWriter:
         source_path = Path(source)
         try:
             if source_path.is_symlink() or not source_path.is_dir():
-                return [], {}, None, "附件源暂不可用，已保留上次快照"
+                return [], {}, None, "附件源暂不可用"
             source_root = source_path.resolve(strict=True)
         except (OSError, RuntimeError):
-            return [], {}, None, "附件源暂不可用，已保留上次快照"
+            return [], {}, None, "附件源暂不可用"
 
-        attachment_root = self._attachment_root(article)
+        attachment_root = self._attachment_root(article, suffix)
         final_directory = self._path(attachment_root)
         project_directory = self._path(attachment_root.parent)
         project_directory.mkdir(parents=True, exist_ok=True)
@@ -593,7 +668,13 @@ class VaultWriter:
         stage_directory: Path | None = Path(
             tempfile.mkdtemp(
                 dir=project_directory,
-                prefix=f".{attachment_root.name}.stage-",
+                prefix=(
+                    ".v.stage-"
+                    + hashlib.sha256(
+                        attachment_root.name.encode("utf-8")
+                    ).hexdigest()[:12]
+                    + "-"
+                ),
             )
         )
         backup_directory: Path | None = None
@@ -626,7 +707,7 @@ class VaultWriter:
                         resolved = candidate.resolve(strict=True)
                         resolved.relative_to(source_root)
                     except (OSError, RuntimeError):
-                        return [], {}, None, "附件文件不可读，已保留上次快照"
+                        return [], {}, None, "附件文件不可读"
                     except ValueError:
                         continue
                     if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(
@@ -642,13 +723,13 @@ class VaultWriter:
                     try:
                         _atomic_copy(resolved, stage_destination)
                     except OSError:
-                        return [], {}, None, "附件复制失败，已保留上次快照"
+                        return [], {}, None, "附件复制失败"
                     destination_text = destination_relative.as_posix()
                     copied.append(destination_text)
                     mapping[relative_posix.as_posix()] = destination_relative
 
             if walk_errors:
-                return [], {}, None, "附件目录不可读，已保留上次快照"
+                return [], {}, None, "附件目录不可读"
 
             if copied and final_exists and _directory_snapshots_equal(
                 stage_directory, final_directory
@@ -782,7 +863,11 @@ class VaultWriter:
             safe.append(relative.as_posix())
         return sorted(set(safe))
 
-    def _sanitize_manifest(self, store: ManifestStore) -> None:
+    def _sanitize_manifest(
+        self,
+        store: ManifestStore,
+        suffixes: dict[str, str],
+    ) -> None:
         cleaned_records: dict[str, dict[str, object]] = {}
         for key, record in store.data["articles"].items():
             path = _article_relative_path(record.get("path"))
@@ -792,6 +877,7 @@ class VaultWriter:
                     record.get("project", ""),
                     record.get("title", ""),
                     record.get("published", ""),
+                    suffixes.get(key),
                 )
 
             def text_field(name: str) -> str:
@@ -833,6 +919,7 @@ class VaultWriter:
                 result.skipped,
                 result.failed,
                 result.error,
+                result.last_sync,
             ),
         )
         records = store.data["articles"]
@@ -1017,7 +1104,11 @@ class VaultWriter:
         for relative in ("02-项目", "03-文章", "04-附件", "90-系统"):
             self._path(relative).mkdir(parents=True, exist_ok=True)
         store = ManifestStore(self._path("90-系统/manifest.json"))
-        self._resolve_manifest_path_collisions(store)
+        incoming_keys = {article.key for article in articles}
+        suffixes = _key_suffixes(
+            set(store.data["articles"]) | incoming_keys
+        )
+        self._resolve_manifest_path_collisions(store, suffixes, incoming_keys)
         created = updated = unchanged = 0
         seen: set[str] = set()
         stale_attachment_roots: set[PurePosixPath] = set()
@@ -1044,7 +1135,9 @@ class VaultWriter:
                         else _article_relative_path(existing.get("path"))
                     )
                     if relative is None:
-                        relative = self._new_article_path(article)
+                        relative = self._new_article_path(
+                            article, suffixes[article.key]
+                        )
                     destination = self._path(relative)
                     read_status = "unread"
                     if existing is not None and isinstance(
@@ -1059,16 +1152,21 @@ class VaultWriter:
                         attachment_mapping,
                         attachment_commit,
                         attachment_warning,
-                    ) = self._copy_attachments(article)
+                    ) = self._copy_attachments(article, suffixes[article.key])
                     if attachment_warning is not None:
                         attachments = (
                             []
                             if existing is None
                             else self._safe_attachments(existing.get("attachments"))
                         )
+                        if not attachments:
+                            raise AttachmentSyncError(
+                                "attachment sync failed without previous snapshot"
+                            )
                         attachment_mapping = self._attachment_mapping(attachments)
                         attachment_warnings.append(
-                            f"{article.project} / {article.title}：{attachment_warning}"
+                            f"{article.project} / {article.title}：{attachment_warning}，"
+                            "已保留已有附件快照"
                         )
                     elif article.source_image_dir is None and existing is not None:
                         attachments = self._safe_attachments(
@@ -1139,8 +1237,10 @@ class VaultWriter:
                     raise
                 committed_updates.append((article_commit, attachment_commit))
 
-            self._sanitize_manifest(store)
-            self._resolve_manifest_path_collisions(store)
+            self._sanitize_manifest(store, suffixes)
+            self._resolve_manifest_path_collisions(
+                store, suffixes, incoming_keys
+            )
             store.save()
         except BaseException:
             for article_commit, attachment_commit in reversed(committed_updates):
