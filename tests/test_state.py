@@ -18,6 +18,7 @@ class ManifestStoreTests(unittest.TestCase):
     def test_missing_manifest_starts_with_default_data(self) -> None:
         store = ManifestStore(self.path)
 
+        self.assertEqual(store.data, {"version": 1, "articles": {}})
         self.assertEqual(store.load(), {"version": 1, "articles": {}})
         self.assertIsNone(store.get("sha256:missing"))
 
@@ -26,6 +27,10 @@ class ManifestStoreTests(unittest.TestCase):
         article = {"title": "原始标题", "count": 1}
 
         store.upsert("sha256:key", article)
+        self.assertEqual(
+            store.data["articles"]["sha256:key"],
+            {"title": "原始标题", "count": 1},
+        )
         article["title"] = "mutated input"
         fetched = store.get("sha256:key")
         self.assertEqual(fetched, {"title": "原始标题", "count": 1})
@@ -36,9 +41,17 @@ class ManifestStoreTests(unittest.TestCase):
             store.get("sha256:key"), {"title": "原始标题", "count": 1}
         )
 
+        store.data["articles"]["sha256:public"] = {"title": "public data"}
+        self.assertEqual(store.get("sha256:public"), {"title": "public data"})
+
     def test_save_reload_preserves_unicode_and_is_idempotent(self) -> None:
         store = ManifestStore(self.path)
-        store.upsert("sha256:key", {"title": "中文标题", "status": "已采集"})
+        store.data = {
+            "version": 1,
+            "articles": {
+                "sha256:key": {"title": "中文标题", "status": "已采集"}
+            },
+        }
 
         store.save()
         first_bytes = self.path.read_bytes()
@@ -82,6 +95,17 @@ class ManifestStoreTests(unittest.TestCase):
                     ValueError, "^unsupported manifest format$"
                 ):
                     ManifestStore(self.path)
+
+    def test_malformed_json_raises_stable_manifest_error(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text('{"version": 1,', encoding="utf-8")
+
+        with self.assertRaises(ValueError) as raised:
+            ManifestStore(self.path)
+
+        self.assertIs(type(raised.exception), ValueError)
+        self.assertEqual(str(raised.exception), "unsupported manifest format")
+        self.assertTrue(raised.exception.__suppress_context__)
 
 
 if __name__ == "__main__":

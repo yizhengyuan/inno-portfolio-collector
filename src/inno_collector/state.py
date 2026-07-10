@@ -9,15 +9,17 @@ from typing import Any
 class ManifestStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
-        self._data: dict[str, Any] = {}
-        self.load()
+        self.data = self.load()
 
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
             data: object = {"version": 1, "articles": {}}
         else:
-            with self.path.open(encoding="utf-8") as handle:
-                data = json.load(handle)
+            try:
+                with self.path.open(encoding="utf-8") as handle:
+                    data = json.load(handle)
+            except json.JSONDecodeError:
+                raise ValueError("unsupported manifest format") from None
 
         if (
             not isinstance(data, dict)
@@ -26,22 +28,21 @@ class ManifestStore:
         ):
             raise ValueError("unsupported manifest format")
 
-        self._data = data
-        return self._data
+        return data
 
     def get(self, key: str) -> dict[str, Any] | None:
-        article = self._data["articles"].get(key)
+        article = self.data["articles"].get(key)
         return None if article is None else dict(article)
 
     def upsert(self, key: str, article: dict[str, Any]) -> None:
-        self._data["articles"][key] = dict(article)
+        self.data["articles"][key] = dict(article)
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_suffix(self.path.suffix + ".tmp")
         with temporary.open("w", encoding="utf-8") as handle:
             json.dump(
-                self._data,
+                self.data,
                 handle,
                 ensure_ascii=False,
                 indent=2,

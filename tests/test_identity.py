@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import unittest
+from datetime import date
+from typing import get_type_hints
 
 from inno_collector.identity import (
     _published_date,
@@ -68,6 +70,9 @@ class CanonicalUrlTests(unittest.TestCase):
 
 
 class SelectSinceTests(unittest.TestCase):
+    def test_published_date_stringifies_date_values(self) -> None:
+        self.assertEqual(_published_date(date(2025, 1, 2)), date(2025, 1, 2))
+
     def test_published_date_accepts_iso_datetime_and_date_prefix(self) -> None:
         self.assertEqual(str(_published_date("2025-03-04T12:30:00Z")), "2025-03-04")
         self.assertEqual(str(_published_date("2025-03-04 extra")), "2025-03-04")
@@ -145,6 +150,23 @@ class SelectSinceTests(unittest.TestCase):
         self.assertEqual(
             [row["id"] for row in select_since(rows, "2025-01-01")],
             ["1", "10", "2"],
+        )
+
+    def test_stringifies_url_values_and_exposes_list_of_dict_contract(self) -> None:
+        class ArticleUrl:
+            def __str__(self) -> str:
+                return "https://mp.weixin.qq.com/s/stringifiable"
+
+        row = {
+            "id": 1,
+            "publish_time": "2025-02-01",
+            "url": ArticleUrl(),
+        }
+
+        self.assertEqual(select_since([row], "2025-01-01"), [row])
+        self.assertEqual(
+            get_type_hints(select_since),
+            {"rows": list[dict], "since": str, "return": list[dict]},
         )
 
 

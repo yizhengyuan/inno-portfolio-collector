@@ -1,9 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Iterable, Mapping
 from datetime import date, datetime
-from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -40,9 +38,7 @@ def article_key(value: str) -> str:
 
 
 def _published_date(value: object) -> date | None:
-    if not isinstance(value, str):
-        return None
-    text = value.strip()
+    text = str(value or "").strip()
     if not text:
         return None
 
@@ -55,16 +51,14 @@ def _published_date(value: object) -> date | None:
             return None
 
 
-def select_since(
-    rows: Iterable[Mapping[str, Any]], since: str
-) -> list[Mapping[str, Any]]:
+def select_since(rows: list[dict], since: str) -> list[dict]:
     cutoff = date.fromisoformat(since)
-    selected: list[Mapping[str, Any]] = []
+    selected: list[dict] = []
     seen: set[str] = set()
 
     for row in rows:
         published = _published_date(row.get("publish_time"))
-        url = row.get("url")
+        url = str(row.get("url") or "")
         if published is None or published < cutoff or not url:
             continue
 
