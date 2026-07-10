@@ -7,9 +7,11 @@ import json
 import shutil
 import tempfile
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
+from unittest.mock import Mock, patch
 
+from inno_collector import ingest as ingest_module
 from inno_collector.identity import article_key
 from inno_collector.ingest import ingest_account_output, yaml_string
 from inno_collector.models import ProjectAccount
@@ -63,6 +65,62 @@ class IngestAccountOutputTests(unittest.TestCase):
         }
         row.update(updates)
         return row
+
+    def assert_format_error(self, expected: str) -> Exception:
+        with self.assertRaises(ValueError) as raised:
+            ingest_account_output(self.project, self.root)
+        self.assertEqual(type(raised.exception).__name__, "IngestFormatError")
+        self.assertEqual(str(raised.exception), expected)
+        self.assertIsNone(raised.exception.__cause__)
+        return raised.exception
+
+    def test_missing_or_non_file_index_has_stable_format_error(self) -> None:
+        self.assertTrue(hasattr(ingest_module, "IngestFormatError"))
+        self.assert_format_error("missing exporter index")
+
+        (self.root / "index.csv").mkdir()
+        self.assert_format_error("missing exporter index")
+
+    def test_rejects_all_structurally_invalid_exporter_indexes(self) -> None:
+        header = ",".join(FIELDS)
+        values = ",".join(self.row()[field] for field in FIELDS)
+        malformed_indexes = {
+            "empty": b"",
+            "header only": header.encode("utf-8"),
+            "no header": values.encode("utf-8"),
+            "missing required header": (
+                "title,publish_time,source_url,markdown_path,image_dir\n"
+                + ",".join(self.row()[field] for field in FIELDS[:-1])
+            ).encode("utf-8"),
+            "duplicate required header": (
+                "title,publish_time,source_url,markdown_path,title,status\n" + values
+            ).encode("utf-8"),
+            "duplicate header row as data": f"{header}\n{header}\n".encode("utf-8"),
+            "surplus unnamed cell": f"{header}\n{values},extra\n".encode("utf-8"),
+            "short row": f"{header}\n{','.join(values.split(',')[:-1])}\n".encode(
+                "utf-8"
+            ),
+            "non utf8": b"\xff\xfe\x80",
+            "malformed csv": f'{header}\n"unterminated'.encode("utf-8"),
+        }
+
+        for name, payload in malformed_indexes.items():
+            with self.subTest(name=name):
+                (self.root / "index.csv").write_bytes(payload)
+                self.assert_format_error("invalid exporter index")
+
+    def test_allows_extra_named_exporter_columns(self) -> None:
+        self.write_article()
+        header = ",".join((*FIELDS, "exporter_id"))
+        values = ",".join((*[self.row()[field] for field in FIELDS], "42"))
+        (self.root / "index.csv").write_text(
+            f"{header}\n{values}\n", encoding="utf-8"
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(len(result.valid), 1)
+        self.assertEqual(result.rejected, ())
 
     def test_ingests_exporter_fixture_into_task2_model(self) -> None:
         shutil.copy(FIXTURES / "exporter-article.md", self.root)
@@ -128,15 +186,26 @@ class IngestAccountOutputTests(unittest.TestCase):
 
     def test_unsafe_or_unavailable_image_directories_do_not_reject_articles(self) -> None:
         self.write_article()
-        not_a_directory = self.root / "image-file"
+        images_root = self.root / "images"
+        images_root.mkdir()
+        not_a_directory = images_root / "image-file"
         not_a_directory.write_bytes(b"image")
-        existing_directory = self.root / "absolute-images"
-        existing_directory.mkdir()
+        articles_directory = self.root / "articles"
+        articles_directory.mkdir()
+        (images_root / "articles-link").symlink_to(
+            articles_directory, target_is_directory=True
+        )
+        (images_root / "root-link").symlink_to(self.root, target_is_directory=True)
         image_dirs = (
+            ".",
+            "images/..",
+            "images/.",
+            "images/articles-link",
+            "images/root-link",
             "../outside-images",
-            "missing-images",
-            "image-file",
-            str(existing_directory),
+            "images/missing-images",
+            "images/image-file",
+            str(images_root),
             "C:\\outside\\images",
         )
         self.write_index(
@@ -322,6 +391,20 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertEqual(result.valid, ())
         self.assertEqual(result.rejected[0].reason, "invalid_body")
 
+    def test_long_qr_image_url_does_not_turn_login_prompt_into_content(self) -> None:
+        qr_url = "https://example.com/qr?payload=" + "a" * 2000
+        body = f"请登录后继续\n\n![二维码]({qr_url})"
+        self.assertGreater(
+            sum(not character.isspace() for character in body), 80
+        )
+        self.write_article(body=body)
+        self.write_index([self.row(title="二维码登录提示")])
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.valid, ())
+        self.assertEqual(result.rejected[0].reason, "invalid_body")
+
     def test_rejects_known_download_error_templates(self) -> None:
         markers = (
             "下载失败",
@@ -357,6 +440,24 @@ class IngestAccountOutputTests(unittest.TestCase):
             [article.reason for article in result.rejected],
             ["invalid_body"] * len(markers),
         )
+
+    def test_long_governance_article_may_quote_error_marker_once(self) -> None:
+        body = (
+            "# 内容治理机制研究\n\n"
+            + "本文分析平台治理政策、审核流程、申诉机制和透明度建设。" * 35
+            + "研究样本中曾出现提示语“此内容因违规无法查看”，本文仅作引用。"
+            + "后续章节继续讨论规则解释、用户权益和治理效果评估。" * 35
+        )
+        self.assertGreater(
+            sum(not character.isspace() for character in body), 1400
+        )
+        self.write_article(body=body)
+        self.write_index([self.row(title="内容治理机制研究")])
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(len(result.valid), 1)
+        self.assertEqual(result.rejected, ())
 
     def test_rejected_urls_never_retain_credentials_query_or_fragment(self) -> None:
         self.write_article()
@@ -427,6 +528,34 @@ class IngestAccountOutputTests(unittest.TestCase):
         result = ingest_account_output(self.project, self.root)
 
         self.assertEqual([article.title for article in result.valid], ["带 BOM 的索引"])
+
+    def test_all_valid_articles_share_one_batch_collected_at(self) -> None:
+        self.write_article()
+        self.write_index(
+            [
+                self.row(title="第一篇"),
+                self.row(
+                    title="第二篇",
+                    source_url="https://mp.weixin.qq.com/s/second-article",
+                ),
+            ]
+        )
+        fake_datetime = Mock()
+        fake_datetime.fromisoformat.side_effect = datetime.fromisoformat
+        fake_datetime.now.side_effect = (
+            datetime(2026, 7, 11, 1, 2, 3, tzinfo=timezone.utc),
+            datetime(2026, 7, 11, 1, 2, 4, tzinfo=timezone.utc),
+        )
+
+        with patch("inno_collector.ingest.datetime", fake_datetime):
+            result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(len(result.valid), 2)
+        self.assertEqual(
+            {article.collected_at for article in result.valid},
+            {"2026-07-11T09:02:03+08:00"},
+        )
+        fake_datetime.now.assert_called_once_with()
 
 
 class YamlStringTests(unittest.TestCase):
