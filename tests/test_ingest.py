@@ -571,17 +571,21 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertEqual(len(result.valid), 1)
         self.assertEqual(result.rejected, ())
 
-    def test_medium_governance_articles_may_quote_early_error_marker(self) -> None:
+    def test_medium_governance_articles_recognize_quoted_marker_spans(self) -> None:
         marker = "此内容因违规无法查看"
-        quote_styles = (
-            ("中文双引号", "“", "”"),
-            ("ASCII双引号", '"', '"'),
+        cases = (
+            ("中文引用", f"“平台页面显示：{marker}，请稍后再试”", True),
+            ("ASCII引用", f'" {marker} "', True),
+            ("未闭合引用", f"“平台页面显示：{marker}，请稍后再试", False),
+            ("未加引号", marker, False),
         )
         rows: list[dict[str, str]] = []
-        for index, (title, opening, closing) in enumerate(quote_styles, start=1):
+        expected_valid: list[str] = []
+        expected_rejected: list[str] = []
+        for index, (title, marker_context, is_valid) in enumerate(cases, start=1):
             body = (
                 "# 内容治理案例\n\n"
-                f"本文开头引用平台提示语{opening}{marker}{closing}，仅用于研究说明。"
+                f"本文开头引用平台提示语{marker_context}，仅用于研究说明。"
                 + "文章随后完整讨论审核标准、申诉流程、治理透明度和用户权益保障。"
                 * 10
             )
@@ -601,14 +605,21 @@ class IngestAccountOutputTests(unittest.TestCase):
                     markdown_path=filename,
                 )
             )
+            if is_valid:
+                expected_valid.append(title)
+            else:
+                expected_rejected.append(title)
         self.write_index(rows)
 
         result = ingest_account_output(self.project, self.root)
 
-        self.assertEqual(result.rejected, ())
         self.assertEqual(
             [article.title for article in result.valid],
-            ["中文双引号", "ASCII双引号"],
+            expected_valid,
+        )
+        self.assertEqual(
+            [(article.title, article.reason) for article in result.rejected],
+            [(title, "invalid_body") for title in expected_rejected],
         )
 
     def test_rejected_urls_never_retain_credentials_query_or_fragment(self) -> None:

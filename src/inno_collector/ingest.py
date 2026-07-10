@@ -29,12 +29,6 @@ _MIN_BODY_CHARACTERS = 80
 _PROMPT_COVERAGE_THRESHOLD = 0.25
 _DOWNLOAD_ERROR_MAX_LENGTH = 800
 _DOWNLOAD_ERROR_MAX_PREFIX = 80
-_ERROR_MARKER_QUOTE_PAIRS = (
-    ("“", "”"),
-    ("‘", "’"),
-    ('"', '"'),
-    ("'", "'"),
-)
 _LOGIN_PROMPTS = (
     "扫码登录",
     "请登录",
@@ -70,6 +64,12 @@ _BARE_URL_RE = re.compile(
     r"https?://[^\s<>\]\)。，！？；：“”‘’]+", re.IGNORECASE
 )
 _MARKDOWN_MARKER_RE = re.compile(r"[`*_~#>|]+")
+_QUOTED_SPAN_PATTERNS = (
+    re.compile(r"“[^”\n]*”"),
+    re.compile(r"‘[^’\n]*’"),
+    re.compile(r'"[^"\n]*"'),
+    re.compile(r"'[^'\n]*'"),
+)
 
 
 def yaml_string(value: object) -> str:
@@ -359,10 +359,16 @@ def _is_download_error(visible: str) -> bool:
 
 def _without_quoted_error_markers(value: str) -> str:
     unquoted = value
-    for marker in _DOWNLOAD_ERROR_TEMPLATES:
-        for opening, closing in _ERROR_MARKER_QUOTE_PAIRS:
-            unquoted = unquoted.replace(f"{opening}{marker}{closing}", "")
+    for pattern in _QUOTED_SPAN_PATTERNS:
+        unquoted = pattern.sub(_remove_error_quote, unquoted)
     return unquoted
+
+
+def _remove_error_quote(match: re.Match[str]) -> str:
+    quoted = match.group(0)
+    if any(marker in quoted for marker in _DOWNLOAD_ERROR_TEMPLATES):
+        return ""
+    return quoted
 
 
 def _invalid_body(body: str) -> bool:
