@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import subprocess
 import sys
 import tempfile
@@ -9,30 +8,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TextIO
 
+from .diagnostics import MAX_DIAGNOSTIC_LENGTH, sanitize_diagnostic
 from .models import ProjectAccount
 
 
 Runner = Callable[[list[str]], tuple[int, str, str]]
-MAX_DIAGNOSTIC_LENGTH = 4096
 EXPORTER_TIMEOUT_SECONDS = 300
 SPOOL_MAX_MEMORY_BYTES = 1 << 20
 MAX_STDOUT_BYTES = 64 << 20
 MAX_STDERR_BYTES = 1 << 20
-SECRET_RE = re.compile(
-    r"(?i)(auth-key|pass_ticket|appmsg_token|token|ticket|uin)=([^&\s\"']+)"
-)
-DELIMITED_SECRET_RE = re.compile(
-    r"(?i)(?<![\w-])((?:\"|')?(?:auth-key|pass_ticket|appmsg_token|token|ticket|uin)"
-    r"(?:\"|')?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^&\s,\"']+)"
-)
-AUTHORIZATION_RE = re.compile(
-    r"(?i)(?<![\w-])((?:\"|')?authorization(?:\"|')?\s*[:=]\s*"
-    r"(?:\"|')?bearer\s+(?:\"|')?)[^\s,}\"']+"
-)
-CLI_SECRET_RE = re.compile(
-    r"(?i)(--(?:auth-key|pass_ticket|appmsg_token|token|ticket|uin)\s+)"
-    r"(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
-)
 
 
 class ExporterCommandError(RuntimeError):
@@ -76,11 +60,7 @@ def _default_runner(command: list[str]) -> tuple[int, str, str]:
 
 
 def _sanitize(message: str) -> str:
-    sanitized = DELIMITED_SECRET_RE.sub(r"\1[REDACTED]", message)
-    sanitized = AUTHORIZATION_RE.sub(r"\1[REDACTED]", sanitized)
-    sanitized = CLI_SECRET_RE.sub(r"\1[REDACTED]", sanitized)
-    sanitized = SECRET_RE.sub(r"\1=[REDACTED]", sanitized)
-    return sanitized[:MAX_DIAGNOSTIC_LENGTH]
+    return sanitize_diagnostic(message)
 
 
 def _object_list(payload: dict, field: str) -> list[dict]:

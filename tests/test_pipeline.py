@@ -83,6 +83,7 @@ class FakeBackend:
         self.fail_sync_ids: set[int] = set()
         self.sync_errors: dict[int, str] = {}
         self.download_errors: dict[int, str] = {}
+        self.accounts_error: str = ""
         self.auth_payload: object = {"ok": True, "status": "valid"}
 
     def auth_check(self) -> object:
@@ -91,6 +92,8 @@ class FakeBackend:
 
     def accounts(self) -> list[dict]:
         self.calls.append(("accounts",))
+        if self.accounts_error:
+            raise RuntimeError(self.accounts_error)
         return [
             {"id": index, "nickname": project.account, "alias": project.wechat_id}
             for index, project in enumerate(self.projects, start=1)
@@ -252,6 +255,33 @@ class CollectionPipelineTests(unittest.TestCase):
                 self.assertEqual(vault.calls, [])
                 self.assertEqual(backend.calls, [("auth_check",)])
 
+    def test_accounts_retries_only_transient_failures_before_any_artifact(self) -> None:
+        cases = (("HTTP 503 temporary unavailable", 3, [1.0, 3.0]), ("403 forbidden", 1, []))
+        for message, expected_calls, expected_delays in cases:
+            with self.subTest(message=message), tempfile.TemporaryDirectory() as temp_dir:
+                project = self.project(1)
+                backend = FakeBackend([project])
+                backend.accounts_error = message
+                delays: list[float] = []
+                runtime = Path(temp_dir) / "runtime"
+                pipeline = CollectionPipeline(
+                    backend,
+                    runtime_dir=runtime,
+                    vault_writer=RecordingVault(),
+                    now=lambda: NOW,
+                    sleep=delays.append,
+                )
+
+                with self.assertRaises(PipelineConfigurationError):
+                    pipeline.run([project], since="2026-01-01")
+
+                self.assertEqual(
+                    sum(call[0] == "accounts" for call in backend.calls),
+                    expected_calls,
+                )
+                self.assertEqual(delays, expected_delays)
+                self.assertFalse(runtime.exists())
+
     def test_since_must_be_an_exact_iso_date_before_any_backend_call(self) -> None:
         projects = [self.project(1)]
         backend = FakeBackend(projects)
@@ -374,7 +404,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].status, "partial")
         self.assertEqual(
             result.projects[0].error,
-            "article catalog contained 3 invalid or duplicate ids",
+            "catalog: 3 invalid or duplicate ids",
         )
 
     def test_empty_or_non_numeric_ids_never_trigger_download(self) -> None:
@@ -456,8 +486,8 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].failed, 2)
         self.assertEqual(
             result.projects[0].error,
-            "ingest rejected 1 requested article; "
-            "download output omitted 1 requested article",
+            "ingest: rejected 1 requested article; "
+            "ingest: output omitted 1 requested article",
         )
 
     def test_pipeline_rejects_non_strict_existing_manifest_before_writes(self) -> None:
@@ -475,7 +505,8 @@ class CollectionPipelineTests(unittest.TestCase):
             pipeline = self.build_pipeline(backend, runtime, vault)
 
             with self.assertRaisesRegex(
-                PipelineConfigurationError, "^existing manifest is invalid$"
+                PipelineConfigurationError,
+                "^catalog: existing manifest is invalid$",
             ):
                 pipeline.run([project], since="2026-01-01")
 
@@ -510,7 +541,10 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].status, "failed")
         self.assertEqual(result.article_count, 0)
         self.assertEqual(vault.calls[0][0], [])
-        self.assertEqual(result.projects[0].error, "exporter returned unsafe output directory")
+        self.assertEqual(
+            result.projects[0].error,
+            "download: exporter returned unsafe output directory",
+        )
 
     def test_malformed_download_payload_is_rejected_even_with_safe_path(self) -> None:
         project = self.project(1)
@@ -529,7 +563,10 @@ class CollectionPipelineTests(unittest.TestCase):
             result = pipeline.run([project], since="2026-01-01")
 
         self.assertEqual(result.projects[0].status, "failed")
-        self.assertEqual(result.projects[0].error, "exporter returned invalid download response")
+        self.assertEqual(
+            result.projects[0].error,
+            "download: exporter returned invalid download response",
+        )
 
     def test_ten_project_results_preserve_configuration_order(self) -> None:
         projects = [self.project(index) for index in range(1, 11)]
@@ -616,6 +653,217 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(len(vault.calls[0][0]), 2)
         self.assertEqual(vault.calls[-1][0], [])
 
+    def test_exporter_failed_key_cannot_be_forged_as_success_in_index(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        row = backend.rows[1][0]
+        vault = RecordingVault()
+
+        def partial_download(article_ids: list[int], output_root: Path) -> dict:
+            backend.calls.append(("download", tuple(article_ids), output_root))
+            output = output_root / "account"
+            output.mkdir()
+            return {
+                "ok": False,
+                "output_dir": str(output),
+                "index": str(output / "index.csv"),
+                "selected_count": 1,
+                "success_count": 0,
+                "failure_count": 1,
+                "skipped_count": 0,
+                "skipped": [],
+                "failed": [{"source_url": row["url"]}],
+            }
+
+        backend.download = partial_download  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = CollectionPipeline(
+                backend,
+                runtime_dir=Path(temp_dir) / "runtime",
+                vault_writer=vault,
+                ingest=lambda _project, _root: IngestResult(
+                    valid=(normalized(project, "slug-1"),), rejected=()
+                ),
+                now=lambda: NOW,
+                sleep=lambda _seconds: None,
+            ).run([project], since="2026-01-01")
+
+        self.assertEqual(result.projects[0].downloaded, 0)
+        self.assertEqual(result.projects[0].failed, 1)
+        self.assertEqual(result.projects[0].status, "failed")
+        self.assertEqual([len(call[0]) for call in vault.calls], [0])
+
+    def test_exporter_failed_and_skipped_keys_are_both_excluded_from_ingest(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [article_row(10, "failed"), article_row(11, "skipped")]
+        vault = RecordingVault()
+
+        def partial_download(article_ids: list[int], output_root: Path) -> dict:
+            backend.calls.append(("download", tuple(article_ids), output_root))
+            output = output_root / "account"
+            output.mkdir()
+            return {
+                "ok": False,
+                "output_dir": str(output),
+                "index": str(output / "index.csv"),
+                "selected_count": 2,
+                "success_count": 0,
+                "failure_count": 1,
+                "skipped_count": 1,
+                "failed": [
+                    {"source_url": "https://mp.weixin.qq.com/s/failed"}
+                ],
+                "skipped": [
+                    {
+                        "article_id": 11,
+                        "source_url": "https://mp.weixin.qq.com/s/skipped",
+                    }
+                ],
+            }
+
+        backend.download = partial_download  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = CollectionPipeline(
+                backend,
+                runtime_dir=Path(temp_dir) / "runtime",
+                vault_writer=vault,
+                ingest=lambda _project, _root: IngestResult(
+                    valid=(
+                        normalized(project, "failed"),
+                        normalized(project, "skipped"),
+                    ),
+                    rejected=(),
+                ),
+                now=lambda: NOW,
+                sleep=lambda _seconds: None,
+            ).run([project], since="2026-01-01")
+
+        self.assertEqual(result.projects[0].downloaded, 0)
+        self.assertEqual(result.projects[0].failed, 1)
+        self.assertEqual(result.projects[0].skipped, 1)
+        self.assertEqual([len(call[0]) for call in vault.calls], [0])
+
+    def test_partial_payload_rejects_unknown_duplicate_or_mismatched_entries(self) -> None:
+        cases = (
+            (
+                "unknown",
+                [{"source_url": "https://mp.weixin.qq.com/s/unknown"}],
+                [],
+            ),
+            (
+                "duplicate",
+                [
+                    {"source_url": "https://mp.weixin.qq.com/s/one"},
+                    {"source_url": "https://mp.weixin.qq.com/s/one"},
+                ],
+                [],
+            ),
+            (
+                "mismatch",
+                [
+                    {
+                        "article_id": 10,
+                        "source_url": "https://mp.weixin.qq.com/s/two",
+                    }
+                ],
+                [],
+            ),
+            (
+                "unknown-skipped",
+                [{"source_url": "https://mp.weixin.qq.com/s/one"}],
+                [{"source_url": "https://mp.weixin.qq.com/s/unknown"}],
+            ),
+        )
+        for name, failed_rows, skipped_rows in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                project = self.project(1)
+                backend = FakeBackend([project])
+                backend.rows[1] = [article_row(10, "one"), article_row(11, "two")]
+                vault = RecordingVault()
+
+                def malformed_download(
+                    article_ids: list[int], output_root: Path
+                ) -> dict:
+                    backend.calls.append(("download", tuple(article_ids), output_root))
+                    output = output_root / "account"
+                    output.mkdir()
+                    failure_count = len(failed_rows)
+                    skipped_count = len(skipped_rows)
+                    return {
+                        "ok": False,
+                        "output_dir": str(output),
+                        "index": str(output / "index.csv"),
+                        "selected_count": 2,
+                        "success_count": 2 - failure_count - skipped_count,
+                        "failure_count": failure_count,
+                        "skipped_count": skipped_count,
+                        "skipped": skipped_rows,
+                        "failed": failed_rows,
+                    }
+
+                backend.download = malformed_download  # type: ignore[method-assign]
+                result = CollectionPipeline(
+                    backend,
+                    runtime_dir=Path(temp_dir) / "runtime",
+                    vault_writer=vault,
+                    ingest=lambda _project, _root: IngestResult(
+                        valid=(normalized(project, "one"),), rejected=()
+                    ),
+                    now=lambda: NOW,
+                    sleep=lambda _seconds: None,
+                ).run([project], since="2026-01-01")
+
+                self.assertEqual(result.projects[0].downloaded, 0)
+                self.assertEqual(result.projects[0].status, "failed")
+                self.assertTrue(result.projects[0].error.startswith("download:"))
+                self.assertEqual([len(call[0]) for call in vault.calls], [0])
+
+    def test_ingest_and_state_exceptions_include_stable_stage_names(self) -> None:
+        for stage in ("ingest", "state"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as temp_dir:
+                project = self.project(1)
+                backend = FakeBackend([project])
+                vault = RecordingVault()
+                ingest = (
+                    (lambda _project, _root: (_ for _ in ()).throw(
+                        RuntimeError("temporary failure token=stage-secret")
+                    ))
+                    if stage == "ingest"
+                    else (
+                        lambda _project, _root: IngestResult(
+                            valid=(normalized(project, "slug-1"),),
+                            rejected=(),
+                        )
+                    )
+                )
+                pipeline = CollectionPipeline(
+                    backend,
+                    runtime_dir=Path(temp_dir) / "runtime",
+                    vault_writer=vault,
+                    ingest=ingest,
+                    now=lambda: NOW,
+                    sleep=lambda _seconds: None,
+                )
+                save_patch = (
+                    patch(
+                        "inno_collector.pipeline.CatalogStateStore.save",
+                        side_effect=OSError("state /Users/yzy/private token=state-secret"),
+                    )
+                    if stage == "state"
+                    else patch("inno_collector.pipeline.CatalogStateStore.save", autospec=True)
+                )
+                if stage == "ingest":
+                    result = pipeline.run([project], since="2026-01-01")
+                else:
+                    with save_patch:
+                        result = pipeline.run([project], since="2026-01-01")
+
+                self.assertTrue(result.projects[0].error.startswith(f"{stage}:"))
+                self.assertNotIn("stage-secret", result.projects[0].error)
+                self.assertNotIn("state-secret", result.projects[0].error)
+                self.assertNotIn("/Users/", result.projects[0].error)
+
     def test_vault_failure_is_isolated_and_does_not_advance_catalog_state(self) -> None:
         projects = [self.project(1), self.project(2)]
         backend = FakeBackend(projects)
@@ -637,6 +885,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual([item.downloaded for item in result.projects], [0, 1])
         self.assertGreaterEqual(result.projects[0].failed, 1)
         self.assertNotIn("vault-secret", result.projects[0].error)
+        self.assertTrue(result.projects[0].error.startswith("vault:"))
         self.assertEqual([len(call[0]) for call in vault.calls], [1, 1, 0])
 
     def test_cleanup_failure_is_local_redacted_and_preserves_successful_vault_write(self) -> None:
@@ -679,7 +928,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual([item.downloaded for item in result.projects], [1, 1])
         self.assertNotIn("cleanup-secret", result.projects[0].error)
         self.assertNotIn("/Users/", result.projects[0].error)
-        self.assertIn("cleanup", result.projects[0].error)
+        self.assertIn("cleanup:", result.projects[0].error)
         self.assertEqual([len(call[0]) for call in vault.calls], [1, 1, 0])
 
     def test_final_report_failure_raises_stable_delivery_error(self) -> None:
@@ -692,7 +941,7 @@ class CollectionPipelineTests(unittest.TestCase):
 
             with self.assertRaisesRegex(
                 PipelineDeliveryError,
-                "^failed to rebuild collection report$",
+                "^report: failed to rebuild collection report$",
             ):
                 pipeline.run([project], since="2026-01-01")
 
@@ -739,6 +988,7 @@ class CollectionPipelineTests(unittest.TestCase):
                 sync_calls = [call for call in backend.calls if call[0] == "sync"]
                 self.assertEqual(len(sync_calls), expected_calls)
                 self.assertEqual(result.projects[0].last_sync, "")
+                self.assertTrue(result.projects[0].error.startswith("sync:"))
 
     def test_sync_payload_must_be_successful_and_is_not_retried(self) -> None:
         project = self.project(1)
@@ -781,6 +1031,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(names[:5], ["auth_check", "accounts", "resolve_exact", "resolve_exact", "resolve_exact"])
         self.assertEqual([item.status for item in result.projects], ["success", "failed", "success"])
         self.assertEqual(result.projects[1].last_sync, "")
+        self.assertTrue(result.projects[1].error.startswith("resolve:"))
 
     def test_catalog_fingerprint_skips_silent_rows_but_refetches_metadata_changes(self) -> None:
         project = self.project(1)
@@ -1082,7 +1333,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].downloaded, 1)
         self.assertEqual(result.projects[0].failed, 2)
         self.assertEqual(result.projects[0].status, "partial")
-        self.assertIn("2 invalid or missing urls", result.projects[0].error)
+        self.assertIn("catalog: 2 invalid or missing urls", result.projects[0].error)
 
     def test_catalog_failures_and_batch_exception_are_counted_additively(self) -> None:
         project = self.project(1)
@@ -1171,12 +1422,15 @@ class CollectionPipelineTests(unittest.TestCase):
                 if bad_level in {"runtime", "staging"}:
                     with self.assertRaisesRegex(
                         PipelineConfigurationError,
-                        "^unsafe runtime staging directory$",
+                        "^staging: unsafe runtime staging directory$",
                     ):
                         pipeline.run([project], since="2026-01-01")
                 else:
                     result = pipeline.run([project], since="2026-01-01")
                     self.assertEqual(result.projects[0].status, "failed")
+                    self.assertTrue(
+                        result.projects[0].error.startswith("staging:")
+                    )
                 self.assertFalse(any(call[0] == "sync" for call in backend.calls))
                 self.assertFalse(any(call[0] == "download" for call in backend.calls))
 
@@ -1225,7 +1479,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].status, "failed")
         self.assertEqual(
             result.projects[0].error,
-            "exporter returned unsafe output directory",
+            "download: exporter returned unsafe output directory",
         )
 
     def test_download_index_must_be_the_safe_index_inside_output_directory(self) -> None:
@@ -1257,7 +1511,7 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].status, "failed")
         self.assertEqual(
             result.projects[0].error,
-            "exporter returned unsafe output directory",
+            "download: exporter returned unsafe output directory",
         )
 
 
@@ -1351,7 +1605,75 @@ class CliTests(unittest.TestCase):
                 ]
             )
         self.assertEqual(exit_code, 2)
-        self.assertEqual(stderr.getvalue(), "collection setup failed: bad config\n")
+        self.assertEqual(stderr.getvalue(), "collection failed: bad config\n")
+
+    @patch(
+        "inno_collector.cli.load_projects",
+        side_effect=FileNotFoundError(
+            2,
+            "missing token=config-secret",
+            "/Users/yzy/My Project/projects.json",
+        ),
+    )
+    def test_collect_error_output_never_leaks_local_paths_or_secrets(
+        self, _load: object
+    ) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "collect",
+                    "--projects",
+                    "/Users/yzy/My Project/projects.json",
+                    "--since",
+                    "2026-01-01",
+                    "--exporter-script",
+                    "exporter.py",
+                    "--exporter-runtime",
+                    "exporter-runtime",
+                    "--runtime",
+                    "runtime",
+                ]
+            )
+
+        output = stderr.getvalue()
+        self.assertEqual(exit_code, 2)
+        self.assertIn("[path]", output)
+        self.assertNotIn("/Users/", output)
+        self.assertNotIn("yzy", output)
+        self.assertNotIn("config-secret", output)
+
+    @patch(
+        "inno_collector.cli.load_projects",
+        side_effect=TypeError(
+            "unexpected '/Volumes/Private Disk/projects.json' token=type-secret"
+        ),
+    )
+    def test_collect_unexpected_exception_uses_same_sanitized_boundary(
+        self, _load: object
+    ) -> None:
+        stderr = StringIO()
+        with redirect_stderr(stderr):
+            exit_code = main(
+                [
+                    "collect",
+                    "--projects",
+                    "projects.json",
+                    "--since",
+                    "2026-01-01",
+                    "--exporter-script",
+                    "exporter.py",
+                    "--exporter-runtime",
+                    "exporter-runtime",
+                    "--runtime",
+                    "runtime",
+                ]
+            )
+
+        self.assertEqual(exit_code, 2)
+        self.assertIn("[path]", stderr.getvalue())
+        self.assertNotIn("Private Disk", stderr.getvalue())
+        self.assertNotIn("type-secret", stderr.getvalue())
 
 
 if __name__ == "__main__":

@@ -7,12 +7,9 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import load_projects
+from .diagnostics import sanitize_diagnostic
 from .exporter import MooreExporterAdapter
-from .pipeline import (
-    CollectionPipeline,
-    PipelineAuthenticationError,
-    PipelineConfigurationError,
-)
+from .pipeline import CollectionPipeline
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -44,16 +41,11 @@ def main(argv: list[str] | None = None) -> int:
             since=args.since,
             dry_run=args.dry_run,
         )
-    except (
-        OSError,
-        UnicodeError,
-        json.JSONDecodeError,
-        ValueError,
-        RuntimeError,
-        PipelineAuthenticationError,
-        PipelineConfigurationError,
-    ) as exc:
-        print(f"collection setup failed: {exc}", file=sys.stderr)
+    except Exception as exc:
+        print(
+            f"collection failed: {sanitize_diagnostic(exc)}",
+            file=sys.stderr,
+        )
         return 2
 
     print(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))

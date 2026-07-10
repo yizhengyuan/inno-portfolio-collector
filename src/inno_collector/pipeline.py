@@ -13,7 +13,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
-from .exporter import _sanitize
+from .diagnostics import sanitize_diagnostic
 from .identity import (
     article_key,
     canonical_url,
@@ -65,10 +65,6 @@ class _VaultWriter(Protocol):
     ) -> object: ...
 
 
-_ABSOLUTE_PATH = re.compile(
-    r"(?<![:\w])/(?:Users|private|var|tmp)/[^\s|]+|"
-    r"(?i:(?<![\w])(?:[A-Z]:\\)[^\s|]+)"
-)
 _TRANSIENT_STATUS = re.compile(r"(?<!\d)(?:429|5\d\d)(?!\d)")
 _TRANSIENT_TEXT = (
     "timed out",
@@ -131,8 +127,7 @@ _STABLE_CATALOG_FIELDS = (
 
 
 def _safe_error(error: BaseException) -> str:
-    message = _sanitize(str(error)) or error.__class__.__name__
-    return _ABSOLUTE_PATH.sub("[path]", message)
+    return sanitize_diagnostic(error, fallback=error.__class__.__name__)
 
 
 def _positive_id(value: object) -> int:
@@ -275,8 +270,9 @@ class CollectionPipeline:
         manifest_records: dict[str, dict],
         catalog_state: CatalogStateStore,
         verification_time: datetime,
-    ) -> tuple[list[int], dict[str, str], int, int]:
+    ) -> tuple[list[int], dict[int, str], dict[str, str], int, int]:
         ids: list[int] = []
+        requested_keys: dict[int, str] = {}
         fingerprints: dict[str, str] = {}
         seen_ids: set[int] = set()
         skipped = 0
@@ -329,8 +325,9 @@ class CollectionPipeline:
                 continue
             seen_ids.add(article_id)
             ids.append(article_id)
+            requested_keys[article_id] = key
             fingerprints[key] = fingerprint
-        return ids, fingerprints, skipped, failed
+        return ids, requested_keys, fingerprints, skipped, failed
 
     def _secure_directory(
         self,
@@ -423,8 +420,8 @@ class CollectionPipeline:
         self,
         payload: object,
         output_root: Path,
-        expected_count: int,
-    ) -> tuple[Path, int]:
+        requested_keys: dict[int, str],
+    ) -> tuple[Path, set[str], set[str], set[str]]:
         if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
             raise PipelineConfigurationError("exporter returned invalid download response")
         count_fields = (
@@ -436,7 +433,7 @@ class CollectionPipeline:
         counts = [payload.get(field) for field in count_fields]
         if (
             any(type(value) is not int or value < 0 for value in counts)
-            or payload["selected_count"] != expected_count
+            or payload["selected_count"] != len(requested_keys)
             or payload["selected_count"]
             != payload["success_count"]
             + payload["failure_count"]
@@ -492,7 +489,54 @@ class CollectionPipeline:
             raise PipelineConfigurationError(
                 "exporter returned invalid output directory"
             )
-        return output, int(payload["failure_count"])
+        requested = set(requested_keys.values())
+
+        def item_key(item: dict) -> str:
+            candidates: set[str] = set()
+            for field in ("article_id", "db_article_id"):
+                if field not in item:
+                    continue
+                try:
+                    article_id = _positive_id(item[field])
+                    candidates.add(requested_keys[article_id])
+                except (KeyError, ValueError):
+                    raise PipelineConfigurationError(
+                        "exporter returned invalid download response"
+                    ) from None
+            if "source_url" in item:
+                try:
+                    key = article_key(str(item["source_url"] or ""))
+                except ValueError:
+                    raise PipelineConfigurationError(
+                        "exporter returned invalid download response"
+                    ) from None
+                if key not in requested:
+                    raise PipelineConfigurationError(
+                        "exporter returned invalid download response"
+                    )
+                candidates.add(key)
+            if len(candidates) != 1:
+                raise PipelineConfigurationError(
+                    "exporter returned invalid download response"
+                )
+            return next(iter(candidates))
+
+        failed_keys = {item_key(item) for item in payload["failed"]}
+        skipped_keys = {item_key(item) for item in payload["skipped"]}
+        if (
+            len(failed_keys) != len(payload["failed"])
+            or len(skipped_keys) != len(payload["skipped"])
+            or failed_keys.intersection(skipped_keys)
+        ):
+            raise PipelineConfigurationError(
+                "exporter returned invalid download response"
+            )
+        success_keys = requested - failed_keys - skipped_keys
+        if len(success_keys) != payload["success_count"]:
+            raise PipelineConfigurationError(
+                "exporter returned invalid download response"
+            )
+        return output, failed_keys, skipped_keys, success_keys
 
     def _project_result(
         self,
@@ -544,9 +588,11 @@ class CollectionPipeline:
                 "exporter authentication is not valid"
             )
         try:
-            accounts = self.backend.accounts()
+            accounts = self._retry(self.backend.accounts)
         except Exception as exc:
-            raise PipelineConfigurationError(_safe_error(exc)) from None
+            raise PipelineConfigurationError(
+                "accounts: " + _safe_error(exc)
+            ) from None
         if not isinstance(accounts, list):
             raise PipelineConfigurationError("exporter account list is invalid")
 
@@ -559,14 +605,23 @@ class CollectionPipeline:
                 )
             except Exception as exc:
                 resolved_ids.append(None)
-                resolution_errors[index] = _safe_error(exc)
+                resolution_errors[index] = "resolve: " + _safe_error(exc)
 
         state_path = self.runtime_dir / "state" / "catalog-state.json"
         account_roots: dict[int, Path] = {}
         if not dry_run:
-            _, state_root, account_roots, staging_errors = self._runtime_layout(
-                resolved_ids
-            )
+            try:
+                _, state_root, account_roots, staging_errors = self._runtime_layout(
+                    resolved_ids
+                )
+            except PipelineConfigurationError as exc:
+                raise PipelineConfigurationError(
+                    "staging: " + _safe_error(exc)
+                ) from None
+            staging_errors = {
+                index: "staging: " + sanitize_diagnostic(message)
+                for index, message in staging_errors.items()
+            }
             resolution_errors.update(staging_errors)
             state_path = state_root / "catalog-state.json"
         elif self.runtime_dir.exists():
@@ -575,14 +630,21 @@ class CollectionPipeline:
                 runtime_details.st_mode
             ):
                 raise PipelineConfigurationError(
-                    "unsafe runtime staging directory"
+                    "staging: unsafe runtime staging directory"
                 )
 
         try:
             catalog_state = CatalogStateStore(state_path)
         except (OSError, UnicodeError, ValueError):
-            raise PipelineConfigurationError("existing catalog state is invalid") from None
-        manifest_records = self._manifest_records()
+            raise PipelineConfigurationError(
+                "catalog: existing catalog state is invalid"
+            ) from None
+        try:
+            manifest_records = self._manifest_records()
+        except PipelineConfigurationError as exc:
+            raise PipelineConfigurationError(
+                "catalog: " + _safe_error(exc)
+            ) from None
         accepted_keys: set[str] = set()
         article_count = 0
         duplicate_count = 0
@@ -618,6 +680,7 @@ class CollectionPipeline:
             run_root: Path | None = None
             vault_succeeded = False
             cleanup_error: Exception | None = None
+            stage = "catalog" if dry_run else "sync"
             try:
                 if not dry_run:
                     sync_payload = self._retry(
@@ -632,6 +695,7 @@ class CollectionPipeline:
                         )
                     last_sync = self.now().isoformat()
 
+                stage = "catalog"
                 rows = self._retry(
                     lambda: self.backend.articles(account_id, limit=5000)
                 )
@@ -648,35 +712,46 @@ class CollectionPipeline:
                 failed += invalid_url_count
                 if invalid_url_count:
                     issues.append(
-                        "article catalog contained "
-                        f"{invalid_url_count} invalid or missing urls"
+                        f"catalog: {invalid_url_count} invalid or missing urls"
                     )
-                article_ids, fingerprints, skipped, invalid_count = (
-                    self._download_plan(
-                        selected,
-                        manifest_records,
-                        catalog_state,
-                        verification_time,
-                    )
+                (
+                    article_ids,
+                    requested_keys,
+                    fingerprints,
+                    skipped,
+                    invalid_count,
+                ) = self._download_plan(
+                    selected,
+                    manifest_records,
+                    catalog_state,
+                    verification_time,
                 )
                 failed += invalid_count
                 if invalid_count:
                     issues.append(
-                        "article catalog contained "
-                        f"{invalid_count} invalid or duplicate ids"
+                        f"catalog: {invalid_count} invalid or duplicate ids"
                     )
 
                 if not dry_run and article_ids:
                     pending_failures = len(article_ids)
+                    stage = "staging"
                     run_root = self._temporary_output_root(account_roots[index])
+                    stage = "download"
                     payload = self._retry(
                         lambda: self.backend.download(article_ids, run_root)
                     )
-                    output_dir, payload_failures = self._download_output(
-                        payload, run_root, len(article_ids)
+                    (
+                        output_dir,
+                        payload_failed_keys,
+                        payload_skipped_keys,
+                        success_keys,
+                    ) = self._download_output(
+                        payload, run_root, requested_keys
                     )
+                    skipped += len(payload_skipped_keys)
+                    stage = "ingest"
                     ingested = self.ingest(project, output_dir)
-                    expected_keys = set(fingerprints)
+                    expected_keys = success_keys
                     outcome_keys: set[str] = set()
                     rejected_count = 0
                     for rejected in ingested.rejected:
@@ -699,24 +774,24 @@ class CollectionPipeline:
                         candidates.append(article)
                     pending_failures = len(candidates)
                     missing_count = len(expected_keys - outcome_keys)
-                    batch_failures = max(
-                        payload_failures,
-                        rejected_count + missing_count,
+                    payload_failures = len(payload_failed_keys)
+                    batch_failures = (
+                        payload_failures + rejected_count + missing_count
                     )
                     failed += batch_failures
                     if rejected_count:
                         issues.append(
-                            f"ingest rejected {rejected_count} requested article"
+                            f"ingest: rejected {rejected_count} requested article"
                             + ("s" if rejected_count != 1 else "")
                         )
                     if missing_count:
                         issues.append(
-                            f"download output omitted {missing_count} requested article"
+                            f"ingest: output omitted {missing_count} requested article"
                             + ("s" if missing_count != 1 else "")
                         )
                     if payload_failures:
                         issues.append(
-                            f"exporter failed {payload_failures} requested article"
+                            f"download: exporter failed {payload_failures} requested article"
                             + ("s" if payload_failures != 1 else "")
                         )
 
@@ -730,6 +805,7 @@ class CollectionPipeline:
                             "; ".join(issues),
                             last_sync,
                         )
+                        stage = "vault"
                         writer.apply(candidates, [provisional])
                         vault_succeeded = True
                         pending_failures = 0
@@ -742,6 +818,7 @@ class CollectionPipeline:
                             or verified_at.utcoffset() is None
                         ):
                             verified_at = verified_at.astimezone()
+                        stage = "state"
                         for article in candidates:
                             catalog_state.mark_success(
                                 article.key,
@@ -763,10 +840,11 @@ class CollectionPipeline:
                     failed = max(failed, 1)
                 exception_message = _safe_error(exc)
                 issue_message = "; ".join(issues)
+                staged_exception = f"{stage}: {exception_message}"
                 error = (
-                    f"{issue_message}; {exception_message}"
+                    f"{issue_message}; {staged_exception}"
                     if issue_message
-                    else exception_message
+                    else staged_exception
                 )
             finally:
                 if run_root is not None:
@@ -778,7 +856,7 @@ class CollectionPipeline:
             if cleanup_error is not None:
                 failed = max(failed, 1)
                 cleanup_message = (
-                    "staging cleanup failed: " + _safe_error(cleanup_error)
+                    "cleanup: " + _safe_error(cleanup_error)
                 )
                 error = (
                     f"{error}; {cleanup_message}" if error else cleanup_message
@@ -801,7 +879,7 @@ class CollectionPipeline:
                 writer.apply([], results)
             except Exception:
                 raise PipelineDeliveryError(
-                    "failed to rebuild collection report"
+                    "report: failed to rebuild collection report"
                 ) from None
 
         failed_projects = sum(result.status != "success" for result in results)
