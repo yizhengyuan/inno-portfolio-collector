@@ -69,10 +69,6 @@ _QUOTED_SPAN_PATTERNS = (
     re.compile(rf"“[^”]{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}”"),
     re.compile(rf"‘[^’]{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}’"),
     re.compile(rf'"[^"]{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}"'),
-    re.compile(
-        rf"(?<![A-Za-z0-9])'[^']{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}'"
-        r"(?![A-Za-z0-9])"
-    ),
 )
 
 
@@ -365,7 +361,7 @@ def _without_quoted_error_markers(value: str) -> str:
     unquoted = value
     for pattern in _QUOTED_SPAN_PATTERNS:
         unquoted = pattern.sub(_remove_error_quote, unquoted)
-    return unquoted
+    return _remove_ascii_single_quoted_error_spans(unquoted)
 
 
 def _remove_error_quote(match: re.Match[str]) -> str:
@@ -373,6 +369,44 @@ def _remove_error_quote(match: re.Match[str]) -> str:
     if any(marker in quoted for marker in _DOWNLOAD_ERROR_TEMPLATES):
         return ""
     return quoted
+
+
+def _remove_ascii_single_quoted_error_spans(value: str) -> str:
+    pieces: list[str] = []
+    cursor = 0
+    opening: int | None = None
+
+    for index, character in enumerate(value):
+        if character != "'" or _is_intraword_apostrophe(value, index):
+            continue
+        if opening is None:
+            opening = index
+            continue
+
+        quoted = value[opening : index + 1]
+        if (
+            index - opening - 1 <= _MAX_QUOTED_SPAN_CHARACTERS
+            and any(marker in quoted for marker in _DOWNLOAD_ERROR_TEMPLATES)
+        ):
+            pieces.append(value[cursor:opening])
+            cursor = index + 1
+        opening = None
+
+    pieces.append(value[cursor:])
+    return "".join(pieces)
+
+
+def _is_intraword_apostrophe(value: str, index: int) -> bool:
+    if index == 0 or index + 1 >= len(value):
+        return False
+    before = value[index - 1]
+    after = value[index + 1]
+    return (
+        before.isascii()
+        and before.isalnum()
+        and after.isascii()
+        and after.isalnum()
+    )
 
 
 def _invalid_body(body: str) -> bool:

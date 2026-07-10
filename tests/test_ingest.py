@@ -578,6 +578,11 @@ class IngestAccountOutputTests(unittest.TestCase):
             ("多行中文引用", f"“平台页面显示：\n{marker}\n请稍后再试”", True),
             ("ASCII引用", f'" {marker} "', True),
             (
+                "单引号内所有格",
+                f"'the author's page says {marker}'",
+                True,
+            ),
+            (
                 "英文所有格",
                 f"author's note says {marker} before reader's review.",
                 False,
@@ -632,6 +637,8 @@ class IngestAccountOutputTests(unittest.TestCase):
         marker = "此内容因违规无法查看"
         overlong = f"“{marker}{'说明' * 1001}{marker}”"
         unclosed = f'"平台页面显示：{marker}，请稍后再试'
+        overlong_single = f"'{marker}{'说明' * 1001}'"
+        unclosed_single = f"'the author's page says {marker}"
 
         self.assertGreater(len(overlong), 2000)
         self.assertIn(
@@ -642,10 +649,23 @@ class IngestAccountOutputTests(unittest.TestCase):
             marker,
             ingest_module._without_quoted_error_markers(unclosed),
         )
+        self.assertIn(
+            marker,
+            ingest_module._without_quoted_error_markers(overlong_single),
+        )
+        self.assertIn(
+            marker,
+            ingest_module._without_quoted_error_markers(unclosed_single),
+        )
         ordinary_quote = '研究者说“这是普通引用”，文章继续讨论治理。'
         self.assertEqual(
             ingest_module._without_quoted_error_markers(ordinary_quote),
             ordinary_quote,
+        )
+        ordinary_single_quote = "研究者引用'the author's note'并继续讨论治理。"
+        self.assertEqual(
+            ingest_module._without_quoted_error_markers(ordinary_single_quote),
+            ordinary_single_quote,
         )
 
     def test_rejected_urls_never_retain_credentials_query_or_fragment(self) -> None:
