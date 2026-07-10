@@ -4,6 +4,7 @@ import copy
 import fcntl
 import json
 import os
+import re
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -26,25 +27,27 @@ def _validate_manifest(data: object) -> dict[str, Any]:
     return data
 
 
-def _read_manifest(path: Path) -> dict[str, Any]:
-    try:
-        with path.open(encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (json.JSONDecodeError, UnicodeDecodeError):
-        raise ValueError("unsupported manifest format") from None
-    return _validate_manifest(data)
-
-
 class ManifestStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.data = self.load()
 
+    def _validate_data(self, data: object) -> dict[str, Any]:
+        return _validate_manifest(data)
+
+    def _read_data(self, path: Path) -> dict[str, Any]:
+        try:
+            with path.open(encoding="utf-8") as handle:
+                data = json.load(handle)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return self._validate_data(None)
+        return self._validate_data(data)
+
     def load(self) -> dict[str, Any]:
         if not self.path.exists():
             data = {"version": 1, "articles": {}}
         else:
-            data = _read_manifest(self.path)
+            data = self._read_data(self.path)
         self.data = data
         self._base_articles = copy.deepcopy(data["articles"])
         return data
@@ -57,7 +60,7 @@ class ManifestStore:
         self.data["articles"][key] = copy.deepcopy(article)
 
     def save(self) -> None:
-        _validate_manifest(self.data)
+        self._validate_data(self.data)
         current_articles = self.data["articles"]
         changed_keys = {
             key
@@ -74,7 +77,7 @@ class ManifestStore:
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
             try:
                 if self.path.exists():
-                    disk_data = _read_manifest(self.path)
+                    disk_data = self._read_data(self.path)
                 else:
                     disk_data = {"version": 1, "articles": {}}
 
@@ -87,7 +90,7 @@ class ManifestStore:
                         merged["articles"][key] = copy.deepcopy(current_articles[key])
                     else:
                         merged["articles"].pop(key, None)
-                _validate_manifest(merged)
+                self._validate_data(merged)
 
                 with tempfile.NamedTemporaryFile(
                     mode="w",
@@ -116,3 +119,39 @@ class ManifestStore:
                 if temporary_path is not None and temporary_path.exists():
                     temporary_path.unlink()
                 fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+
+_FINGERPRINT = re.compile(r"^sha256:[0-9a-f]{64}$")
+
+
+def _validate_catalog_state(data: object) -> dict[str, Any]:
+    try:
+        manifest = _validate_manifest(data)
+    except ValueError:
+        raise ValueError("unsupported catalog state format") from None
+    for record in manifest["articles"].values():
+        if (
+            set(record) != {"fingerprint"}
+            or not isinstance(record.get("fingerprint"), str)
+            or _FINGERPRINT.fullmatch(record["fingerprint"]) is None
+        ):
+            raise ValueError("unsupported catalog state format") from None
+    return manifest
+
+
+class CatalogStateStore(ManifestStore):
+    def _validate_data(self, data: object) -> dict[str, Any]:
+        return _validate_catalog_state(data)
+
+    def get(self, key: str) -> str | None:
+        record = super().get(key)
+        if record is None:
+            return None
+        return str(record["fingerprint"])
+
+    def mark_success(self, key: str, fingerprint: str) -> None:
+        record = {"fingerprint": fingerprint}
+        _validate_catalog_state(
+            {"version": 1, "articles": {key: record}}
+        )
+        super().upsert(key, record)

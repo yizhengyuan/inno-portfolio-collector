@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from inno_collector.state import ManifestStore
+from inno_collector.state import CatalogStateStore, ManifestStore
 
 
 class ManifestStoreTests(unittest.TestCase):
@@ -268,6 +268,81 @@ class ManifestStoreTests(unittest.TestCase):
             path for path in self.path.parent.iterdir() if path.name.endswith(".tmp")
         ]
         self.assertEqual(remaining_temporary_files, [])
+
+
+class CatalogStateStoreTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary_directory.cleanup)
+        self.path = Path(self.temporary_directory.name) / "state" / "catalog-state.json"
+
+    def test_missing_state_is_read_only_until_success_is_saved(self) -> None:
+        store = CatalogStateStore(self.path)
+
+        self.assertIsNone(store.get("sha256:missing"))
+        self.assertFalse(self.path.exists())
+
+        store.mark_success("sha256:key", "sha256:" + "a" * 64)
+        store.save()
+
+        self.assertEqual(
+            CatalogStateStore(self.path).get("sha256:key"),
+            "sha256:" + "a" * 64,
+        )
+
+    def test_rejects_invalid_catalog_fingerprint_records(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        invalid_payloads = (
+            {"version": 1, "articles": {"sha256:key": {}}},
+            {"version": 1, "articles": {"sha256:key": {"fingerprint": "bad"}}},
+            {
+                "version": 1,
+                "articles": {
+                    "sha256:key": {
+                        "fingerprint": "sha256:" + "a" * 64,
+                        "extra": True,
+                    }
+                },
+            },
+        )
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                self.path.write_text(json.dumps(payload), encoding="utf-8")
+                with self.assertRaisesRegex(
+                    ValueError, "^unsupported catalog state format$"
+                ):
+                    CatalogStateStore(self.path)
+
+    def test_stale_catalog_stores_merge_unrelated_successes(self) -> None:
+        first = CatalogStateStore(self.path)
+        second = CatalogStateStore(self.path)
+        first.mark_success("sha256:first", "sha256:" + "1" * 64)
+        second.mark_success("sha256:second", "sha256:" + "2" * 64)
+
+        first.save()
+        second.save()
+
+        reloaded = CatalogStateStore(self.path)
+        self.assertEqual(reloaded.get("sha256:first"), "sha256:" + "1" * 64)
+        self.assertEqual(reloaded.get("sha256:second"), "sha256:" + "2" * 64)
+
+    def test_concurrent_invalid_catalog_state_is_not_overwritten(self) -> None:
+        store = CatalogStateStore(self.path)
+        self.path.parent.mkdir(parents=True)
+        invalid = {
+            "version": 1,
+            "articles": {"sha256:external": {"fingerprint": "invalid"}},
+        }
+        self.path.write_text(json.dumps(invalid), encoding="utf-8")
+        original = self.path.read_bytes()
+        store.mark_success("sha256:new", "sha256:" + "a" * 64)
+
+        with self.assertRaisesRegex(
+            ValueError, "^unsupported catalog state format$"
+        ):
+            store.save()
+
+        self.assertEqual(self.path.read_bytes(), original)
 
 
 if __name__ == "__main__":

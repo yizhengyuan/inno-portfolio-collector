@@ -1,6 +1,12 @@
 from __future__ import annotations
 
+import errno
+import hashlib
+import json
 import re
+import shutil
+import stat
+import tempfile
 import time
 from collections.abc import Callable, Iterable
 from datetime import date, datetime
@@ -8,7 +14,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .exporter import _sanitize
-from .identity import article_key, select_since
+from .identity import article_key, canonical_url, select_since
 from .ingest import ingest_account_output
 from .models import (
     IngestResult,
@@ -17,7 +23,7 @@ from .models import (
     ProjectAccount,
     ProjectRunResult,
 )
-from .state import ManifestStore
+from .state import CatalogStateStore, ManifestStore
 from .vault import VaultWriter
 
 
@@ -26,6 +32,10 @@ class PipelineAuthenticationError(RuntimeError):
 
 
 class PipelineConfigurationError(RuntimeError):
+    pass
+
+
+class PipelineDeliveryError(RuntimeError):
     pass
 
 
@@ -55,6 +65,63 @@ _ABSOLUTE_PATH = re.compile(
     r"(?<![:\w])/(?:Users|private|var|tmp)/[^\s|]+|"
     r"(?i:(?<![\w])(?:[A-Z]:\\)[^\s|]+)"
 )
+_TRANSIENT_STATUS = re.compile(r"(?<!\d)(?:429|5\d\d)(?!\d)")
+_TRANSIENT_TEXT = (
+    "timed out",
+    "timeout",
+    "temporary",
+    "temporarily",
+    "unavailable",
+    "connection reset",
+    "connection refused",
+    "try again",
+    "rate limit",
+    "too many requests",
+)
+_NON_TRANSIENT_TEXT = (
+    "401",
+    "403",
+    "authentication",
+    "authorization",
+    "forbidden",
+    "permission",
+    "invalid",
+    "format",
+    "unsafe",
+    "account match",
+)
+_TRANSIENT_ERRNOS = {
+    errno.ECONNABORTED,
+    errno.ECONNREFUSED,
+    errno.ECONNRESET,
+    errno.EHOSTUNREACH,
+    errno.ENETDOWN,
+    errno.ENETUNREACH,
+    errno.ETIMEDOUT,
+}
+_VOLATILE_CATALOG_FIELDS = {
+    "content_downloaded",
+    "created_at",
+    "downloaded_at",
+    "fetch_time",
+    "fetched_at",
+    "sync_time",
+    "synced_at",
+    "updated_at",
+}
+_STABLE_CATALOG_FIELDS = (
+    "title",
+    "publish_time",
+    "digest",
+    "author",
+    "msgid",
+    "idx",
+    "cover_url",
+    "is_deleted",
+    "article_status",
+    "is_original",
+    "collection_title",
+)
 
 
 def _safe_error(error: BaseException) -> str:
@@ -66,6 +133,77 @@ def _positive_id(value: object) -> int:
     if type(value) is not int or value <= 0:
         raise ValueError("invalid numeric identifier")
     return value
+
+
+def _stable_json_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_json_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key).casefold() not in _VOLATILE_CATALOG_FIELDS
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_json_value(item) for item in value]
+    if value is None or isinstance(value, (bool, int, str)):
+        return value
+    if isinstance(value, float):
+        return value if value == value and abs(value) != float("inf") else str(value)
+    return str(value)
+
+
+def _stable_raw_json(value: object) -> object:
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError:
+            return value
+    return _stable_json_value(value)
+
+
+def catalog_fingerprint(row: dict) -> str:
+    stable = {
+        "url": canonical_url(str(row.get("url") or "")),
+        **{
+            field: str(row.get(field) or "").strip()
+            for field in _STABLE_CATALOG_FIELDS
+        },
+        "raw_json": _stable_raw_json(row.get("raw_json")),
+    }
+    encoded = json.dumps(
+        stable,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def _is_transient(error: Exception) -> bool:
+    if isinstance(error, (PipelineAuthenticationError, PipelineConfigurationError)):
+        return False
+    if isinstance(error, (TimeoutError, ConnectionError)):
+        return True
+    if isinstance(error, OSError) and error.errno in _TRANSIENT_ERRNOS:
+        return True
+    message = str(error).casefold()
+    if re.search(r"(?<!\d)(?:401|403)(?!\d)", message) is not None:
+        return False
+    if _TRANSIENT_STATUS.search(message) is not None:
+        return True
+    if any(marker in message for marker in _NON_TRANSIENT_TEXT):
+        return False
+    return any(
+        marker in message for marker in _TRANSIENT_TEXT
+    )
+
+
+def _status(downloaded: int, skipped: int, failed: int) -> str:
+    if failed == 0:
+        return "success"
+    if downloaded or skipped:
+        return "partial"
+    return "failed"
 
 
 class CollectionPipeline:
@@ -91,21 +229,20 @@ class CollectionPipeline:
         for delay in (1.0, 3.0, None):
             try:
                 return operation()
-            except Exception:
-                if delay is None:
+            except Exception as exc:
+                if delay is None or not _is_transient(exc):
                     raise
                 self.sleep(delay)
         raise AssertionError("unreachable")
 
-    def _existing_keys(self) -> set[str]:
+    def _manifest_keys(self) -> set[str]:
         manifest_path = self.vault_root / "90-系统" / "manifest.json"
         if not manifest_path.exists():
             return set()
         try:
-            store = ManifestStore(manifest_path)
+            return set(ManifestStore(manifest_path).data["articles"])
         except (OSError, UnicodeError, ValueError):
             raise PipelineConfigurationError("existing manifest is invalid") from None
-        return set(store.data["articles"])
 
     def _account_id(self, row: object) -> int:
         if not isinstance(row, dict):
@@ -115,23 +252,25 @@ class CollectionPipeline:
         except ValueError:
             raise PipelineConfigurationError("resolved account is invalid") from None
 
-    def _download_ids(
+    def _download_plan(
         self,
         rows: list[dict],
-        existing_keys: set[str],
-    ) -> tuple[list[int], set[str], int, int]:
+        available_keys: set[str],
+        catalog_state: CatalogStateStore,
+    ) -> tuple[list[int], dict[str, str], int, int]:
         ids: list[int] = []
-        expected_keys: set[str] = set()
+        fingerprints: dict[str, str] = {}
         seen_ids: set[int] = set()
         skipped = 0
         failed = 0
         for row in rows:
             try:
                 key = article_key(str(row.get("url") or ""))
-            except ValueError:
+                fingerprint = catalog_fingerprint(row)
+            except (TypeError, ValueError):
                 failed += 1
                 continue
-            if key in existing_keys:
+            if key in available_keys and catalog_state.get(key) == fingerprint:
                 skipped += 1
                 continue
             try:
@@ -144,33 +283,192 @@ class CollectionPipeline:
                 continue
             seen_ids.add(article_id)
             ids.append(article_id)
-            expected_keys.add(key)
-        return ids, expected_keys, skipped, failed
+            fingerprints[key] = fingerprint
+        return ids, fingerprints, skipped, failed
 
-    def _output_directory(self, payload: object, output_root: Path) -> Path:
-        if not isinstance(payload, dict) or payload.get("ok") is not True:
-            raise RuntimeError("exporter download was unsuccessful")
-        if not isinstance(payload.get("output_dir"), str):
-            raise RuntimeError("exporter returned invalid output directory")
-        raw_output = payload["output_dir"].strip()
-        if not raw_output:
-            raise RuntimeError("exporter returned invalid output directory")
+    def _secure_directory(
+        self,
+        path: Path,
+        *,
+        parent: Path | None = None,
+    ) -> Path:
         try:
-            root = output_root.resolve(strict=True)
-            output = Path(raw_output).expanduser().resolve(strict=True)
-            output.relative_to(root)
+            details = path.lstat()
+        except FileNotFoundError:
+            try:
+                if parent is None:
+                    path.mkdir(parents=True)
+                else:
+                    path.mkdir()
+                details = path.lstat()
+            except OSError:
+                raise PipelineConfigurationError(
+                    "unsafe runtime staging directory"
+                ) from None
+        except OSError:
+            raise PipelineConfigurationError(
+                "unsafe runtime staging directory"
+            ) from None
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+            raise PipelineConfigurationError("unsafe runtime staging directory")
+        try:
+            resolved = path.resolve(strict=True)
+            if parent is not None and resolved.parent != parent:
+                raise ValueError
         except (OSError, RuntimeError, ValueError):
-            raise RuntimeError("exporter returned unsafe output directory") from None
-        if not output.is_dir():
-            raise RuntimeError("exporter returned invalid output directory")
-        return output
+            raise PipelineConfigurationError(
+                "unsafe runtime staging directory"
+            ) from None
+        return resolved
 
-    def _status(self, downloaded: int, skipped: int, failed: int) -> str:
-        if failed == 0:
-            return "success"
-        if downloaded or skipped:
-            return "partial"
-        return "failed"
+    def _runtime_layout(
+        self,
+        resolved_accounts: list[int | None],
+    ) -> tuple[Path, Path, dict[int, Path], dict[int, str]]:
+        runtime_root = self._secure_directory(self.runtime_dir)
+        staging_root = self._secure_directory(
+            runtime_root / "staging", parent=runtime_root
+        )
+        state_root = self._secure_directory(runtime_root / "state", parent=runtime_root)
+        account_roots: dict[int, Path] = {}
+        errors: dict[int, str] = {}
+        for index, account_id in enumerate(resolved_accounts, start=1):
+            if account_id is None:
+                continue
+            try:
+                account_roots[index - 1] = self._secure_directory(
+                    staging_root / f"{index:02d}-{account_id}",
+                    parent=staging_root,
+                )
+            except PipelineConfigurationError as exc:
+                errors[index - 1] = str(exc)
+        return runtime_root, state_root, account_roots, errors
+
+    def _temporary_output_root(self, account_root: Path) -> Path:
+        try:
+            run_root = Path(tempfile.mkdtemp(dir=account_root, prefix="run-"))
+            details = run_root.lstat()
+            resolved = run_root.resolve(strict=True)
+            if (
+                stat.S_ISLNK(details.st_mode)
+                or not stat.S_ISDIR(details.st_mode)
+                or resolved.parent != account_root
+            ):
+                raise ValueError
+            return resolved
+        except (OSError, RuntimeError, ValueError):
+            raise PipelineConfigurationError(
+                "unsafe runtime staging directory"
+            ) from None
+
+    def _cleanup_output_root(self, run_root: Path) -> None:
+        try:
+            details = run_root.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(details.st_mode):
+            run_root.unlink()
+        elif stat.S_ISDIR(details.st_mode):
+            shutil.rmtree(run_root)
+        else:
+            run_root.unlink()
+
+    def _download_output(
+        self,
+        payload: object,
+        output_root: Path,
+        expected_count: int,
+    ) -> tuple[Path, int]:
+        if not isinstance(payload, dict) or type(payload.get("ok")) is not bool:
+            raise PipelineConfigurationError("exporter returned invalid download response")
+        count_fields = (
+            "selected_count",
+            "success_count",
+            "failure_count",
+            "skipped_count",
+        )
+        counts = [payload.get(field) for field in count_fields]
+        if (
+            any(type(value) is not int or value < 0 for value in counts)
+            or payload["selected_count"] != expected_count
+            or payload["selected_count"]
+            != payload["success_count"]
+            + payload["failure_count"]
+            + payload["skipped_count"]
+            or not isinstance(payload.get("failed"), list)
+            or any(not isinstance(item, dict) for item in payload["failed"])
+            or len(payload["failed"]) != payload["failure_count"]
+            or not isinstance(payload.get("skipped"), list)
+            or any(not isinstance(item, dict) for item in payload["skipped"])
+            or len(payload["skipped"]) != payload["skipped_count"]
+            or (payload["ok"] and payload["failure_count"] != 0)
+            or (not payload["ok"] and payload["failure_count"] == 0)
+            or not isinstance(payload.get("output_dir"), str)
+            or not payload["output_dir"].strip()
+            or not isinstance(payload.get("index"), str)
+            or not payload["index"].strip()
+        ):
+            raise PipelineConfigurationError("exporter returned invalid download response")
+        try:
+            root_details = output_root.lstat()
+            root = output_root.resolve(strict=True)
+            if stat.S_ISLNK(root_details.st_mode) or not stat.S_ISDIR(
+                root_details.st_mode
+            ):
+                raise ValueError
+            output_path = Path(payload["output_dir"]).expanduser()
+            output_details = output_path.lstat()
+            if stat.S_ISLNK(output_details.st_mode) or not stat.S_ISDIR(
+                output_details.st_mode
+            ):
+                raise ValueError
+            output = output_path.resolve(strict=True)
+            output.relative_to(root)
+            index_path = Path(payload["index"]).expanduser()
+            try:
+                index_details = index_path.lstat()
+            except FileNotFoundError:
+                index_details = None
+            if index_details is not None and (
+                stat.S_ISLNK(index_details.st_mode)
+                or not stat.S_ISREG(index_details.st_mode)
+            ):
+                raise ValueError
+            index = index_path.resolve(strict=False)
+            index.relative_to(output)
+            if index != (output / "index.csv").resolve(strict=False):
+                raise ValueError
+        except (OSError, RuntimeError, ValueError):
+            raise PipelineConfigurationError(
+                "exporter returned unsafe output directory"
+            ) from None
+        if not output.is_dir():
+            raise PipelineConfigurationError(
+                "exporter returned invalid output directory"
+            )
+        return output, int(payload["failure_count"])
+
+    def _project_result(
+        self,
+        project: ProjectAccount,
+        discovered: int,
+        downloaded: int,
+        skipped: int,
+        failed: int,
+        error: str,
+        last_sync: str,
+    ) -> ProjectRunResult:
+        return ProjectRunResult(
+            project=project.project,
+            account=project.account,
+            discovered=discovered,
+            downloaded=downloaded,
+            skipped=skipped,
+            failed=failed,
+            status=_status(downloaded, skipped, failed),
+            error=error,
+            last_sync=last_sync,
+        )
 
     def run(
         self,
@@ -206,38 +504,100 @@ class CollectionPipeline:
         if not isinstance(accounts, list):
             raise PipelineConfigurationError("exporter account list is invalid")
 
-        existing_keys = self._existing_keys()
-        all_articles: list[NormalizedArticle] = []
-        all_results: list[ProjectRunResult] = []
-        duplicate_count = 0
-        accepted_keys: set[str] = set()
+        resolved_ids: list[int | None] = []
+        resolution_errors: dict[int, str] = {}
+        for index, project in enumerate(project_list):
+            try:
+                resolved_ids.append(
+                    self._account_id(self.backend.resolve_exact(project, accounts))
+                )
+            except Exception as exc:
+                resolved_ids.append(None)
+                resolution_errors[index] = _safe_error(exc)
 
-        for index, project in enumerate(project_list, start=1):
-            attempted_at = self.now().isoformat()
+        state_path = self.runtime_dir / "state" / "catalog-state.json"
+        account_roots: dict[int, Path] = {}
+        if not dry_run:
+            _, state_root, account_roots, staging_errors = self._runtime_layout(
+                resolved_ids
+            )
+            resolution_errors.update(staging_errors)
+            state_path = state_root / "catalog-state.json"
+        elif self.runtime_dir.exists():
+            runtime_details = self.runtime_dir.lstat()
+            if stat.S_ISLNK(runtime_details.st_mode) or not stat.S_ISDIR(
+                runtime_details.st_mode
+            ):
+                raise PipelineConfigurationError(
+                    "unsafe runtime staging directory"
+                )
+
+        try:
+            catalog_state = CatalogStateStore(state_path)
+        except (OSError, UnicodeError, ValueError):
+            raise PipelineConfigurationError("existing catalog state is invalid") from None
+        manifest_keys = self._manifest_keys()
+        accepted_keys: set[str] = set()
+        article_count = 0
+        duplicate_count = 0
+        results: list[ProjectRunResult] = []
+        writer = self.vault_writer or VaultWriter(self.vault_root)
+
+        for index, project in enumerate(project_list):
+            if index in resolution_errors:
+                results.append(
+                    self._project_result(
+                        project,
+                        0,
+                        0,
+                        0,
+                        1,
+                        resolution_errors[index],
+                        "",
+                    )
+                )
+                continue
+
+            account_id = resolved_ids[index]
+            assert account_id is not None
             discovered = downloaded = skipped = failed = 0
+            last_sync = ""
             error = ""
             issues: list[str] = []
+            article_ids: list[int] = []
+            run_root: Path | None = None
+            vault_succeeded = False
             try:
-                account = self.backend.resolve_exact(project, accounts)
-                account_id = self._account_id(account)
                 if not dry_run:
-                    self._retry(lambda: self.backend.sync(account_id, limit=1000))
+                    sync_payload = self._retry(
+                        lambda: self.backend.sync(account_id, limit=1000)
+                    )
+                    if (
+                        not isinstance(sync_payload, dict)
+                        or sync_payload.get("ok") is not True
+                    ):
+                        raise PipelineConfigurationError(
+                            "exporter returned unsuccessful sync response"
+                        )
+                    last_sync = self.now().isoformat()
+
                 rows = self._retry(
                     lambda: self.backend.articles(account_id, limit=5000)
                 )
                 if not isinstance(rows, list) or any(
                     not isinstance(row, dict) for row in rows
                 ):
-                    raise RuntimeError("exporter returned invalid article list")
+                    raise PipelineConfigurationError(
+                        "exporter returned invalid article list"
+                    )
                 selected = select_since(rows, since)
                 discovered = len(selected)
-                (
-                    article_ids,
-                    expected_keys,
-                    skipped,
-                    invalid_count,
-                ) = self._download_ids(
-                    selected, existing_keys
+                article_ids, fingerprints, skipped, invalid_count = (
+                    self._download_plan(
+                        selected,
+                        manifest_keys | accepted_keys,
+                        catalog_state,
+                    )
                 )
                 failed += invalid_count
                 if invalid_count:
@@ -247,17 +607,15 @@ class CollectionPipeline:
                     )
 
                 if not dry_run and article_ids:
-                    output_root = (
-                        self.runtime_dir
-                        / "staging"
-                        / f"{index:02d}-{account_id}"
-                    )
-                    output_root.mkdir(parents=True, exist_ok=True)
+                    run_root = self._temporary_output_root(account_roots[index])
                     payload = self._retry(
-                        lambda: self.backend.download(article_ids, output_root)
+                        lambda: self.backend.download(article_ids, run_root)
                     )
-                    output_dir = self._output_directory(payload, output_root)
+                    output_dir, payload_failures = self._download_output(
+                        payload, run_root, len(article_ids)
+                    )
                     ingested = self.ingest(project, output_dir)
+                    expected_keys = set(fingerprints)
                     outcome_keys: set[str] = set()
                     rejected_count = 0
                     for rejected in ingested.rejected:
@@ -267,59 +625,96 @@ class CollectionPipeline:
                             continue
                         if rejected_key in expected_keys:
                             outcome_keys.add(rejected_key)
-                            failed += 1
                             rejected_count += 1
+                    candidates: list[NormalizedArticle] = []
+                    for article in ingested.valid:
+                        if article.key not in expected_keys:
+                            continue
+                        outcome_keys.add(article.key)
+                        if article.key in accepted_keys:
+                            duplicate_count += 1
+                            skipped += 1
+                            continue
+                        candidates.append(article)
+                    missing_count = len(expected_keys - outcome_keys)
+                    batch_failures = max(
+                        payload_failures,
+                        rejected_count + missing_count,
+                    )
+                    failed += batch_failures
                     if rejected_count:
                         issues.append(
                             f"ingest rejected {rejected_count} requested article"
                             + ("s" if rejected_count != 1 else "")
                         )
-                    for article in ingested.valid:
-                        if article.key not in expected_keys:
-                            continue
-                        outcome_keys.add(article.key)
-                        if article.key in accepted_keys or article.key in existing_keys:
-                            duplicate_count += 1
-                            skipped += 1
-                            continue
-                        accepted_keys.add(article.key)
-                        all_articles.append(article)
-                        downloaded += 1
-                    missing_count = len(expected_keys - outcome_keys)
-                    failed += missing_count
                     if missing_count:
                         issues.append(
                             f"download output omitted {missing_count} requested article"
                             + ("s" if missing_count != 1 else "")
                         )
+                    if payload_failures:
+                        issues.append(
+                            f"exporter failed {payload_failures} requested article"
+                            + ("s" if payload_failures != 1 else "")
+                        )
+
+                    if candidates:
+                        provisional = self._project_result(
+                            project,
+                            discovered,
+                            len(candidates),
+                            skipped,
+                            failed,
+                            "; ".join(issues),
+                            last_sync,
+                        )
+                        writer.apply(candidates, [provisional])
+                        vault_succeeded = True
+                        downloaded = len(candidates)
+                        accepted_keys.update(article.key for article in candidates)
+                        article_count += downloaded
+                        for article in candidates:
+                            catalog_state.mark_success(
+                                article.key, fingerprints[article.key]
+                            )
+                        catalog_state.save()
                 error = "; ".join(issues)
             except Exception as exc:
-                failed = max(failed, 1)
+                if not vault_succeeded:
+                    downloaded = 0
+                    failed = max(failed, len(article_ids) or 1)
+                else:
+                    failed = max(failed, 1)
                 error = _safe_error(exc)
+            finally:
+                if run_root is not None:
+                    self._cleanup_output_root(run_root)
 
-            all_results.append(
-                ProjectRunResult(
-                    project=project.project,
-                    account=project.account,
-                    discovered=discovered,
-                    downloaded=downloaded,
-                    skipped=skipped,
-                    failed=failed,
-                    status=self._status(downloaded, skipped, failed),
-                    error=error,
-                    last_sync=attempted_at,
+            results.append(
+                self._project_result(
+                    project,
+                    discovered,
+                    downloaded,
+                    skipped,
+                    failed,
+                    error,
+                    last_sync,
                 )
             )
 
         if not dry_run:
-            writer = self.vault_writer or VaultWriter(self.vault_root)
-            writer.apply(all_articles, all_results)
+            try:
+                writer.apply([], results)
+            except Exception:
+                raise PipelineDeliveryError(
+                    "failed to rebuild collection report"
+                ) from None
 
-        failed_projects = sum(result.status != "success" for result in all_results)
+        failed_projects = sum(result.status != "success" for result in results)
         return PipelineRunResult(
-            projects=tuple(all_results),
-            project_count=len(all_results),
+            projects=tuple(results),
+            project_count=len(results),
             failed_projects=failed_projects,
-            article_count=len(all_articles),
+            article_count=article_count,
             duplicate_count=duplicate_count,
         )

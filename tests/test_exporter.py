@@ -188,6 +188,86 @@ class MooreExporterAdapterTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][-4:], ["--account-id", "7", "--limit", "12"])
         self.assertEqual(runner.calls[1][-4:], ["--account-id", "7", "--limit", "34"])
 
+    def test_download_returns_strict_partial_payload_from_exit_one(self) -> None:
+        payload = {
+            "ok": False,
+            "output_dir": "/tmp/output/account",
+            "index": "/tmp/output/account/index.csv",
+            "selected_count": 3,
+            "success_count": 2,
+            "failure_count": 1,
+            "skipped_count": 0,
+            "skipped": [],
+            "failed": [{"article_id": 9, "error": "body unavailable"}],
+        }
+        runner = FakeRunner((1, json.dumps(payload), ""))
+
+        result = self.adapter(runner).download([7, 8, 9], Path("/tmp/output"))
+
+        self.assertEqual(result, payload)
+
+    def test_download_rejects_malformed_or_inconsistent_partial_payloads(self) -> None:
+        valid = {
+            "ok": False,
+            "output_dir": "/tmp/output/account",
+            "index": "/tmp/output/account/index.csv",
+            "selected_count": 3,
+            "success_count": 2,
+            "failure_count": 1,
+            "skipped_count": 0,
+            "skipped": [],
+            "failed": [{"article_id": 9}],
+        }
+        invalid_payloads = (
+            {**valid, "output_dir": ""},
+            {**valid, "index": None},
+            {**valid, "selected_count": True},
+            {**valid, "failure_count": 0},
+            {**valid, "failed": "not-a-list"},
+            {**valid, "selected_count": 4},
+            {**valid, "ok": "false"},
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                runner = FakeRunner((1, json.dumps(payload), ""))
+                with self.assertRaisesRegex(
+                    ExporterCommandError,
+                    "^exporter returned invalid partial download response$",
+                ):
+                    self.adapter(runner).download([7, 8, 9], Path("/tmp/output"))
+
+    def test_non_download_commands_still_reject_exit_one_partial_shape(self) -> None:
+        payload = {
+            "ok": False,
+            "output_dir": "/tmp/output/account",
+            "index": "/tmp/output/account/index.csv",
+            "selected_count": 1,
+            "success_count": 0,
+            "failure_count": 1,
+            "skipped_count": 0,
+            "skipped": [],
+            "failed": [{}],
+        }
+        runner = FakeRunner((1, json.dumps(payload), ""))
+
+        with self.assertRaisesRegex(ExporterCommandError, "exporter command failed"):
+            self.adapter(runner).sync(7)
+
+    def test_download_exit_one_without_partial_artifacts_preserves_transient_error(self) -> None:
+        runner = FakeRunner(
+            (
+                1,
+                json.dumps({"ok": False, "error": "HTTP 503 temporary unavailable"}),
+                "",
+            )
+        )
+
+        with self.assertRaisesRegex(
+            ExporterCommandError, "^HTTP 503 temporary unavailable$"
+        ):
+            self.adapter(runner).download([7], Path("/tmp/output"))
+
     def test_accounts_rejects_invalid_collections(self) -> None:
         for accounts in ("not-a-list", [{"id": 1}, "not-an-object"]):
             with self.subTest(accounts=accounts):

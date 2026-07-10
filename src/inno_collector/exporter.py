@@ -103,7 +103,7 @@ class MooreExporterAdapter:
         self.runtime_dir = runtime_dir
         self.runner = runner
 
-    def _run(self, command: str, *arguments: str) -> dict:
+    def _execute(self, command: str, *arguments: str) -> tuple[int, dict, str]:
         argv = [
             sys.executable,
             str(self.script),
@@ -126,9 +126,65 @@ class MooreExporterAdapter:
 
         if not isinstance(payload, dict):
             raise ExporterCommandError("exporter returned invalid JSON object")
+        return code, payload, stderr
+
+    def _run(self, command: str, *arguments: str) -> dict:
+        code, payload, stderr = self._execute(command, *arguments)
         if code != 0 or payload.get("ok") is not True:
             message = payload.get("error") or stderr or "exporter command failed"
             raise ExporterCommandError(_sanitize(str(message)))
+        return payload
+
+    def _run_download(self, *arguments: str) -> dict:
+        code, payload, stderr = self._execute("exporter-download", *arguments)
+        if code == 0 and payload.get("ok") is True:
+            return payload
+        if code != 1:
+            message = payload.get("error") or stderr or "exporter command failed"
+            raise ExporterCommandError(_sanitize(str(message)))
+
+        partial_fields = {
+            "output_dir",
+            "index",
+            "selected_count",
+            "success_count",
+            "failure_count",
+            "skipped_count",
+            "skipped",
+            "failed",
+        }
+        if not partial_fields.intersection(payload) and payload.get("error"):
+            raise ExporterCommandError(_sanitize(str(payload["error"])))
+
+        count_fields = (
+            "selected_count",
+            "success_count",
+            "failure_count",
+            "skipped_count",
+        )
+        counts = [payload.get(field) for field in count_fields]
+        if (
+            payload.get("ok") is not False
+            or not isinstance(payload.get("output_dir"), str)
+            or not payload["output_dir"].strip()
+            or not isinstance(payload.get("index"), str)
+            or not payload["index"].strip()
+            or any(type(value) is not int or value < 0 for value in counts)
+            or not isinstance(payload.get("skipped"), list)
+            or any(not isinstance(item, dict) for item in payload["skipped"])
+            or not isinstance(payload.get("failed"), list)
+            or any(not isinstance(item, dict) for item in payload["failed"])
+            or payload["failure_count"] <= 0
+            or payload["failure_count"] != len(payload["failed"])
+            or payload["skipped_count"] != len(payload["skipped"])
+            or payload["selected_count"]
+            != payload["success_count"]
+            + payload["failure_count"]
+            + payload["skipped_count"]
+        ):
+            raise ExporterCommandError(
+                "exporter returned invalid partial download response"
+            )
         return payload
 
     def auth_check(self) -> dict:
@@ -158,8 +214,7 @@ class MooreExporterAdapter:
 
     def download(self, article_ids: list[int], output_root: Path) -> dict:
         joined_ids = ",".join(str(article_id) for article_id in article_ids)
-        return self._run(
-            "exporter-download",
+        return self._run_download(
             "--article-ids",
             joined_ids,
             "--output-dir",
