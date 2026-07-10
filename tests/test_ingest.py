@@ -587,6 +587,16 @@ class IngestAccountOutputTests(unittest.TestCase):
                 f"author's note says {marker} before reader's review.",
                 False,
             ),
+            (
+                "复数所有格",
+                f"authors' note says {marker} before readers' review.",
+                False,
+            ),
+            (
+                "词首省略",
+                f"'tis noted that {marker} before 'twas reviewed.",
+                False,
+            ),
             ("未闭合引用", f"“平台页面显示：{marker}，请稍后再试", False),
             ("未加引号", marker, False),
         )

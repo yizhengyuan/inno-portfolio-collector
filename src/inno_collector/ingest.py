@@ -30,6 +30,7 @@ _PROMPT_COVERAGE_THRESHOLD = 0.25
 _DOWNLOAD_ERROR_MAX_LENGTH = 800
 _DOWNLOAD_ERROR_MAX_PREFIX = 80
 _MAX_QUOTED_SPAN_CHARACTERS = 2000
+_LEADING_APOSTROPHE_WORDS = ("tis", "twas")
 _LOGIN_PROMPTS = (
     "扫码登录",
     "请登录",
@@ -377,10 +378,14 @@ def _remove_ascii_single_quoted_error_spans(value: str) -> str:
     opening: int | None = None
 
     for index, character in enumerate(value):
-        if character != "'" or _is_intraword_apostrophe(value, index):
+        if character != "'":
             continue
         if opening is None:
+            if not _is_ascii_single_quote_opening(value, index):
+                continue
             opening = index
+            continue
+        if not _is_ascii_single_quote_closing(value, index):
             continue
 
         quoted = value[opening : index + 1]
@@ -396,17 +401,30 @@ def _remove_ascii_single_quoted_error_spans(value: str) -> str:
     return "".join(pieces)
 
 
-def _is_intraword_apostrophe(value: str, index: int) -> bool:
-    if index == 0 or index + 1 >= len(value):
+def _is_ascii_single_quote_opening(value: str, index: int) -> bool:
+    if _is_ascii_alphanumeric_at(value, index - 1):
         return False
-    before = value[index - 1]
-    after = value[index + 1]
-    return (
-        before.isascii()
-        and before.isalnum()
-        and after.isascii()
-        and after.isalnum()
-    )
+
+    token_start = index + 1
+    for word in _LEADING_APOSTROPHE_WORDS:
+        token_end = token_start + len(word)
+        if (
+            value[token_start:token_end].casefold() == word
+            and not _is_ascii_alphanumeric_at(value, token_end)
+        ):
+            return False
+    return True
+
+
+def _is_ascii_single_quote_closing(value: str, index: int) -> bool:
+    return not _is_ascii_alphanumeric_at(value, index + 1)
+
+
+def _is_ascii_alphanumeric_at(value: str, index: int) -> bool:
+    if index < 0 or index >= len(value):
+        return False
+    character = value[index]
+    return character.isascii() and character.isalnum()
 
 
 def _invalid_body(body: str) -> bool:
