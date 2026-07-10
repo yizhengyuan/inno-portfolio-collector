@@ -30,6 +30,20 @@ class DiagnosticSanitizerTests(unittest.TestCase):
 
         self.assertEqual(sanitize_diagnostic(BrokenError()), "operation failed")
 
+    def test_redacts_any_windows_drive_and_unc_absolute_path(self) -> None:
+        cases = (
+            r"open X:\Work Folder\Projects\config.json token=drive-secret",
+            r"open \\fileserver\Private Share\Projects\config.json token=unc-secret",
+        )
+
+        for message in cases:
+            with self.subTest(message=message):
+                sanitized = sanitize_diagnostic(message)
+                self.assertIn("[path]", sanitized)
+                self.assertNotIn("Work Folder", sanitized)
+                self.assertNotIn("Private Share", sanitized)
+                self.assertNotIn("secret", sanitized)
+
 
 if __name__ == "__main__":
     unittest.main()

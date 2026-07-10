@@ -503,9 +503,11 @@ class CollectionPipeline:
                     raise PipelineConfigurationError(
                         "exporter returned invalid download response"
                     ) from None
-            if "source_url" in item:
+            for field in ("source_url", "url"):
+                if field not in item:
+                    continue
                 try:
-                    key = article_key(str(item["source_url"] or ""))
+                    key = article_key(str(item[field] or ""))
                 except ValueError:
                     raise PipelineConfigurationError(
                         "exporter returned invalid download response"
@@ -752,33 +754,62 @@ class CollectionPipeline:
                     stage = "ingest"
                     ingested = self.ingest(project, output_dir)
                     expected_keys = success_keys
-                    outcome_keys: set[str] = set()
-                    rejected_count = 0
+                    outcomes: dict[str, tuple[str, object]] = {}
+                    conflicting_keys: set[str] = set()
+
+                    def record_outcome(
+                        key: str, kind: str, value: object
+                    ) -> None:
+                        if key not in expected_keys:
+                            return
+                        if key in outcomes:
+                            conflicting_keys.add(key)
+                            return
+                        outcomes[key] = (kind, value)
+
                     for rejected in ingested.rejected:
                         try:
                             rejected_key = article_key(rejected.source_url)
                         except ValueError:
                             continue
-                        if rejected_key in expected_keys:
-                            outcome_keys.add(rejected_key)
-                            rejected_count += 1
-                    candidates: list[NormalizedArticle] = []
+                        record_outcome(rejected_key, "rejected", rejected)
                     for article in ingested.valid:
-                        if article.key not in expected_keys:
+                        record_outcome(article.key, "valid", article)
+
+                    rejected_keys = {
+                        key
+                        for key, (kind, _) in outcomes.items()
+                        if kind == "rejected" and key not in conflicting_keys
+                    }
+                    missing_keys = expected_keys - set(outcomes)
+                    candidates: list[NormalizedArticle] = []
+                    for key, (kind, value) in outcomes.items():
+                        if kind != "valid" or key in conflicting_keys:
                             continue
-                        outcome_keys.add(article.key)
-                        if article.key in accepted_keys:
+                        assert isinstance(value, NormalizedArticle)
+                        if key in accepted_keys:
                             duplicate_count += 1
                             skipped += 1
                             continue
-                        candidates.append(article)
+                        candidates.append(value)
                     pending_failures = len(candidates)
-                    missing_count = len(expected_keys - outcome_keys)
+                    conflict_count = len(conflicting_keys)
+                    rejected_count = len(rejected_keys)
+                    missing_count = len(missing_keys)
                     payload_failures = len(payload_failed_keys)
                     batch_failures = (
-                        payload_failures + rejected_count + missing_count
+                        payload_failures
+                        + conflict_count
+                        + rejected_count
+                        + missing_count
                     )
                     failed += batch_failures
+                    if conflict_count:
+                        issues.append(
+                            "ingest: conflicting or duplicate outcome for "
+                            f"{conflict_count} requested article"
+                            + ("s" if conflict_count != 1 else "")
+                        )
                     if rejected_count:
                         issues.append(
                             f"ingest: rejected {rejected_count} requested article"

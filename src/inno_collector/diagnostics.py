@@ -21,7 +21,8 @@ _CLI_SECRET_RE = re.compile(
 )
 _LOCAL_PATH_START = re.compile(
     r"(?i)(?:file://)?/(?:Users|Volumes|private|var|tmp|home|opt)(?:/|$)|"
-    r"(?<![\w])[A-Z]:\\(?:Users|Volumes|Temp)(?:\\|$)"
+    r"(?<![\w])[A-Z]:(?:\\+|/)|"
+    r"(?<!\\)\\\\[^\\\r\n]+\\"
 )
 
 

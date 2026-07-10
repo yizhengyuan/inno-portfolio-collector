@@ -744,6 +744,123 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].skipped, 1)
         self.assertEqual([len(call[0]) for call in vault.calls], [0])
 
+    def test_real_partial_url_field_keeps_success_and_counts_failure(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [article_row(10, "good"), article_row(11, "bad")]
+        vault = RecordingVault()
+
+        def partial_download(article_ids: list[int], output_root: Path) -> dict:
+            backend.calls.append(("download", tuple(article_ids), output_root))
+            output = output_root / "account"
+            output.mkdir()
+            return {
+                "ok": False,
+                "output_dir": str(output),
+                "index": str(output / "index.csv"),
+                "selected_count": 2,
+                "success_count": 1,
+                "failure_count": 1,
+                "skipped_count": 0,
+                "failed": [
+                    {
+                        "url": "https://mp.weixin.qq.com/s/bad",
+                        "error": "download failed",
+                    }
+                ],
+                "skipped": [],
+            }
+
+        backend.download = partial_download  # type: ignore[method-assign]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = CollectionPipeline(
+                backend,
+                runtime_dir=Path(temp_dir) / "runtime",
+                vault_writer=vault,
+                ingest=lambda _project, _root: IngestResult(
+                    valid=(normalized(project, "good"),),
+                    rejected=(
+                        RejectedArticle(
+                            "坏文章",
+                            "https://mp.weixin.qq.com/s/bad",
+                            "download_failed",
+                        ),
+                    ),
+                ),
+                now=lambda: NOW,
+                sleep=lambda _seconds: None,
+            ).run([project], since="2026-01-01")
+
+        self.assertEqual(result.projects[0].downloaded, 1)
+        self.assertEqual(result.projects[0].failed, 1)
+        self.assertEqual(result.projects[0].status, "partial")
+        self.assertEqual(len(vault.calls[0][0]), 1)
+        self.assertEqual(vault.calls[0][0][0].source_url, "https://mp.weixin.qq.com/s/good")
+
+    def test_ingest_duplicate_or_conflicting_outcome_fails_key_once_without_write(self) -> None:
+        project = self.project(1)
+        cases = (
+            (
+                "valid-and-rejected",
+                (normalized(project, "slug-1"),),
+                (
+                    RejectedArticle(
+                        "冲突",
+                        "https://mp.weixin.qq.com/s/slug-1",
+                        "invalid_body",
+                    ),
+                ),
+            ),
+            (
+                "duplicate-valid",
+                (
+                    normalized(project, "slug-1"),
+                    normalized(project, "slug-1"),
+                ),
+                (),
+            ),
+            (
+                "duplicate-rejected",
+                (),
+                (
+                    RejectedArticle(
+                        "重复",
+                        "https://mp.weixin.qq.com/s/slug-1",
+                        "invalid_body",
+                    ),
+                    RejectedArticle(
+                        "重复",
+                        "https://mp.weixin.qq.com/s/slug-1",
+                        "invalid_body",
+                    ),
+                ),
+            ),
+        )
+        for name, valid, rejected in cases:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temp_dir:
+                backend = FakeBackend([project])
+                vault = RecordingVault()
+                result = CollectionPipeline(
+                    backend,
+                    runtime_dir=Path(temp_dir) / "runtime",
+                    vault_writer=vault,
+                    ingest=lambda _project, _root: IngestResult(
+                        valid=valid,
+                        rejected=rejected,
+                    ),
+                    now=lambda: NOW,
+                    sleep=lambda _seconds: None,
+                ).run([project], since="2026-01-01")
+
+                self.assertEqual(result.projects[0].downloaded, 0)
+                self.assertEqual(result.projects[0].failed, 1)
+                self.assertEqual(result.projects[0].status, "failed")
+                self.assertIn(
+                    "ingest: conflicting or duplicate outcome for 1 requested article",
+                    result.projects[0].error,
+                )
+                self.assertEqual([len(call[0]) for call in vault.calls], [0])
+
     def test_partial_payload_rejects_unknown_duplicate_or_mismatched_entries(self) -> None:
         cases = (
             (
@@ -1646,7 +1763,7 @@ class CliTests(unittest.TestCase):
     @patch(
         "inno_collector.cli.load_projects",
         side_effect=TypeError(
-            "unexpected '/Volumes/Private Disk/projects.json' token=type-secret"
+            r"unexpected 'X:\Work Folder\Projects\projects.json' token=type-secret"
         ),
     )
     def test_collect_unexpected_exception_uses_same_sanitized_boundary(
@@ -1672,7 +1789,7 @@ class CliTests(unittest.TestCase):
 
         self.assertEqual(exit_code, 2)
         self.assertIn("[path]", stderr.getvalue())
-        self.assertNotIn("Private Disk", stderr.getvalue())
+        self.assertNotIn("Work Folder", stderr.getvalue())
         self.assertNotIn("type-secret", stderr.getvalue())
 
 
