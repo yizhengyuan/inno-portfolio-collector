@@ -143,6 +143,66 @@ def _new_backup_path(parent: Path, asset_name: str) -> Path:
     raise ValueError("unsafe attachment backup")
 
 
+def _remove_regular_file(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+        raise ValueError("unsafe article file")
+    path.unlink()
+
+
+class _AttachmentCommit:
+    def __init__(
+        self,
+        final_directory: Path,
+        backup_directory: Path | None,
+        final_present: bool,
+    ) -> None:
+        self.final_directory = final_directory
+        self.backup_directory = backup_directory
+        self.final_present = final_present
+
+    def rollback(self) -> None:
+        if self.final_present:
+            _remove_directory(self.final_directory)
+            self.final_present = False
+        if self.backup_directory is not None:
+            os.replace(self.backup_directory, self.final_directory)
+            self.backup_directory = None
+
+    def finalize(self) -> None:
+        if self.backup_directory is not None:
+            _remove_directory(self.backup_directory)
+            self.backup_directory = None
+
+
+class _ArticleCommit:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.backup_path: Path | None = None
+        try:
+            details = path.lstat()
+        except FileNotFoundError:
+            return
+        if stat.S_ISLNK(details.st_mode) or not stat.S_ISREG(details.st_mode):
+            raise ValueError("unsafe article file")
+        self.backup_path = _new_backup_path(path.parent, path.name + ".article")
+        os.replace(path, self.backup_path)
+
+    def rollback(self) -> None:
+        _remove_regular_file(self.path)
+        if self.backup_path is not None:
+            os.replace(self.backup_path, self.path)
+            self.backup_path = None
+
+    def finalize(self) -> None:
+        if self.backup_path is not None:
+            _remove_regular_file(self.backup_path)
+            self.backup_path = None
+
+
 def _render_article(
     article: NormalizedArticle,
     read_status: str,
@@ -229,6 +289,24 @@ def _table(project_results: list[ProjectRunResult]) -> str:
     return "\n".join(rows)
 
 
+def _project_page_stems(projects: list[str]) -> dict[str, str]:
+    grouped: dict[str, list[str]] = {}
+    for project in projects:
+        base = _safe_filename(project, "未命名项目", 80)
+        grouped.setdefault(base, []).append(project)
+
+    stems: dict[str, str] = {}
+    for base, names in grouped.items():
+        ordered = sorted(names, key=lambda value: (value.casefold(), value))
+        if len(ordered) == 1:
+            stems[ordered[0]] = base
+            continue
+        for index, project in enumerate(ordered, start=1):
+            digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:8]
+            stems[project] = f"{base}-{index:02d}-{digest}"
+    return stems
+
+
 class VaultWriter:
     def __init__(self, root: Path) -> None:
         self.root = Path(root).resolve()
@@ -280,17 +358,21 @@ class VaultWriter:
 
     def _copy_attachments(
         self, article: NormalizedArticle
-    ) -> tuple[list[str], dict[str, PurePosixPath]]:
+    ) -> tuple[
+        list[str],
+        dict[str, PurePosixPath],
+        _AttachmentCommit | None,
+    ]:
         source = article.source_image_dir
         if source is None:
-            return [], {}
+            return [], {}, None
         source_path = Path(source)
         try:
             if source_path.is_symlink() or not source_path.is_dir():
-                return [], {}
+                return [], {}, None
             source_root = source_path.resolve(strict=True)
         except (OSError, RuntimeError):
-            return [], {}
+            return [], {}, None
 
         attachment_root = self._attachment_root(article)
         final_directory = self._path(attachment_root)
@@ -363,14 +445,14 @@ class VaultWriter:
                         project_directory, attachment_root.name
                     )
                     os.replace(final_directory, backup_directory)
-                    try:
-                        _remove_directory(backup_directory)
-                    except BaseException:
-                        os.replace(backup_directory, final_directory)
-                        backup_directory = None
-                        raise
+                    commit = _AttachmentCommit(
+                        final_directory,
+                        backup_directory,
+                        final_present=False,
+                    )
                     backup_directory = None
-                return [], {}
+                    return [], {}, commit
+                return [], {}, None
 
             if final_exists:
                 backup_directory = _new_backup_path(
@@ -385,21 +467,18 @@ class VaultWriter:
                     os.replace(backup_directory, final_directory)
                     backup_directory = None
                 raise
-            if backup_directory is not None:
-                _remove_directory(backup_directory)
-                backup_directory = None
-            return sorted(copied), mapping
+            commit = _AttachmentCommit(
+                final_directory,
+                backup_directory,
+                final_present=True,
+            )
+            backup_directory = None
+            return sorted(copied), mapping, commit
         finally:
             if stage_directory is not None:
                 _remove_directory(stage_directory)
-            if backup_directory is not None:
-                try:
-                    backup_directory.lstat()
-                except FileNotFoundError:
-                    pass
-                else:
-                    if not final_directory.exists():
-                        os.replace(backup_directory, final_directory)
+            if backup_directory is not None and not final_directory.exists():
+                os.replace(backup_directory, final_directory)
 
     def _rewrite_links(
         self,
@@ -447,6 +526,20 @@ class VaultWriter:
             source_relative = PurePosixPath(*relative.parts[3:]).as_posix()
             mapping[source_relative] = relative
         return mapping
+
+    def _attachment_roots(self, attachments: object) -> set[PurePosixPath]:
+        roots: set[PurePosixPath] = set()
+        if not isinstance(attachments, list):
+            return roots
+        for attachment in attachments:
+            relative = _safe_relative_path(attachment)
+            if (
+                relative is not None
+                and len(relative.parts) >= 4
+                and relative.parts[0] == "04-附件"
+            ):
+                roots.add(PurePosixPath(*relative.parts[:3]))
+        return roots
 
     def _safe_attachments(self, value: object) -> list[str]:
         if not isinstance(value, list):
@@ -533,6 +626,7 @@ class VaultWriter:
             if isinstance(record.get("project"), str)
         )
         project_names = sorted(projects, key=lambda value: (value.casefold(), value))
+        project_page_stems = _project_page_stems(project_names)
         expected_project_pages: set[str] = set()
 
         for project in project_names:
@@ -560,7 +654,7 @@ class VaultWriter:
                 title = str(record.get("title", "未命名文章")).replace("|", "-")
                 published = _plain_cell(record.get("published", ""))
                 lines.append(f"- {published} [[{target.as_posix()}|{title}]]")
-            page_name = _safe_filename(project, "未命名项目", 80) + ".md"
+            page_name = project_page_stems[project] + ".md"
             expected_project_pages.add(page_name)
             _atomic_write(
                 self._path(PurePosixPath("02-项目", page_name)),
@@ -589,7 +683,7 @@ class VaultWriter:
             "",
         ]
         home_lines.extend(
-            f"- [[02-项目/{_safe_filename(project, '未命名项目', 80)}|"
+            f"- [[02-项目/{project_page_stems[project]}|"
             f"{_plain_cell(project)}]]"
             for project in project_names
         )
@@ -639,72 +733,127 @@ class VaultWriter:
         store = ManifestStore(self._path("90-系统/manifest.json"))
         created = updated = unchanged = 0
         seen: set[str] = set()
+        stale_attachment_roots: set[PurePosixPath] = set()
+        committed_updates: list[
+            tuple[_ArticleCommit | None, _AttachmentCommit | None]
+        ] = []
 
-        for article in articles:
-            if article.key in seen:
-                continue
-            seen.add(article.key)
-            existing = store.get(article.key)
-            relative = (
-                None
-                if existing is None
-                else _article_relative_path(existing.get("path"))
+        try:
+            for article in articles:
+                if article.key in seen:
+                    continue
+                seen.add(article.key)
+                article_commit: _ArticleCommit | None = None
+                attachment_commit: _AttachmentCommit | None = None
+                try:
+                    existing = store.get(article.key)
+                    old_attachment_roots = self._attachment_roots(
+                        None if existing is None else existing.get("attachments")
+                    )
+                    relative = (
+                        None
+                        if existing is None
+                        else _article_relative_path(existing.get("path"))
+                    )
+                    if relative is None:
+                        relative = self._new_article_path(article)
+                    destination = self._path(relative)
+                    read_status = "unread"
+                    if existing is not None and isinstance(
+                        existing.get("read_status"), str
+                    ):
+                        read_status = existing["read_status"]
+                    if destination.is_file():
+                        read_status = _read_status(destination, read_status)
+
+                    (
+                        attachments,
+                        attachment_mapping,
+                        attachment_commit,
+                    ) = self._copy_attachments(article)
+                    if article.source_image_dir is None and existing is not None:
+                        attachments = self._safe_attachments(
+                            existing.get("attachments")
+                        )
+                        attachment_mapping = self._attachment_mapping(attachments)
+                    body = self._rewrite_links(article.body, attachment_mapping)
+                    stale_attachment_roots.update(
+                        old_attachment_roots - self._attachment_roots(attachments)
+                    )
+                    rendered_body = body.lstrip("\n")
+                    existing_body = (
+                        _read_article_body(destination)
+                        if destination.is_file()
+                        else None
+                    )
+
+                    same_hash = (
+                        existing is not None
+                        and existing.get("content_hash") == article.content_hash
+                        and destination.is_file()
+                        and existing_body == rendered_body
+                    )
+                    if same_hash:
+                        unchanged += 1
+                    else:
+                        article_commit = _ArticleCommit(destination)
+                        _atomic_write(
+                            destination,
+                            _render_article(article, read_status, body),
+                        )
+                        if existing is None:
+                            created += 1
+                        else:
+                            updated += 1
+
+                    store.upsert(
+                        article.key,
+                        {
+                            "key": article.key,
+                            "project": article.project,
+                            "account": article.account,
+                            "title": article.title,
+                            "published": article.published,
+                            "source_url": article.source_url,
+                            "collected_at": article.collected_at,
+                            "content_hash": article.content_hash,
+                            "read_status": read_status,
+                            "path": relative.as_posix(),
+                            "attachments": attachments,
+                        },
+                    )
+                except BaseException:
+                    if article_commit is not None:
+                        article_commit.rollback()
+                    if attachment_commit is not None:
+                        attachment_commit.rollback()
+                    raise
+                committed_updates.append((article_commit, attachment_commit))
+
+            self._sanitize_manifest(store)
+            store.save()
+        except BaseException:
+            for article_commit, attachment_commit in reversed(committed_updates):
+                if article_commit is not None:
+                    article_commit.rollback()
+                if attachment_commit is not None:
+                    attachment_commit.rollback()
+            raise
+
+        for article_commit, attachment_commit in committed_updates:
+            if article_commit is not None:
+                article_commit.finalize()
+            if attachment_commit is not None:
+                attachment_commit.finalize()
+        active_attachment_roots: set[PurePosixPath] = set()
+        for record in store.data["articles"].values():
+            active_attachment_roots.update(
+                self._attachment_roots(record.get("attachments"))
             )
-            if relative is None:
-                relative = self._new_article_path(article)
-            destination = self._path(relative)
-            read_status = "unread"
-            if existing is not None and isinstance(existing.get("read_status"), str):
-                read_status = existing["read_status"]
-            if destination.is_file():
-                read_status = _read_status(destination, read_status)
-
-            attachments, attachment_mapping = self._copy_attachments(article)
-            if article.source_image_dir is None and existing is not None:
-                attachments = self._safe_attachments(existing.get("attachments"))
-                attachment_mapping = self._attachment_mapping(attachments)
-            body = self._rewrite_links(article.body, attachment_mapping)
-            rendered_body = body.lstrip("\n")
-            existing_body = (
-                _read_article_body(destination) if destination.is_file() else None
-            )
-
-            same_hash = (
-                existing is not None
-                and existing.get("content_hash") == article.content_hash
-                and destination.is_file()
-                and existing_body == rendered_body
-            )
-            if same_hash:
-                unchanged += 1
-            else:
-                _atomic_write(
-                    destination,
-                    _render_article(article, read_status, body),
-                )
-                if existing is None:
-                    created += 1
-                else:
-                    updated += 1
-
-            store.upsert(
-                article.key,
-                {
-                    "key": article.key,
-                    "project": article.project,
-                    "account": article.account,
-                    "title": article.title,
-                    "published": article.published,
-                    "source_url": article.source_url,
-                    "collected_at": article.collected_at,
-                    "content_hash": article.content_hash,
-                    "read_status": read_status,
-                    "path": relative.as_posix(),
-                    "attachments": attachments,
-                },
-            )
-
-        self._sanitize_manifest(store)
-        store.save()
+        for stale_root in sorted(
+            stale_attachment_roots - active_attachment_roots,
+            key=PurePosixPath.as_posix,
+        ):
+            _remove_directory(self._path(stale_root))
         self._write_indexes(store, project_results)
         return VaultApplyResult(created, updated, unchanged)
