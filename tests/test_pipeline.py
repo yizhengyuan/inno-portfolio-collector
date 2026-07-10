@@ -4,7 +4,8 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import datetime, timezone
+from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -24,6 +25,7 @@ from inno_collector.pipeline import (
     PipelineAuthenticationError,
     PipelineConfigurationError,
     PipelineDeliveryError,
+    catalog_fingerprint,
 )
 from inno_collector.state import CatalogStateStore
 
@@ -315,6 +317,20 @@ class CollectionPipelineTests(unittest.TestCase):
             pipeline = self.build_pipeline(backend, runtime, vault)
 
             first = pipeline.run([project], since="2026-01-01")
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "articles": {
+                            existing_key: {
+                                "key": existing_key,
+                                "content_hash": "sha256:" + "a" * 64,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             backend.calls.clear()
             second = self.build_pipeline(backend, runtime, vault).run(
                 [project], since="2026-01-01"
@@ -623,6 +639,49 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertNotIn("vault-secret", result.projects[0].error)
         self.assertEqual([len(call[0]) for call in vault.calls], [1, 1, 0])
 
+    def test_cleanup_failure_is_local_redacted_and_preserves_successful_vault_write(self) -> None:
+        projects = [self.project(1), self.project(2)]
+        backend = FakeBackend(projects)
+        vault = RecordingVault()
+
+        class CleanupFailingPipeline(CollectionPipeline):
+            cleanup_calls = 0
+
+            def _cleanup_output_root(self, run_root: Path) -> None:
+                self.cleanup_calls += 1
+                if self.cleanup_calls == 1:
+                    raise OSError(
+                        "cleanup /Users/yzy/private token=cleanup-secret"
+                    )
+                super()._cleanup_output_root(run_root)
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pipeline = CleanupFailingPipeline(
+                backend,
+                runtime_dir=Path(temp_dir) / "runtime",
+                vault_writer=vault,
+                ingest=lambda project, _root: IngestResult(
+                    valid=(
+                        normalized(
+                            project,
+                            f"slug-{backend.projects.index(project) + 1}",
+                        ),
+                    ),
+                    rejected=(),
+                ),
+                now=lambda: NOW,
+                sleep=lambda _seconds: None,
+            )
+
+            result = pipeline.run(projects, since="2026-01-01")
+
+        self.assertEqual([item.status for item in result.projects], ["partial", "success"])
+        self.assertEqual([item.downloaded for item in result.projects], [1, 1])
+        self.assertNotIn("cleanup-secret", result.projects[0].error)
+        self.assertNotIn("/Users/", result.projects[0].error)
+        self.assertIn("cleanup", result.projects[0].error)
+        self.assertEqual([len(call[0]) for call in vault.calls], [1, 1, 0])
+
     def test_final_report_failure_raises_stable_delivery_error(self) -> None:
         project = self.project(1)
         backend = FakeBackend([project])
@@ -661,6 +720,9 @@ class CollectionPipelineTests(unittest.TestCase):
         cases = (
             ("temporary unavailable", 3),
             ("HTTP 503 invalid upstream response", 3),
+            ("HTTP 503 authentication failed", 1),
+            ("503 permission denied", 1),
+            ("503 invalid format", 1),
             ("403 forbidden", 1),
             ("invalid format", 1),
         )
@@ -742,7 +804,17 @@ class CollectionPipelineTests(unittest.TestCase):
             manifest.parent.mkdir(parents=True)
             key = article_key(row["url"])
             manifest.write_text(
-                json.dumps({"version": 1, "articles": {key: {"key": key}}}),
+                json.dumps(
+                    {
+                        "version": 1,
+                        "articles": {
+                            key: {
+                                "key": key,
+                                "content_hash": "sha256:" + "a" * 64,
+                            }
+                        },
+                    }
+                ),
                 encoding="utf-8",
             )
 
@@ -786,6 +858,257 @@ class CollectionPipelineTests(unittest.TestCase):
 
         self.assertTrue(any(call[0] == "download" for call in backend.calls))
         self.assertEqual(raw_changed.projects[0].downloaded, 1)
+
+    def test_content_verification_is_bounded_and_refreshes_silent_body_changes(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        row = backend.rows[1][0]
+        old_hash = "sha256:" + "1" * 64
+        new_hash = "sha256:" + "2" * 64
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            manifest = (
+                runtime
+                / "vault"
+                / "英诺被投项目资讯库"
+                / "90-系统"
+                / "manifest.json"
+            )
+            manifest.parent.mkdir(parents=True)
+            key = article_key(row["url"])
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "articles": {
+                            key: {"key": key, "content_hash": old_hash}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_path = runtime / "state" / "catalog-state.json"
+            state = CatalogStateStore(state_path)
+            state.mark_success(
+                key,
+                catalog_fingerprint(row),
+                content_hash=old_hash,
+                verified_at=NOW.isoformat(),
+            )
+            state.save()
+
+            within_backend = FakeBackend([project])
+            within_backend.rows[1] = [dict(row)]
+            within = CollectionPipeline(
+                within_backend,
+                runtime_dir=runtime,
+                vault_writer=RecordingVault(),
+                ingest=lambda _project, _root: IngestResult(valid=(), rejected=()),
+                now=lambda: NOW + timedelta(hours=23),
+                sleep=lambda _seconds: None,
+                verification_interval=timedelta(hours=24),
+            ).run([project], since="2026-01-01")
+            self.assertFalse(
+                any(call[0] == "download" for call in within_backend.calls)
+            )
+            self.assertEqual(within.projects[0].skipped, 1)
+
+            expired_backend = FakeBackend([project])
+            expired_backend.rows[1] = [dict(row)]
+            updated_article = replace(
+                normalized(project, "slug-1"),
+                content_hash=new_hash,
+                body="静默变化后的正文" * 20,
+            )
+            expired = CollectionPipeline(
+                expired_backend,
+                runtime_dir=runtime,
+                vault_writer=RecordingVault(),
+                ingest=lambda _project, _root: IngestResult(
+                    valid=(updated_article,), rejected=()
+                ),
+                now=lambda: NOW + timedelta(hours=25),
+                sleep=lambda _seconds: None,
+                verification_interval=timedelta(hours=24),
+            ).run([project], since="2026-01-01")
+
+            refreshed = CatalogStateStore(state_path).get_record(key)
+
+        self.assertTrue(any(call[0] == "download" for call in expired_backend.calls))
+        self.assertEqual(expired.projects[0].downloaded, 1)
+        assert refreshed is not None
+        self.assertEqual(refreshed["content_hash"], new_hash)
+        self.assertEqual(
+            refreshed["verified_at"],
+            (NOW + timedelta(hours=25)).isoformat(),
+        )
+
+    def test_legacy_catalog_state_and_manifest_hash_mismatch_force_refresh(self) -> None:
+        for mode in ("legacy", "hash-mismatch"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temp_dir:
+                project = self.project(1)
+                backend = FakeBackend([project])
+                row = backend.rows[1][0]
+                runtime = Path(temp_dir) / "runtime"
+                manifest = (
+                    runtime
+                    / "vault"
+                    / "英诺被投项目资讯库"
+                    / "90-系统"
+                    / "manifest.json"
+                )
+                manifest.parent.mkdir(parents=True)
+                key = article_key(row["url"])
+                manifest_hash = "sha256:" + "1" * 64
+                manifest.write_text(
+                    json.dumps(
+                        {
+                            "version": 1,
+                            "articles": {
+                                key: {"key": key, "content_hash": manifest_hash}
+                            },
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+                state = CatalogStateStore(runtime / "state" / "catalog-state.json")
+                if mode == "legacy":
+                    state.mark_success(key, catalog_fingerprint(row))
+                else:
+                    state.mark_success(
+                        key,
+                        catalog_fingerprint(row),
+                        content_hash="sha256:" + "2" * 64,
+                        verified_at=NOW.isoformat(),
+                    )
+                state.save()
+
+                result = self.build_pipeline(
+                    backend, runtime, RecordingVault()
+                ).run([project], since="2026-01-01")
+
+                self.assertTrue(
+                    any(call[0] == "download" for call in backend.calls)
+                )
+                self.assertEqual(result.projects[0].downloaded, 1)
+
+    def test_expired_verification_failure_does_not_advance_state(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        row = backend.rows[1][0]
+        key = article_key(row["url"])
+        old_hash = "sha256:" + "1" * 64
+        with tempfile.TemporaryDirectory() as temp_dir:
+            runtime = Path(temp_dir) / "runtime"
+            manifest = (
+                runtime
+                / "vault"
+                / "英诺被投项目资讯库"
+                / "90-系统"
+                / "manifest.json"
+            )
+            manifest.parent.mkdir(parents=True)
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "articles": {
+                            key: {"key": key, "content_hash": old_hash}
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state_path = runtime / "state" / "catalog-state.json"
+            state = CatalogStateStore(state_path)
+            state.mark_success(
+                key,
+                catalog_fingerprint(row),
+                content_hash=old_hash,
+                verified_at=NOW.isoformat(),
+            )
+            state.save()
+            before = state_path.read_bytes()
+            vault = RecordingVault()
+            vault.fail_on_calls.add(1)
+
+            CollectionPipeline(
+                backend,
+                runtime_dir=runtime,
+                vault_writer=vault,
+                ingest=lambda _project, _root: IngestResult(
+                    valid=(normalized(project, "slug-1"),), rejected=()
+                ),
+                now=lambda: NOW + timedelta(hours=25),
+                sleep=lambda _seconds: None,
+                verification_interval=timedelta(hours=24),
+            ).run([project], since="2026-01-01")
+
+            self.assertEqual(state_path.read_bytes(), before)
+
+    def test_invalid_or_missing_urls_after_cutoff_are_discovered_failures(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [
+            article_row(10, "valid"),
+            {"id": 11, "url": "", "publish_time": "2026-01-02"},
+            {
+                "id": 12,
+                "url": "https://example.com/not-wechat",
+                "publish_time": "2026-01-03",
+            },
+            {
+                "id": 13,
+                "url": "https://example.com/old",
+                "publish_time": "2025-12-31",
+            },
+            {"id": 14, "url": "", "publish_time": "not-a-date"},
+        ]
+        vault = RecordingVault()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pipeline = CollectionPipeline(
+                backend,
+                runtime_dir=Path(temp_dir) / "runtime",
+                vault_writer=vault,
+                ingest=lambda _project, _root: IngestResult(
+                    valid=(normalized(project, "valid"),), rejected=()
+                ),
+                now=lambda: NOW,
+                sleep=lambda _seconds: None,
+            )
+            result = pipeline.run([project], since="2026-01-01")
+
+        self.assertEqual(result.projects[0].discovered, 3)
+        self.assertEqual(result.projects[0].downloaded, 1)
+        self.assertEqual(result.projects[0].failed, 2)
+        self.assertEqual(result.projects[0].status, "partial")
+        self.assertIn("2 invalid or missing urls", result.projects[0].error)
+
+    def test_catalog_failures_and_batch_exception_are_counted_additively(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [
+            article_row(10, "valid"),
+            {"id": 11, "url": "", "publish_time": "2026-01-02"},
+            {
+                "id": 12,
+                "url": "https://example.com/not-wechat",
+                "publish_time": "2026-01-03",
+            },
+        ]
+        backend.download_errors[10] = "403 forbidden"
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.build_pipeline(
+                backend,
+                Path(temp_dir) / "runtime",
+                RecordingVault(),
+            ).run([project], since="2026-01-01")
+
+        self.assertEqual(result.projects[0].discovered, 3)
+        self.assertEqual(result.projects[0].failed, 3)
+        self.assertEqual(result.projects[0].status, "failed")
+        self.assertIn("2 invalid or missing urls", result.projects[0].error)
+        self.assertIn("403 forbidden", result.projects[0].error)
 
     def test_failed_vault_write_does_not_make_next_run_skip_changed_catalog(self) -> None:
         project = self.project(1)

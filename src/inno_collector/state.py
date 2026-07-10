@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -130,11 +131,26 @@ def _validate_catalog_state(data: object) -> dict[str, Any]:
     except ValueError:
         raise ValueError("unsupported catalog state format") from None
     for record in manifest["articles"].values():
+        if not isinstance(record.get("fingerprint"), str) or _FINGERPRINT.fullmatch(
+            record["fingerprint"]
+        ) is None:
+            raise ValueError("unsupported catalog state format") from None
+        if set(record) == {"fingerprint"}:
+            continue
         if (
-            set(record) != {"fingerprint"}
-            or not isinstance(record.get("fingerprint"), str)
-            or _FINGERPRINT.fullmatch(record["fingerprint"]) is None
+            set(record) != {"fingerprint", "content_hash", "verified_at"}
+            or not isinstance(record.get("content_hash"), str)
+            or _FINGERPRINT.fullmatch(record["content_hash"]) is None
+            or not isinstance(record.get("verified_at"), str)
         ):
+            raise ValueError("unsupported catalog state format") from None
+        try:
+            verified_at = datetime.fromisoformat(
+                record["verified_at"].replace("Z", "+00:00")
+            )
+        except ValueError:
+            raise ValueError("unsupported catalog state format") from None
+        if verified_at.tzinfo is None or verified_at.utcoffset() is None:
             raise ValueError("unsupported catalog state format") from None
     return manifest
 
@@ -144,13 +160,30 @@ class CatalogStateStore(ManifestStore):
         return _validate_catalog_state(data)
 
     def get(self, key: str) -> str | None:
-        record = super().get(key)
+        record = self.get_record(key)
         if record is None:
             return None
         return str(record["fingerprint"])
 
-    def mark_success(self, key: str, fingerprint: str) -> None:
+    def get_record(self, key: str) -> dict[str, Any] | None:
+        return super().get(key)
+
+    def mark_success(
+        self,
+        key: str,
+        fingerprint: str,
+        *,
+        content_hash: str | None = None,
+        verified_at: str | None = None,
+    ) -> None:
         record = {"fingerprint": fingerprint}
+        if content_hash is not None or verified_at is not None:
+            record.update(
+                {
+                    "content_hash": content_hash,
+                    "verified_at": verified_at,
+                }
+            )
         _validate_catalog_state(
             {"version": 1, "articles": {key: record}}
         )

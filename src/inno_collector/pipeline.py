@@ -9,12 +9,16 @@ import stat
 import tempfile
 import time
 from collections.abc import Callable, Iterable
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 from .exporter import _sanitize
-from .identity import article_key, canonical_url, select_since
+from .identity import (
+    article_key,
+    canonical_url,
+    select_since_with_invalid_urls,
+)
 from .ingest import ingest_account_output
 from .models import (
     IngestResult,
@@ -78,17 +82,19 @@ _TRANSIENT_TEXT = (
     "rate limit",
     "too many requests",
 )
-_NON_TRANSIENT_TEXT = (
-    "401",
-    "403",
+_AUTHORIZATION_TEXT = (
     "authentication",
     "authorization",
     "forbidden",
     "permission",
-    "invalid",
+)
+_CONFIGURATION_TEXT = (
     "format",
     "unsafe",
     "account match",
+)
+_NON_TRANSIENT_TEXT = (
+    "invalid",
 )
 _TRANSIENT_ERRNOS = {
     errno.ECONNABORTED,
@@ -187,7 +193,11 @@ def _is_transient(error: Exception) -> bool:
     if isinstance(error, OSError) and error.errno in _TRANSIENT_ERRNOS:
         return True
     message = str(error).casefold()
-    if re.search(r"(?<!\d)(?:401|403)(?!\d)", message) is not None:
+    if (
+        re.search(r"(?<!\d)(?:401|403)(?!\d)", message) is not None
+        or any(marker in message for marker in _AUTHORIZATION_TEXT)
+        or any(marker in message for marker in _CONFIGURATION_TEXT)
+    ):
         return False
     if _TRANSIENT_STATUS.search(message) is not None:
         return True
@@ -216,7 +226,13 @@ class CollectionPipeline:
         ingest: Callable[[ProjectAccount, Path], IngestResult] = ingest_account_output,
         now: Callable[[], datetime] = lambda: datetime.now().astimezone(),
         sleep: Callable[[float], None] = time.sleep,
+        verification_interval: timedelta = timedelta(hours=24),
     ) -> None:
+        if (
+            not isinstance(verification_interval, timedelta)
+            or verification_interval < timedelta(0)
+        ):
+            raise ValueError("verification interval must be non-negative")
         self.backend = backend
         self.runtime_dir = Path(runtime_dir)
         self.vault_root = self.runtime_dir / "vault" / "英诺被投项目资讯库"
@@ -224,6 +240,7 @@ class CollectionPipeline:
         self.ingest = ingest
         self.now = now
         self.sleep = sleep
+        self.verification_interval = verification_interval
 
     def _retry(self, operation: Callable[[], object]) -> object:
         for delay in (1.0, 3.0, None):
@@ -235,12 +252,12 @@ class CollectionPipeline:
                 self.sleep(delay)
         raise AssertionError("unreachable")
 
-    def _manifest_keys(self) -> set[str]:
+    def _manifest_records(self) -> dict[str, dict]:
         manifest_path = self.vault_root / "90-系统" / "manifest.json"
         if not manifest_path.exists():
-            return set()
+            return {}
         try:
-            return set(ManifestStore(manifest_path).data["articles"])
+            return ManifestStore(manifest_path).data["articles"]
         except (OSError, UnicodeError, ValueError):
             raise PipelineConfigurationError("existing manifest is invalid") from None
 
@@ -255,8 +272,9 @@ class CollectionPipeline:
     def _download_plan(
         self,
         rows: list[dict],
-        available_keys: set[str],
+        manifest_records: dict[str, dict],
         catalog_state: CatalogStateStore,
+        verification_time: datetime,
     ) -> tuple[list[int], dict[str, str], int, int]:
         ids: list[int] = []
         fingerprints: dict[str, str] = {}
@@ -270,7 +288,35 @@ class CollectionPipeline:
             except (TypeError, ValueError):
                 failed += 1
                 continue
-            if key in available_keys and catalog_state.get(key) == fingerprint:
+            state_record = catalog_state.get_record(key)
+            manifest_record = manifest_records.get(key)
+            verified_at: datetime | None = None
+            if state_record is not None and isinstance(
+                state_record.get("verified_at"), str
+            ):
+                try:
+                    verified_at = datetime.fromisoformat(
+                        state_record["verified_at"].replace("Z", "+00:00")
+                    )
+                except ValueError:
+                    verified_at = None
+            age = (
+                None
+                if verified_at is None
+                else verification_time - verified_at.astimezone(
+                    verification_time.tzinfo
+                )
+            )
+            if (
+                manifest_record is not None
+                and state_record is not None
+                and state_record.get("fingerprint") == fingerprint
+                and isinstance(state_record.get("content_hash"), str)
+                and manifest_record.get("content_hash")
+                == state_record["content_hash"]
+                and age is not None
+                and timedelta(0) <= age < self.verification_interval
+            ):
                 skipped += 1
                 continue
             try:
@@ -536,12 +582,15 @@ class CollectionPipeline:
             catalog_state = CatalogStateStore(state_path)
         except (OSError, UnicodeError, ValueError):
             raise PipelineConfigurationError("existing catalog state is invalid") from None
-        manifest_keys = self._manifest_keys()
+        manifest_records = self._manifest_records()
         accepted_keys: set[str] = set()
         article_count = 0
         duplicate_count = 0
         results: list[ProjectRunResult] = []
         writer = self.vault_writer or VaultWriter(self.vault_root)
+        verification_time = self.now()
+        if verification_time.tzinfo is None or verification_time.utcoffset() is None:
+            verification_time = verification_time.astimezone()
 
         for index, project in enumerate(project_list):
             if index in resolution_errors:
@@ -565,8 +614,10 @@ class CollectionPipeline:
             error = ""
             issues: list[str] = []
             article_ids: list[int] = []
+            pending_failures = 0
             run_root: Path | None = None
             vault_succeeded = False
+            cleanup_error: Exception | None = None
             try:
                 if not dry_run:
                     sync_payload = self._retry(
@@ -590,13 +641,22 @@ class CollectionPipeline:
                     raise PipelineConfigurationError(
                         "exporter returned invalid article list"
                     )
-                selected = select_since(rows, since)
-                discovered = len(selected)
+                selected, invalid_url_count = select_since_with_invalid_urls(
+                    rows, since
+                )
+                discovered = len(selected) + invalid_url_count
+                failed += invalid_url_count
+                if invalid_url_count:
+                    issues.append(
+                        "article catalog contained "
+                        f"{invalid_url_count} invalid or missing urls"
+                    )
                 article_ids, fingerprints, skipped, invalid_count = (
                     self._download_plan(
                         selected,
-                        manifest_keys | accepted_keys,
+                        manifest_records,
                         catalog_state,
+                        verification_time,
                     )
                 )
                 failed += invalid_count
@@ -607,6 +667,7 @@ class CollectionPipeline:
                     )
 
                 if not dry_run and article_ids:
+                    pending_failures = len(article_ids)
                     run_root = self._temporary_output_root(account_roots[index])
                     payload = self._retry(
                         lambda: self.backend.download(article_ids, run_root)
@@ -636,6 +697,7 @@ class CollectionPipeline:
                             skipped += 1
                             continue
                         candidates.append(article)
+                    pending_failures = len(candidates)
                     missing_count = len(expected_keys - outcome_keys)
                     batch_failures = max(
                         payload_failures,
@@ -670,25 +732,57 @@ class CollectionPipeline:
                         )
                         writer.apply(candidates, [provisional])
                         vault_succeeded = True
+                        pending_failures = 0
                         downloaded = len(candidates)
                         accepted_keys.update(article.key for article in candidates)
                         article_count += downloaded
+                        verified_at = self.now()
+                        if (
+                            verified_at.tzinfo is None
+                            or verified_at.utcoffset() is None
+                        ):
+                            verified_at = verified_at.astimezone()
                         for article in candidates:
                             catalog_state.mark_success(
-                                article.key, fingerprints[article.key]
+                                article.key,
+                                fingerprints[article.key],
+                                content_hash=article.content_hash,
+                                verified_at=verified_at.isoformat(),
                             )
                         catalog_state.save()
+                        for article in candidates:
+                            manifest_records[article.key] = {
+                                "content_hash": article.content_hash
+                            }
                 error = "; ".join(issues)
             except Exception as exc:
                 if not vault_succeeded:
                     downloaded = 0
-                    failed = max(failed, len(article_ids) or 1)
+                    failed += pending_failures or 1
                 else:
                     failed = max(failed, 1)
-                error = _safe_error(exc)
+                exception_message = _safe_error(exc)
+                issue_message = "; ".join(issues)
+                error = (
+                    f"{issue_message}; {exception_message}"
+                    if issue_message
+                    else exception_message
+                )
             finally:
                 if run_root is not None:
-                    self._cleanup_output_root(run_root)
+                    try:
+                        self._cleanup_output_root(run_root)
+                    except Exception as exc:
+                        cleanup_error = exc
+
+            if cleanup_error is not None:
+                failed = max(failed, 1)
+                cleanup_message = (
+                    "staging cleanup failed: " + _safe_error(cleanup_error)
+                )
+                error = (
+                    f"{error}; {cleanup_message}" if error else cleanup_message
+                )
 
             results.append(
                 self._project_result(

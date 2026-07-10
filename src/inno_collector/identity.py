@@ -73,20 +73,24 @@ def _numeric_id(value: object) -> int:
         return 0
 
 
-def select_since(rows: list[dict], since: str) -> list[dict]:
+def select_since_with_invalid_urls(
+    rows: list[dict], since: str
+) -> tuple[list[dict], int]:
     cutoff = date.fromisoformat(since)
     selected: list[dict] = []
     seen: set[str] = set()
+    invalid_urls = 0
 
     for row in rows:
         published = _published_date(row.get("publish_time"))
         url = str(row.get("url") or "")
-        if published is None or published < cutoff or not url:
+        if published is None or published < cutoff:
             continue
 
         try:
             key = article_key(url)
         except ValueError:
+            invalid_urls += 1
             continue
         if key in seen:
             continue
@@ -100,4 +104,8 @@ def select_since(rows: list[dict], since: str) -> list[dict]:
         ),
         reverse=True,
     )
-    return selected
+    return selected, invalid_urls
+
+
+def select_since(rows: list[dict], since: str) -> list[dict]:
+    return select_since_with_invalid_urls(rows, since)[0]

@@ -290,6 +290,39 @@ class CatalogStateStoreTests(unittest.TestCase):
             "sha256:" + "a" * 64,
         )
 
+    def test_records_content_hash_and_timezone_aware_verification_time(self) -> None:
+        store = CatalogStateStore(self.path)
+        store.mark_success(
+            "sha256:key",
+            "sha256:" + "a" * 64,
+            content_hash="sha256:" + "b" * 64,
+            verified_at="2026-07-11T09:30:00+00:00",
+        )
+        store.save()
+
+        self.assertEqual(
+            CatalogStateStore(self.path).get_record("sha256:key"),
+            {
+                "fingerprint": "sha256:" + "a" * 64,
+                "content_hash": "sha256:" + "b" * 64,
+                "verified_at": "2026-07-11T09:30:00+00:00",
+            },
+        )
+
+    def test_legacy_fingerprint_only_record_loads_for_conservative_migration(self) -> None:
+        self.path.parent.mkdir(parents=True)
+        legacy = {
+            "version": 1,
+            "articles": {
+                "sha256:key": {"fingerprint": "sha256:" + "a" * 64}
+            },
+        }
+        self.path.write_text(json.dumps(legacy), encoding="utf-8")
+
+        store = CatalogStateStore(self.path)
+
+        self.assertEqual(store.get_record("sha256:key"), legacy["articles"]["sha256:key"])
+
     def test_rejects_invalid_catalog_fingerprint_records(self) -> None:
         self.path.parent.mkdir(parents=True)
         invalid_payloads = (
@@ -301,6 +334,16 @@ class CatalogStateStoreTests(unittest.TestCase):
                     "sha256:key": {
                         "fingerprint": "sha256:" + "a" * 64,
                         "extra": True,
+                    }
+                },
+            },
+            {
+                "version": 1,
+                "articles": {
+                    "sha256:key": {
+                        "fingerprint": "sha256:" + "a" * 64,
+                        "content_hash": "sha256:" + "b" * 64,
+                        "verified_at": "2026-07-11T09:30:00",
                     }
                 },
             },
