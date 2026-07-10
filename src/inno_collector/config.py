@@ -16,15 +16,18 @@ def load_projects(path: Path) -> tuple[ProjectAccount, ...]:
     account_names: set[str] = set()
 
     for item in payload:
-        if not item.get("enabled", True):
+        enabled = bool(item.get("enabled", True))
+        if not enabled:
             continue
 
-        project = item.get("project", "").strip()
-        account = item.get("account", "").strip()
-        wechat_id = item.get("wechat_id", "").strip()
-        confidence = item.get("confidence", "").strip()
+        project = str(item.get("project", "")).strip()
+        account = str(item.get("account", "")).strip()
+        wechat_id = str(item.get("wechat_id", "")).strip()
+        confidence = str(item.get("confidence", "")).strip()
         aliases = tuple(
-            alias.strip() for alias in item.get("aliases", ()) if alias.strip()
+            str(value).strip()
+            for value in item.get("aliases", [])
+            if str(value).strip()
         )
 
         if not project or not account:
@@ -44,7 +47,7 @@ def load_projects(path: Path) -> tuple[ProjectAccount, ...]:
                 account=account,
                 wechat_id=wechat_id,
                 confidence=confidence,
-                enabled=True,
+                enabled=enabled,
                 aliases=aliases,
             )
         )

@@ -125,6 +125,32 @@ class ProjectConfigTests(unittest.TestCase):
             ),
         )
 
+    def test_normalizes_non_string_json_scalars(self) -> None:
+        projects = self.load_payload(
+            [
+                {
+                    "project": 101,
+                    "account": 202,
+                    "wechat_id": 303,
+                    "confidence": "high",
+                    "aliases": [404, "  别名  "],
+                }
+            ]
+        )
+
+        self.assertEqual(
+            projects,
+            (
+                ProjectAccount(
+                    project="101",
+                    account="202",
+                    wechat_id="303",
+                    confidence="high",
+                    aliases=("404", "别名"),
+                ),
+            ),
+        )
+
 
 class DomainModelTests(unittest.TestCase):
     def test_models_are_frozen_slotted_dataclasses_with_expected_fields(self) -> None:
