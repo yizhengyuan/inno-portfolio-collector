@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, patch
 
 from inno_collector.exporter import (
     ExporterCommandError,
@@ -86,6 +88,28 @@ class MooreExporterAdapterTests(unittest.TestCase):
 
         self.assertEqual(str(raised.exception), "exporter command failed")
 
+    def test_non_object_json_payload_raises_stable_protocol_error(self) -> None:
+        for payload in ([], None):
+            with self.subTest(payload=payload):
+                runner = FakeRunner((0, json.dumps(payload), ""))
+
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).auth_check()
+
+                self.assertEqual(
+                    str(raised.exception), "exporter returned invalid JSON object"
+                )
+
+    def test_string_ok_values_never_succeed(self) -> None:
+        for ok_value in ("false", "true"):
+            with self.subTest(ok=ok_value):
+                runner = FakeRunner((0, json.dumps({"ok": ok_value}), ""))
+
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).auth_check()
+
+                self.assertEqual(str(raised.exception), "exporter command failed")
+
     def test_non_json_stdout_raises_a_sanitized_error(self) -> None:
         runner = FakeRunner((0, "not json token=invalid-json-secret", ""))
 
@@ -163,6 +187,52 @@ class MooreExporterAdapterTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][-4:], ["--account-id", "7", "--limit", "12"])
         self.assertEqual(runner.calls[1][-4:], ["--account-id", "7", "--limit", "34"])
 
+    def test_accounts_rejects_invalid_collections(self) -> None:
+        for accounts in ("not-a-list", [{"id": 1}, "not-an-object"]):
+            with self.subTest(accounts=accounts):
+                runner = FakeRunner(
+                    (0, json.dumps({"ok": True, "accounts": accounts}), "")
+                )
+
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).accounts()
+
+                self.assertEqual(
+                    str(raised.exception), "exporter returned invalid accounts"
+                )
+
+    def test_articles_rejects_invalid_collections(self) -> None:
+        for articles in ({"id": 1}, [{"id": 1}, 2]):
+            with self.subTest(articles=articles):
+                runner = FakeRunner(
+                    (0, json.dumps({"ok": True, "articles": articles}), "")
+                )
+
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).articles(7)
+
+                self.assertEqual(
+                    str(raised.exception), "exporter returned invalid articles"
+                )
+
+    def test_empty_account_and_article_lists_are_allowed(self) -> None:
+        runner = FakeRunner(
+            (0, json.dumps({"ok": True, "accounts": []}), ""),
+            (0, json.dumps({"ok": True, "articles": []}), ""),
+        )
+        adapter = self.adapter(runner)
+
+        self.assertEqual(adapter.accounts(), [])
+        self.assertEqual(adapter.articles(7), [])
+
+    def test_large_successful_articles_payload_is_not_truncated(self) -> None:
+        articles = [{"id": 1, "body": "x" * 10000}]
+        runner = FakeRunner(
+            (0, json.dumps({"ok": True, "articles": articles}), "")
+        )
+
+        self.assertEqual(self.adapter(runner).articles(7), articles)
+
     def test_resolve_exact_matches_each_configured_identifier(self) -> None:
         project = ProjectAccount(
             project="Project A",
@@ -180,6 +250,28 @@ class MooreExporterAdapterTests(unittest.TestCase):
         for row, expected_id in cases:
             with self.subTest(expected_id=expected_id):
                 self.assertEqual(adapter.resolve_exact(project, [row])["id"], expected_id)
+
+    def test_resolve_exact_rejects_identifiers_in_crossed_fields(self) -> None:
+        project = ProjectAccount(
+            project="Project A",
+            account="Official Name",
+            wechat_id="wx_alpha",
+            aliases=("Alpha Labs",),
+        )
+        rows = (
+            {"id": 1, "nickname": "WX_ALPHA", "alias": "other"},
+            {"id": 2, "nickname": "other", "alias": "official name"},
+            {"id": 3, "nickname": "other", "alias": "alpha labs"},
+        )
+        adapter = self.adapter(FakeRunner())
+
+        for row in rows:
+            with self.subTest(row=row):
+                with self.assertRaisesRegex(
+                    ExporterCommandError,
+                    "^expected one exact account match for Project A, got 0$",
+                ):
+                    adapter.resolve_exact(project, [row])
 
     def test_resolve_exact_rejects_zero_matches_without_fuzzy_matching(self) -> None:
         project = ProjectAccount(project="Project A", account="Alpha")
@@ -230,6 +322,56 @@ class MooreExporterAdapterTests(unittest.TestCase):
         self.assertEqual(sanitized.count("[REDACTED]"), 6)
         self.assertIn("safe=value", sanitized)
 
+    def test_sanitize_redacts_common_secret_formats(self) -> None:
+        cases = (
+            "token: colon-secret",
+            '"token": "json-secret"',
+            'token="quoted-secret"',
+            "Authorization: Bearer bearer-secret",
+            "--auth-key cli-secret",
+        )
+
+        for message in cases:
+            with self.subTest(message=message):
+                sanitized = _sanitize(message)
+                self.assertNotIn("secret", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+                runner = FakeRunner(
+                    (0, json.dumps({"ok": False, "error": message}), "")
+                )
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).auth_check()
+                self.assertNotIn("secret", str(raised.exception))
+
+    def test_error_diagnostic_length_is_bounded(self) -> None:
+        runner = FakeRunner((2, json.dumps({"ok": True}), "failure: " + "x" * 10000))
+
+        with self.assertRaises(ExporterCommandError) as raised:
+            self.adapter(runner).auth_check()
+
+        message = str(raised.exception)
+        self.assertLessEqual(len(message), 4096)
+        self.assertTrue(message.startswith("failure: "))
+
+    def test_timeout_is_converted_without_command_details(self) -> None:
+        def timeout_runner(command: list[str]) -> tuple[int, str, str]:
+            raise subprocess.TimeoutExpired(
+                [*command, "--auth-key", "timeout-secret"],
+                timeout=300,
+            )
+
+        adapter = MooreExporterAdapter(
+            self.script,
+            self.runtime_dir,
+            runner=timeout_runner,
+        )
+
+        with self.assertRaises(ExporterCommandError) as raised:
+            adapter.auth_check()
+
+        self.assertEqual(str(raised.exception), "exporter command timed out")
+
     def test_default_runner_captures_stdout_stderr_and_exit_code(self) -> None:
         command = [
             sys.executable,
@@ -240,6 +382,27 @@ class MooreExporterAdapterTests(unittest.TestCase):
         result = _default_runner(command)
 
         self.assertEqual(result, (3, "out\n", "err\n"))
+
+    @patch("inno_collector.exporter.subprocess.run")
+    def test_default_runner_sets_subprocess_timeout(self, run: Mock) -> None:
+        run.return_value = subprocess.CompletedProcess(
+            args=["exporter"],
+            returncode=0,
+            stdout="out",
+            stderr="err",
+        )
+        command = ["exporter", "auth"]
+
+        result = _default_runner(command)
+
+        self.assertEqual(result, (0, "out", "err"))
+        run.assert_called_once_with(
+            command,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=300,
+        )
 
 
 if __name__ == "__main__":
