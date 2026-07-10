@@ -78,6 +78,14 @@ class MooreExporterAdapterTests(unittest.TestCase):
         self.assertNotIn("topsecret", str(raised.exception))
         self.assertIn("auth-key=[REDACTED]", str(raised.exception))
 
+    def test_unsuccessful_payload_without_details_uses_stable_error(self) -> None:
+        runner = FakeRunner((0, json.dumps({"ok": False}), ""))
+
+        with self.assertRaises(ExporterCommandError) as raised:
+            self.adapter(runner).auth_check()
+
+        self.assertEqual(str(raised.exception), "exporter command failed")
+
     def test_non_json_stdout_raises_a_sanitized_error(self) -> None:
         runner = FakeRunner((0, "not json token=invalid-json-secret", ""))
 

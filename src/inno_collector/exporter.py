@@ -62,7 +62,7 @@ class MooreExporterAdapter:
             raise ExporterCommandError(_sanitize(message)) from exc
 
         if code != 0 or not payload.get("ok", False):
-            message = payload.get("error") or stderr or f"{command} failed"
+            message = payload.get("error") or stderr or "exporter command failed"
             raise ExporterCommandError(_sanitize(str(message)))
         return payload
 
