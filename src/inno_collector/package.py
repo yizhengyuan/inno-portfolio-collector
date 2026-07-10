@@ -561,12 +561,15 @@ def _available_output(output: Path, now_value: datetime) -> tuple[Path, Path]:
     raise DeliveryValidationError({"errors": ["unable to allocate delivery filename"]})
 
 
-def _snapshot_vault(source: Path, snapshot: Path) -> None:
+def _snapshot_vault(
+    source: Path, snapshot: Path
+) -> tuple[dict[PurePosixPath, str], set[PurePosixPath]]:
     files, directories, inventory_errors, fingerprints = _inventory(source)
     policy_errors = _inventory_policy_errors(files, directories, fingerprints)
     if inventory_errors or policy_errors:
         raise DeliveryValidationError({"errors": sorted(inventory_errors + policy_errors)})
     snapshot.mkdir()
+    snapshot_hashes: dict[PurePosixPath, str] = {}
     for relative in sorted(directories, key=lambda item: (len(item.parts), item.as_posix())):
         snapshot.joinpath(*relative.parts).mkdir()
     for relative in sorted(files, key=lambda item: item.as_posix()):
@@ -587,6 +590,8 @@ def _snapshot_vault(source: Path, snapshot: Path) -> None:
         destination = snapshot.joinpath(*relative.parts)
         destination.parent.mkdir(parents=True, exist_ok=True)
         destination.write_bytes(payload)
+        snapshot_hashes[relative] = hashlib.sha256(payload).hexdigest()
+    return snapshot_hashes, set(directories)
 
 
 def _reserve_output_pair(destination: Path, summary: Path) -> None:
@@ -644,7 +649,7 @@ def build_delivery_zip(
             lock_handle = os.fdopen(lock_descriptor, "rb")
             fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
         snapshot = Path(snapshot_context.name) / "vault"
-        _snapshot_vault(root, snapshot)
+        snapshot_hashes, snapshot_directories = _snapshot_vault(root, snapshot)
         report = lint_vault(snapshot)
         if report["errors"]:
             raise DeliveryValidationError(report)
@@ -653,8 +658,12 @@ def build_delivery_zip(
         with tempfile.NamedTemporaryFile(dir=destination_parent, prefix=".delivery-", suffix=".tmp", delete=False) as handle:
             zip_temp = Path(handle.name)
         files, directories, inventory_errors, _ = _inventory(snapshot)
-        if inventory_errors:
-            raise DeliveryValidationError({"errors": inventory_errors})
+        if (
+            inventory_errors
+            or set(files) != set(snapshot_hashes)
+            or set(directories) != snapshot_directories
+        ):
+            raise DeliveryValidationError({"errors": inventory_errors or ["snapshot changed after validation"]})
         included_files = [path for path in files if path.as_posix() not in _SAFE_IGNORED_LOCKS]
         included_directories = [path for path in directories if path.as_posix() not in _SAFE_IGNORED_LOCKS]
         top = root.name
@@ -666,6 +675,8 @@ def build_delivery_zip(
                 if _is_forbidden(relative):
                     raise DeliveryValidationError({"errors": [relative.as_posix()]})
                 payload = _open_regular(snapshot.joinpath(*relative.parts))
+                if hashlib.sha256(payload).hexdigest() != snapshot_hashes[relative]:
+                    raise DeliveryValidationError({"errors": ["snapshot changed after validation"]})
                 archive.writestr(f"{top}/{relative.as_posix()}", payload)
         digest = hashlib.sha256(zip_temp.read_bytes()).hexdigest()
         summary = (
