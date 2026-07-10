@@ -27,7 +27,7 @@ DELIMITED_SECRET_RE = re.compile(
 )
 AUTHORIZATION_RE = re.compile(
     r"(?i)(?<![\w-])((?:\"|')?authorization(?:\"|')?\s*[:=]\s*"
-    r"(?:\"|')?bearer\s+)[^\s,}\"']+"
+    r"(?:\"|')?bearer\s+(?:\"|')?)[^\s,}\"']+"
 )
 CLI_SECRET_RE = re.compile(
     r"(?i)(--(?:auth-key|pass_ticket|appmsg_token|token|ticket|uin)\s+)"

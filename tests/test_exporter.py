@@ -381,6 +381,26 @@ class MooreExporterAdapterTests(unittest.TestCase):
                 self.assertNotIn(secret, str(raised.exception))
                 self.assertIn("[REDACTED]", str(raised.exception))
 
+    def test_sanitize_redacts_quoted_bearer_tokens(self) -> None:
+        cases = (
+            'Authorization: Bearer "double-quoted-secret"',
+            "Authorization: Bearer 'single-quoted-secret'",
+        )
+
+        for message in cases:
+            with self.subTest(message=message):
+                sanitized = _sanitize(message)
+                self.assertNotIn("quoted-secret", sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+                runner = FakeRunner(
+                    (0, json.dumps({"ok": False, "error": message}), "")
+                )
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).auth_check()
+                self.assertNotIn("quoted-secret", str(raised.exception))
+                self.assertIn("[REDACTED]", str(raised.exception))
+
     def test_error_diagnostic_length_is_bounded(self) -> None:
         runner = FakeRunner((2, json.dumps({"ok": True}), "failure: " + "x" * 10000))
 
