@@ -290,18 +290,27 @@ def _table(project_results: list[ProjectRunResult]) -> str:
 
 
 def _project_page_stems(projects: list[str]) -> dict[str, str]:
-    grouped: dict[str, list[str]] = {}
+    grouped: dict[str, list[tuple[str, str]]] = {}
     for project in projects:
         base = _safe_filename(project, "未命名项目", 80)
-        grouped.setdefault(base, []).append(project)
+        collision_key = unicodedata.normalize("NFC", base).casefold()
+        grouped.setdefault(collision_key, []).append((project, base))
 
     stems: dict[str, str] = {}
-    for base, names in grouped.items():
-        ordered = sorted(names, key=lambda value: (value.casefold(), value))
+    for entries in grouped.values():
+        ordered = sorted(
+            entries,
+            key=lambda item: (
+                unicodedata.normalize("NFC", item[0]).casefold(),
+                unicodedata.normalize("NFC", item[0]),
+                item[0],
+            ),
+        )
         if len(ordered) == 1:
-            stems[ordered[0]] = base
+            project, base = ordered[0]
+            stems[project] = base
             continue
-        for index, project in enumerate(ordered, start=1):
+        for index, (project, base) in enumerate(ordered, start=1):
             digest = hashlib.sha256(project.encode("utf-8")).hexdigest()[:8]
             stems[project] = f"{base}-{index:02d}-{digest}"
     return stems

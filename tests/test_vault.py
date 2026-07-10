@@ -4,6 +4,7 @@ import json
 import re
 import tempfile
 import unittest
+import unicodedata
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -310,6 +311,31 @@ class VaultWriterTests(unittest.TestCase):
             (self.vault / "00-首页.md").read_bytes(),
             (other_vault / "00-首页.md").read_bytes(),
         )
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in (self.vault / "02-项目").glob("*.md")
+            },
+            {
+                path.name: path.read_bytes()
+                for path in (other_vault / "02-项目").glob("*.md")
+            },
+        )
+
+    def test_project_pages_are_unique_under_casefold_and_nfc_semantics(self) -> None:
+        projects = ["Foo", "foo", "Caf\u00e9", "Cafe\u0301"]
+        results = [self.project_result(project=project) for project in projects]
+        other_vault = self.root / "casefold-other"
+
+        VaultWriter(self.vault).apply([], results)
+        VaultWriter(other_vault).apply([], list(reversed(results)))
+
+        pages = sorted(path.name for path in (self.vault / "02-项目").glob("*.md"))
+        semantic_names = {
+            unicodedata.normalize("NFC", page).casefold() for page in pages
+        }
+        self.assertEqual(len(pages), len(projects))
+        self.assertEqual(len(semantic_names), len(projects))
         self.assertEqual(
             {
                 path.name: path.read_bytes()
