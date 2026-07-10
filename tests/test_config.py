@@ -46,6 +46,84 @@ class ProjectConfigTests(unittest.TestCase):
         ):
             self.load_payload({"project": "雷鸟创新"})
 
+    def test_requires_config_items_to_be_json_objects(self) -> None:
+        with self.assertRaisesRegex(
+            ValueError, "project config item must be a JSON object"
+        ):
+            self.load_payload(["not an object"])
+
+    def test_enabled_must_be_json_boolean(self) -> None:
+        for enabled in ("false", 0, None, ""):
+            with self.subTest(enabled=enabled):
+                with self.assertRaisesRegex(
+                    ValueError, "^enabled must be a JSON boolean$"
+                ):
+                    self.load_payload(
+                        [
+                            {
+                                "project": "项目",
+                                "account": "账号",
+                                "confidence": "high",
+                                "enabled": enabled,
+                            }
+                        ]
+                    )
+
+        projects = self.load_payload(
+            [{"project": "项目", "account": "账号", "confidence": "high"}]
+        )
+        self.assertTrue(projects[0].enabled)
+
+    def test_aliases_must_be_json_array(self) -> None:
+        for aliases in ("别名", {"alias": True}, None):
+            with self.subTest(aliases=aliases):
+                with self.assertRaisesRegex(
+                    ValueError, "^aliases must be a JSON array$"
+                ):
+                    self.load_payload(
+                        [
+                            {
+                                "project": "项目",
+                                "account": "账号",
+                                "confidence": "high",
+                                "aliases": aliases,
+                            }
+                        ]
+                    )
+
+    def test_normalizes_null_string_fields_as_empty(self) -> None:
+        for field_name in ("project", "account"):
+            with self.subTest(field=field_name):
+                item = {
+                    "project": "项目",
+                    "account": "账号",
+                    "confidence": "high",
+                    field_name: None,
+                }
+                with self.assertRaisesRegex(
+                    ValueError, "^project and account names must not be empty$"
+                ):
+                    self.load_payload([item])
+
+        projects = self.load_payload(
+            [
+                {
+                    "project": "项目",
+                    "account": "账号",
+                    "wechat_id": None,
+                    "confidence": "high",
+                }
+            ]
+        )
+        self.assertEqual(projects[0].wechat_id, "")
+
+        with self.assertRaisesRegex(
+            ValueError, "^all enabled account mappings must have high confidence$"
+        ):
+            self.load_payload(
+                [{"project": "项目", "account": "账号", "confidence": None}]
+            )
+
     def test_rejects_blank_project_or_account(self) -> None:
         for field_name in ("project", "account"):
             with self.subTest(field=field_name):

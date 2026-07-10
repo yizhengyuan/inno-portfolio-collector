@@ -6,6 +6,10 @@ from pathlib import Path
 from .models import ProjectAccount
 
 
+def _string(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
 def load_projects(path: Path) -> tuple[ProjectAccount, ...]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list):
@@ -16,18 +20,25 @@ def load_projects(path: Path) -> tuple[ProjectAccount, ...]:
     account_names: set[str] = set()
 
     for item in payload:
-        enabled = bool(item.get("enabled", True))
+        if not isinstance(item, dict):
+            raise ValueError("project config item must be a JSON object")
+
+        enabled_raw = item.get("enabled", True)
+        if not isinstance(enabled_raw, bool):
+            raise ValueError("enabled must be a JSON boolean")
+        enabled = bool(enabled_raw)
         if not enabled:
             continue
 
-        project = str(item.get("project", "")).strip()
-        account = str(item.get("account", "")).strip()
-        wechat_id = str(item.get("wechat_id", "")).strip()
-        confidence = str(item.get("confidence", "")).strip()
+        project = _string(item.get("project", ""))
+        account = _string(item.get("account", ""))
+        wechat_id = _string(item.get("wechat_id", ""))
+        confidence = _string(item.get("confidence", ""))
+        aliases_raw = item.get("aliases", [])
+        if not isinstance(aliases_raw, list):
+            raise ValueError("aliases must be a JSON array")
         aliases = tuple(
-            str(value).strip()
-            for value in item.get("aliases", [])
-            if str(value).strip()
+            _string(value) for value in aliases_raw if _string(value)
         )
 
         if not project or not account:
