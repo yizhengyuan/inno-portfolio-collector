@@ -9,6 +9,7 @@ import shutil
 import stat
 import tempfile
 import unicodedata
+import uuid
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
 
@@ -21,6 +22,7 @@ _UNSAFE_FILENAME = re.compile(r'[/\\:*?"<>|\[\]]')
 _SHA256_KEY = re.compile(r"^sha256:([0-9a-fA-F]{8,})$")
 _PUBLISHED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _IMAGE_LINK = re.compile(r"(!\[[^\]\n]*\]\()([^\)\n]+)(\))")
+_ARTICLE_BODY = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 
 
@@ -122,6 +124,25 @@ def _atomic_copy(source: Path, destination: Path) -> None:
             temporary.unlink()
 
 
+def _remove_directory(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise ValueError("unsafe attachment directory")
+    shutil.rmtree(path)
+
+
+def _new_backup_path(parent: Path, asset_name: str) -> Path:
+    candidate = parent / f".{asset_name}.backup-{uuid.uuid4().hex}"
+    try:
+        candidate.lstat()
+    except FileNotFoundError:
+        return candidate
+    raise ValueError("unsafe attachment backup")
+
+
 def _render_article(
     article: NormalizedArticle,
     read_status: str,
@@ -160,6 +181,17 @@ def _read_status(path: Path, fallback: str) -> str:
             return fallback
         return value if isinstance(value, str) else fallback
     return fallback
+
+
+def _read_article_body(path: Path) -> str | None:
+    try:
+        contents = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    match = _ARTICLE_BODY.match(contents)
+    if match is None:
+        return None
+    return contents[match.end() :]
 
 
 def _plain_cell(value: object) -> str:
@@ -261,50 +293,121 @@ class VaultWriter:
             return [], {}
 
         attachment_root = self._attachment_root(article)
+        final_directory = self._path(attachment_root)
+        project_directory = self._path(attachment_root.parent)
+        project_directory.mkdir(parents=True, exist_ok=True)
+        try:
+            final_details = final_directory.lstat()
+        except FileNotFoundError:
+            final_exists = False
+        else:
+            if stat.S_ISLNK(final_details.st_mode) or not stat.S_ISDIR(
+                final_details.st_mode
+            ):
+                raise ValueError("unsafe attachment directory")
+            final_exists = True
+
+        stage_directory: Path | None = Path(
+            tempfile.mkdtemp(
+                dir=project_directory,
+                prefix=f".{attachment_root.name}.stage-",
+            )
+        )
+        backup_directory: Path | None = None
         copied: list[str] = []
         mapping: dict[str, PurePosixPath] = {}
-        for directory, directory_names, filenames in os.walk(
-            source_root, topdown=True, followlinks=False
-        ):
-            current = Path(directory)
-            directory_names[:] = sorted(
-                name
-                for name in directory_names
-                if not name.startswith(".") and not (current / name).is_symlink()
-            )
-            for filename in sorted(filenames):
-                if filename.startswith("."):
-                    continue
-                candidate = current / filename
-                if candidate.suffix.casefold() not in _IMAGE_EXTENSIONS:
-                    continue
+        try:
+            assert stage_directory is not None
+            for directory, directory_names, filenames in os.walk(
+                source_root, topdown=True, followlinks=False
+            ):
+                current = Path(directory)
+                directory_names[:] = sorted(
+                    name
+                    for name in directory_names
+                    if not name.startswith(".")
+                    and not (current / name).is_symlink()
+                )
+                for filename in sorted(filenames):
+                    if filename.startswith("."):
+                        continue
+                    candidate = current / filename
+                    if candidate.suffix.casefold() not in _IMAGE_EXTENSIONS:
+                        continue
+                    try:
+                        details = candidate.lstat()
+                        resolved = candidate.resolve(strict=True)
+                        resolved.relative_to(source_root)
+                    except (OSError, RuntimeError, ValueError):
+                        continue
+                    if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(
+                        details.st_mode
+                    ):
+                        continue
+                    relative_source = resolved.relative_to(source_root)
+                    relative_posix = PurePosixPath(*relative_source.parts)
+                    destination_relative = attachment_root / relative_posix
+                    stage_destination = stage_directory.joinpath(
+                        *relative_posix.parts
+                    )
+                    _atomic_copy(resolved, stage_destination)
+                    destination_text = destination_relative.as_posix()
+                    copied.append(destination_text)
+                    mapping[relative_posix.as_posix()] = destination_relative
+
+            if not copied:
+                _remove_directory(stage_directory)
+                stage_directory = None
+                if final_exists:
+                    backup_directory = _new_backup_path(
+                        project_directory, attachment_root.name
+                    )
+                    os.replace(final_directory, backup_directory)
+                    try:
+                        _remove_directory(backup_directory)
+                    except BaseException:
+                        os.replace(backup_directory, final_directory)
+                        backup_directory = None
+                        raise
+                    backup_directory = None
+                return [], {}
+
+            if final_exists:
+                backup_directory = _new_backup_path(
+                    project_directory, attachment_root.name
+                )
+                os.replace(final_directory, backup_directory)
+            try:
+                os.replace(stage_directory, final_directory)
+                stage_directory = None
+            except BaseException:
+                if backup_directory is not None:
+                    os.replace(backup_directory, final_directory)
+                    backup_directory = None
+                raise
+            if backup_directory is not None:
+                _remove_directory(backup_directory)
+                backup_directory = None
+            return sorted(copied), mapping
+        finally:
+            if stage_directory is not None:
+                _remove_directory(stage_directory)
+            if backup_directory is not None:
                 try:
-                    details = candidate.lstat()
-                    resolved = candidate.resolve(strict=True)
-                    resolved.relative_to(source_root)
-                except (OSError, RuntimeError, ValueError):
-                    continue
-                if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(details.st_mode):
-                    continue
-                relative_source = resolved.relative_to(source_root)
-                relative_posix = PurePosixPath(*relative_source.parts)
-                destination_relative = attachment_root / relative_posix
-                destination = self._path(destination_relative)
-                _atomic_copy(resolved, destination)
-                destination_text = destination_relative.as_posix()
-                copied.append(destination_text)
-                mapping[relative_posix.as_posix()] = destination_relative
-        return sorted(copied), mapping
+                    backup_directory.lstat()
+                except FileNotFoundError:
+                    pass
+                else:
+                    if not final_directory.exists():
+                        os.replace(backup_directory, final_directory)
 
     def _rewrite_links(
         self,
-        article: NormalizedArticle,
+        body: str,
         mapping: dict[str, PurePosixPath],
     ) -> str:
-        source = article.source_image_dir
-        if source is None or not mapping:
-            return article.body
-        source_name = Path(source).name
+        if not mapping:
+            return body
 
         def replace_link(match: re.Match[str]) -> str:
             raw_target = match.group(2)
@@ -314,7 +417,8 @@ class VaultWriter:
             target = PurePosixPath(decoded)
             if (
                 len(target.parts) < 4
-                or target.parts[:3] != ("..", "images", source_name)
+                or target.parts[:2] != ("..", "images")
+                or target.parts[2] in {"", ".", ".."}
                 or any(part in {"", ".", ".."} for part in target.parts[3:])
             ):
                 return match.group(0)
@@ -326,7 +430,23 @@ class VaultWriter:
             rewritten = rewritten.replace(" ", "%20")
             return f"{match.group(1)}{rewritten}{match.group(3)}"
 
-        return _IMAGE_LINK.sub(replace_link, article.body)
+        return _IMAGE_LINK.sub(replace_link, body)
+
+    def _attachment_mapping(
+        self, attachments: list[str]
+    ) -> dict[str, PurePosixPath]:
+        mapping: dict[str, PurePosixPath] = {}
+        for attachment in attachments:
+            relative = _safe_relative_path(attachment)
+            if (
+                relative is None
+                or len(relative.parts) < 4
+                or relative.parts[0] != "04-附件"
+            ):
+                continue
+            source_relative = PurePosixPath(*relative.parts[3:]).as_posix()
+            mapping[source_relative] = relative
+        return mapping
 
     def _safe_attachments(self, value: object) -> list[str]:
         if not isinstance(value, list):
@@ -388,10 +508,23 @@ class VaultWriter:
         store: ManifestStore,
         project_results: list[ProjectRunResult],
     ) -> None:
+        sorted_results = sorted(
+            project_results,
+            key=lambda result: (
+                result.project,
+                result.account,
+                result.status,
+                result.discovered,
+                result.downloaded,
+                result.skipped,
+                result.failed,
+                result.error,
+            ),
+        )
         records = store.data["articles"]
         projects = {
             result.project
-            for result in project_results
+            for result in sorted_results
             if isinstance(result.project, str)
         }
         projects.update(
@@ -400,6 +533,7 @@ class VaultWriter:
             if isinstance(record.get("project"), str)
         )
         project_names = sorted(projects, key=lambda value: (value.casefold(), value))
+        expected_project_pages: set[str] = set()
 
         for project in project_names:
             articles = [
@@ -427,10 +561,22 @@ class VaultWriter:
                 published = _plain_cell(record.get("published", ""))
                 lines.append(f"- {published} [[{target.as_posix()}|{title}]]")
             page_name = _safe_filename(project, "未命名项目", 80) + ".md"
+            expected_project_pages.add(page_name)
             _atomic_write(
                 self._path(PurePosixPath("02-项目", page_name)),
                 ("\n".join(lines).rstrip() + "\n").encode("utf-8"),
             )
+
+        project_directory = self._path("02-项目")
+        for entry in project_directory.iterdir():
+            if entry.name in expected_project_pages or entry.suffix.casefold() != ".md":
+                continue
+            try:
+                details = entry.lstat()
+            except OSError:
+                continue
+            if stat.S_ISREG(details.st_mode) and not stat.S_ISLNK(details.st_mode):
+                entry.unlink()
 
         home_lines = [
             "# 英诺项目文章库",
@@ -452,21 +598,21 @@ class VaultWriter:
             ("\n".join(home_lines).rstrip() + "\n").encode("utf-8"),
         )
 
-        status = "# 采集状态\n\n" + _table(project_results) + "\n"
+        status = "# 采集状态\n\n" + _table(sorted_results) + "\n"
         _atomic_write(self._path("01-采集状态.md"), status.encode("utf-8"))
 
         failed_projects = sum(
             result.failed > 0
             or result.status.strip().casefold() not in {"success", "ok", "completed"}
-            for result in project_results
+            for result in sorted_results
         )
         report = (
             "# 本次采集报告\n\n"
-            f"- 项目数：{len(project_results)}\n"
+            f"- 项目数：{len(sorted_results)}\n"
             f"- 失败项目数：{failed_projects}\n"
             f"- 文章总数：{len(records)}\n\n"
             "## 项目统计\n\n"
-            + _table(project_results)
+            + _table(sorted_results)
             + "\n"
         )
         _atomic_write(
@@ -488,6 +634,8 @@ class VaultWriter:
         articles: list[NormalizedArticle],
         project_results: list[ProjectRunResult],
     ) -> VaultApplyResult:
+        for relative in ("02-项目", "03-文章", "04-附件", "90-系统"):
+            self._path(relative).mkdir(parents=True, exist_ok=True)
         store = ManifestStore(self._path("90-系统/manifest.json"))
         created = updated = unchanged = 0
         seen: set[str] = set()
@@ -514,12 +662,18 @@ class VaultWriter:
             attachments, attachment_mapping = self._copy_attachments(article)
             if article.source_image_dir is None and existing is not None:
                 attachments = self._safe_attachments(existing.get("attachments"))
-            body = self._rewrite_links(article, attachment_mapping)
+                attachment_mapping = self._attachment_mapping(attachments)
+            body = self._rewrite_links(article.body, attachment_mapping)
+            rendered_body = body.lstrip("\n")
+            existing_body = (
+                _read_article_body(destination) if destination.is_file() else None
+            )
 
             same_hash = (
                 existing is not None
                 and existing.get("content_hash") == article.content_hash
                 and destination.is_file()
+                and existing_body == rendered_body
             )
             if same_hash:
                 unchanged += 1

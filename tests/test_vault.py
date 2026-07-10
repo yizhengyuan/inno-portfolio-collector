@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from inno_collector import vault as vault_module
@@ -107,6 +108,14 @@ class VaultWriterTests(unittest.TestCase):
         self.assertEqual(article_path.read_bytes(), original_bytes)
         self.assertEqual(article_path.stat().st_mtime_ns, original_mtime)
 
+    def test_empty_apply_precreates_all_vault_directories(self) -> None:
+        result = VaultWriter(self.vault).apply([], [])
+
+        self.assertEqual(result, VaultApplyResult(created=0, updated=0, unchanged=0))
+        for relative in ("02-项目", "03-文章", "04-附件", "90-系统"):
+            with self.subTest(relative=relative):
+                self.assertTrue((self.vault / relative).is_dir())
+
     def test_changed_hash_updates_in_place_and_preserves_edited_read_status(self) -> None:
         writer = VaultWriter(self.vault)
         original = self.article()
@@ -198,6 +207,66 @@ class VaultWriterTests(unittest.TestCase):
         self.assertIn("总文章数：3", home)
         self.assertIn("零文章项目", home)
 
+    def test_project_page_cleanup_removes_only_stale_regular_markdown(self) -> None:
+        writer = VaultWriter(self.vault)
+        writer.apply(
+            [self.article(project="旧项目")],
+            [self.project_result(project="旧项目")],
+        )
+        project_directory = self.vault / "02-项目"
+        stale = project_directory / "手工旧页.md"
+        stale.write_text("stale", encoding="utf-8")
+        keep_text = project_directory / "保留.txt"
+        keep_text.write_text("keep", encoding="utf-8")
+        keep_directory = project_directory / "目录.md"
+        keep_directory.mkdir()
+        external = self.root / "external.md"
+        external.write_text("external", encoding="utf-8")
+        keep_symlink = project_directory / "链接.md"
+        keep_symlink.symlink_to(external)
+
+        writer.apply(
+            [self.article(project="新项目")],
+            [self.project_result(project="新项目")],
+        )
+
+        self.assertFalse((project_directory / "旧项目.md").exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue((project_directory / "新项目.md").is_file())
+        self.assertTrue(keep_text.is_file())
+        self.assertTrue(keep_directory.is_dir())
+        self.assertTrue(keep_symlink.is_symlink())
+        self.assertEqual(external.read_text(encoding="utf-8"), "external")
+
+    def test_status_and_report_are_independent_of_project_result_order(self) -> None:
+        first = self.project_result(
+            project="乙项目",
+            account="乙账号",
+            discovered=3,
+            downloaded=2,
+            skipped=1,
+        )
+        second = self.project_result(
+            project="甲项目",
+            account="甲账号",
+            discovered=4,
+            downloaded=1,
+            failed=3,
+            status="failed",
+            error="failure",
+        )
+        other_vault = self.root / "other-vault"
+
+        VaultWriter(self.vault).apply([], [first, second])
+        VaultWriter(other_vault).apply([], [second, first])
+
+        for relative in ("01-采集状态.md", "90-系统/collection-report.md"):
+            with self.subTest(relative=relative):
+                self.assertEqual(
+                    (self.vault / relative).read_bytes(),
+                    (other_vault / relative).read_bytes(),
+                )
+
     def test_copies_only_safe_images_and_rewrites_only_existing_local_links(
         self,
     ) -> None:
@@ -233,6 +302,182 @@ class VaultWriterTests(unittest.TestCase):
         self.assertIn("nested/a%20b.png", rendered)
         self.assertIn("https://example.com/remote.png", rendered)
         self.assertIn("../images/%E6%BA%90%20%E5%9B%BE/missing.jpg", rendered)
+
+    def test_same_hash_late_images_update_body_once_then_stay_unchanged(self) -> None:
+        body = "![后补](../images/later/a.png)\n"
+        article = self.article(body=body, source_image_dir=None)
+        writer = VaultWriter(self.vault)
+        writer.apply([article], [self.project_result()])
+        path = self.article_path()
+        before = path.read_bytes()
+        image_directory = self.root / "export" / "images" / "later"
+        image_directory.mkdir(parents=True)
+        (image_directory / "a.png").write_bytes(b"late-image")
+
+        updated = writer.apply(
+            [replace(article, source_image_dir=image_directory)],
+            [self.project_result()],
+        )
+
+        self.assertEqual(updated, VaultApplyResult(created=0, updated=1, unchanged=0))
+        self.assertNotEqual(path.read_bytes(), before)
+        self.assertIn("../../04-附件/", path.read_text(encoding="utf-8"))
+        updated_mtime = path.stat().st_mtime_ns
+
+        unchanged = writer.apply(
+            [replace(article, source_image_dir=image_directory)],
+            [self.project_result()],
+        )
+
+        self.assertEqual(
+            unchanged, VaultApplyResult(created=0, updated=0, unchanged=1)
+        )
+        self.assertEqual(path.stat().st_mtime_ns, updated_mtime)
+
+    def test_hash_change_without_source_images_keeps_existing_vault_links(self) -> None:
+        image_directory = self.root / "export" / "images" / "existing"
+        image_directory.mkdir(parents=True)
+        (image_directory / "nested").mkdir()
+        (image_directory / "nested" / "a.png").write_bytes(b"existing-image")
+        original = self.article(
+            body="![现有](../images/existing/nested/a.png)\n",
+            source_image_dir=image_directory,
+        )
+        writer = VaultWriter(self.vault)
+        writer.apply([original], [self.project_result()])
+        self.assertIn(
+            "../../04-附件/", self.article_path().read_text(encoding="utf-8")
+        )
+
+        changed = replace(
+            original,
+            content_hash="sha256:new-body",
+            body="新增正文。\n\n![现有](../images/renamed-source/nested/a.png)\n",
+            source_image_dir=None,
+        )
+        result = writer.apply([changed], [self.project_result()])
+
+        self.assertEqual(result, VaultApplyResult(created=0, updated=1, unchanged=0))
+        rendered = self.article_path().read_text(encoding="utf-8")
+        self.assertIn("新增正文", rendered)
+        self.assertIn("../../04-附件/", rendered)
+        self.assertNotIn("../images/renamed-source", rendered)
+        attachment = self.vault / self.manifest()["articles"][changed.key][
+            "attachments"
+        ][0]
+        self.assertEqual(attachment.read_bytes(), b"existing-image")
+
+    def test_attachment_batch_copy_failure_leaves_no_manifest_or_final_or_stage(
+        self,
+    ) -> None:
+        image_directory = self.root / "export" / "images" / "batch"
+        image_directory.mkdir(parents=True)
+        (image_directory / "a.png").write_bytes(b"a")
+        (image_directory / "b.png").write_bytes(b"b")
+        article = self.article(
+            body=(
+                "![a](../images/batch/a.png)\n"
+                "![b](../images/batch/b.png)\n"
+            ),
+            source_image_dir=image_directory,
+        )
+        original_copy = vault_module._atomic_copy
+        calls = 0
+
+        def fail_second(source: Path, destination: Path) -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise OSError("second copy failed")
+            original_copy(source, destination)
+
+        with patch.object(vault_module, "_atomic_copy", side_effect=fail_second):
+            with self.assertRaisesRegex(OSError, "second copy failed"):
+                VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        manifest_path = self.vault / "90-系统" / "manifest.json"
+        if manifest_path.exists():
+            self.assertNotIn(article.key, self.manifest()["articles"])
+        project_assets = self.vault / "04-附件" / "项目甲"
+        self.assertEqual(list(project_assets.iterdir()) if project_assets.exists() else [], [])
+        self.assertEqual(list((self.vault / "03-文章").rglob("*.md")), [])
+
+    def test_attachment_snapshot_replacement_physically_removes_old_files(self) -> None:
+        image_directory = self.root / "export" / "images" / "snapshot"
+        image_directory.mkdir(parents=True)
+        (image_directory / "a.png").write_bytes(b"a-v1")
+        (image_directory / "b.png").write_bytes(b"b-v1")
+        article = self.article(
+            body=(
+                "![a](../images/snapshot/a.png)\n"
+                "![b](../images/snapshot/b.png)\n"
+            ),
+            source_image_dir=image_directory,
+        )
+        writer = VaultWriter(self.vault)
+        writer.apply([article], [self.project_result()])
+        first_attachments = self.manifest()["articles"][article.key]["attachments"]
+        old_b = self.vault / next(
+            attachment for attachment in first_attachments if attachment.endswith("b.png")
+        )
+        self.assertTrue(old_b.is_file())
+        (image_directory / "a.png").write_bytes(b"a-v2")
+        (image_directory / "b.png").unlink()
+        changed = replace(
+            article,
+            content_hash="sha256:snapshot-v2",
+            body="![a](../images/snapshot/a.png)\n",
+        )
+
+        result = writer.apply([changed], [self.project_result()])
+
+        self.assertEqual(result, VaultApplyResult(created=0, updated=1, unchanged=0))
+        attachments = self.manifest()["articles"][article.key]["attachments"]
+        self.assertEqual(len(attachments), 1)
+        self.assertTrue(attachments[0].endswith("a.png"))
+        self.assertEqual((self.vault / attachments[0]).read_bytes(), b"a-v2")
+        self.assertFalse(old_b.exists())
+        asset_root = (self.vault / attachments[0]).parent
+        self.assertEqual(
+            sorted(path.name for path in asset_root.iterdir()),
+            ["a.png"],
+        )
+
+    def test_attachment_swap_refuses_preexisting_symlink_backup(self) -> None:
+        image_directory = self.root / "export" / "images" / "backup"
+        image_directory.mkdir(parents=True)
+        (image_directory / "a.png").write_bytes(b"old")
+        article = self.article(
+            body="![a](../images/backup/a.png)\n",
+            source_image_dir=image_directory,
+        )
+        writer = VaultWriter(self.vault)
+        writer.apply([article], [self.project_result()])
+        attachment = self.vault / self.manifest()["articles"][article.key][
+            "attachments"
+        ][0]
+        asset_root = attachment.parent
+        old_bytes = attachment.read_bytes()
+        external = self.root / "external-backup"
+        external.mkdir()
+        backup = asset_root.parent / f".{asset_root.name}.backup-fixed"
+        backup.symlink_to(external, target_is_directory=True)
+        (image_directory / "a.png").write_bytes(b"new")
+
+        with patch.object(
+            vault_module.uuid,
+            "uuid4",
+            return_value=SimpleNamespace(hex="fixed"),
+        ):
+            with self.assertRaisesRegex(ValueError, "unsafe attachment backup"):
+                writer.apply(
+                    [replace(article, content_hash="sha256:new")],
+                    [self.project_result()],
+                )
+
+        self.assertTrue(backup.is_symlink())
+        self.assertEqual(attachment.read_bytes(), old_bytes)
+        self.assertEqual(list(external.iterdir()), [])
 
     def test_status_report_and_readme_cover_project_outcomes(self) -> None:
         results = [
