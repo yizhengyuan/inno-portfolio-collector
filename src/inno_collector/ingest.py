@@ -8,7 +8,7 @@ import json
 import re
 from datetime import date, datetime
 from pathlib import Path, PureWindowsPath
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import unquote, urlsplit, urlunsplit
 
 from .identity import article_key, canonical_url
 from .models import IngestResult, NormalizedArticle, ProjectAccount, RejectedArticle
@@ -77,6 +77,94 @@ def yaml_string(value: object) -> str:
     return json.dumps(str(value), ensure_ascii=False)
 
 
+def markdown_image_destinations(value: str) -> list[tuple[int, int, str]]:
+    """Return destination spans for CommonMark images with balanced parentheses."""
+    destinations: list[tuple[int, int, str]] = []
+    cursor = 0
+    while True:
+        start = value.find("![", cursor)
+        if start < 0:
+            return destinations
+        label_end = value.find("](", start + 2)
+        if label_end < 0 or "\n" in value[start:label_end]:
+            cursor = start + 2
+            continue
+        inner_start = label_end + 2
+        depth = 0
+        escaped = False
+        closing = -1
+        for index in range(inner_start, len(value)):
+            character = value[index]
+            if character == "\n":
+                break
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == "(":
+                depth += 1
+            elif character == ")":
+                if depth == 0:
+                    closing = index
+                    break
+                depth -= 1
+        if closing < 0:
+            cursor = label_end + 2
+            continue
+        raw = value[inner_start:closing]
+        stripped = raw.strip()
+        offset = inner_start + len(raw) - len(raw.lstrip())
+        if stripped.startswith("<") and ">" in stripped:
+            end = stripped.index(">") + 1
+            destination = stripped[1 : end - 1]
+            destinations.append((offset + 1, offset + end - 1, destination))
+        else:
+            nested = 0
+            escaped = False
+            end = len(stripped)
+            for index, character in enumerate(stripped):
+                if escaped:
+                    escaped = False
+                elif character == "\\":
+                    escaped = True
+                elif character == "(":
+                    nested += 1
+                elif character == ")" and nested:
+                    nested -= 1
+                elif character.isspace() and nested == 0:
+                    end = index
+                    break
+            if end:
+                destinations.append((offset, offset + end, stripped[:end]))
+        cursor = closing + 1
+
+
+def canonical_body_for_hash(body: str) -> str:
+    replacements: list[tuple[int, int, str]] = []
+    for start, end, raw in markdown_image_destinations(body):
+        decoded = unquote(raw).replace("\\", "/")
+        path = PureWindowsPath(decoded) if re.match(r"^[A-Za-z]:", decoded) else None
+        if path is not None:
+            continue
+        parts = tuple(part for part in decoded.split("/") if part)
+        relative: tuple[str, ...] | None = None
+        if len(parts) >= 4 and parts[:2] == ("..", "images"):
+            relative = parts[3:]
+        elif len(parts) >= 6 and parts[:3] == ("..", "..", "04-附件"):
+            relative = parts[5:]
+        if relative and all(part not in {".", ".."} for part in relative):
+            replacements.append((start, end, "asset:" + "/".join(relative)))
+    canonical = body
+    for start, end, replacement in reversed(replacements):
+        canonical = canonical[:start] + replacement + canonical[end:]
+    return canonical
+
+
+def canonical_body_hash(body: str) -> str:
+    digest = hashlib.sha256(canonical_body_for_hash(body).encode("utf-8")).hexdigest()
+    return f"sha256:{digest}"
+
+
 def ingest_account_output(project: ProjectAccount, root: Path) -> IngestResult:
     output_root = root.resolve()
     rows = _read_index(output_root)
@@ -132,7 +220,6 @@ def ingest_account_output(project: ProjectAccount, root: Path) -> IngestResult:
             rejected.append(RejectedArticle(title, source_url, "invalid_body"))
             continue
 
-        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
         source_image_dir = _source_image_dir(output_root, row.get("image_dir"))
         valid.append(
             NormalizedArticle(
@@ -143,7 +230,7 @@ def ingest_account_output(project: ProjectAccount, root: Path) -> IngestResult:
                 published=published,
                 source_url=source_url,
                 collected_at=collected_at,
-                content_hash=f"sha256:{digest}",
+                content_hash=canonical_body_hash(body),
                 body=body,
                 source_markdown=source_markdown,
                 source_image_dir=source_image_dir,

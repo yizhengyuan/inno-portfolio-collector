@@ -144,7 +144,7 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertFalse(article.body.endswith("\n\n"))
         self.assertEqual(
             article.content_hash,
-            "sha256:" + hashlib.sha256(article.body.encode("utf-8")).hexdigest(),
+            ingest_module.canonical_body_hash(article.body),
         )
         collected_at = datetime.fromisoformat(article.collected_at)
         self.assertIsNotNone(collected_at.tzinfo)

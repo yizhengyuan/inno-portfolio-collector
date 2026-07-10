@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
+import math
 import os
 import re
 import stat
@@ -13,6 +15,7 @@ from pathlib import Path, PurePosixPath
 from urllib.parse import unquote, urlsplit
 
 from .identity import article_key, canonical_url
+from .ingest import canonical_body_hash, markdown_image_destinations
 
 
 class DeliveryValidationError(RuntimeError):
@@ -39,18 +42,18 @@ _FRONTMATTER_FIELDS = (
 )
 _HASH = re.compile(r"^sha256:[0-9a-f]{64}$")
 _WIKILINK = re.compile(r"\[\[([^\]\n]+)\]\]")
-_IMAGE_LINK = re.compile(r"!\[[^\]\n]*\]\(([^)\n]+)\)")
 _REPORT_NUMBER = re.compile(r"^- (项目数|失败项目数|文章总数)：(\d+)\s*$", re.MULTILINE)
 _SECRET_VALUE = re.compile(
-    r"(?i)(?<![\w-])(auth-key|pass_ticket|appmsg_token)\s*[:=]\s*"
-    r"(?!\[REDACTED\](?:\W|$))([^\s,;&]+)"
+    r"(?i)(?<![\w-])[\"']?(auth-key|pass_ticket|appmsg_token)[\"']?\s*[:=]\s*"
+    r"[\"']?(?!\[REDACTED\](?:[\"']?\W|$))([^\s,;&\"'}]+)"
 )
 _AUTHORIZATION = re.compile(
-    r"(?i)(?<![\w-])authorization\s*:\s*bearer\s+"
-    r"(?!\[REDACTED\](?:\W|$))[^\s,;]+"
+    r"(?i)(?<![\w-])[\"']?authorization[\"']?\s*:\s*[\"']?bearer\s+"
+    r"(?!\[REDACTED\](?:[\"']?\W|$))[^\s,;\"'}]+"
 )
 _COOKIE_HEADER = re.compile(
-    r"(?im)^\s*cookie\s*:\s*(?!\[REDACTED\]\s*$)\S.*$"
+    r"(?im)(?:^|[{,])\s*[\"']?cookie[\"']?\s*:\s*[\"']?"
+    r"(?!\[REDACTED\](?:[\"']?\s*(?:[,}]|$)))[^\s\"'}][^\r\n,}]*"
 )
 _ABSOLUTE_PATH = re.compile(
     r"(?i)(?:file://)?/(?:Users|Volumes|private|var|tmp|home|opt)(?:/[^\s<>\]\[)'\"]*)?|"
@@ -61,6 +64,9 @@ _SUSPICIOUS_SUFFIXES = (
     ".tmp", ".temp", ".bak", ".backup", ".stage", ".lock", "~",
 )
 _SAFE_IGNORED_LOCKS = {".vault.lock", "90-系统/manifest.json.lock"}
+_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+_MAX_TEXT_SIZE = 16 * 1024 * 1024
+_MAX_IMAGE_SIZE = 128 * 1024 * 1024
 
 
 def _collision_key(value: str) -> str:
@@ -76,12 +82,14 @@ def _safe_relative(value: object) -> PurePosixPath | None:
     return path
 
 
-def _open_regular(path: Path) -> bytes:
+def _open_regular(path: Path, *, max_bytes: int | None = None) -> bytes:
     descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
     try:
         before = os.fstat(descriptor)
         if not stat.S_ISREG(before.st_mode):
             raise OSError("not a regular file")
+        if max_bytes is not None and before.st_size > max_bytes:
+            raise OSError("file too large")
         chunks: list[bytes] = []
         while True:
             chunk = os.read(descriptor, 1 << 20)
@@ -98,16 +106,17 @@ def _open_regular(path: Path) -> bytes:
         os.close(descriptor)
 
 
-def _inventory(root: Path) -> tuple[list[PurePosixPath], list[PurePosixPath], list[str]]:
+def _inventory(root: Path) -> tuple[list[PurePosixPath], list[PurePosixPath], list[str], dict[PurePosixPath, tuple[int, ...]]]:
     files: list[PurePosixPath] = []
     directories: list[PurePosixPath] = []
     forbidden: list[str] = []
+    fingerprints: dict[PurePosixPath, tuple[int, ...]] = {}
     try:
         root_details = root.lstat()
     except OSError:
-        return files, directories, ["vault root is missing"]
+        return files, directories, ["vault root is missing"], fingerprints
     if stat.S_ISLNK(root_details.st_mode) or not stat.S_ISDIR(root_details.st_mode):
-        return files, directories, ["vault root is not a regular directory"]
+        return files, directories, ["vault root is not a regular directory"], fingerprints
 
     def visit(directory: Path, relative: PurePosixPath) -> None:
         try:
@@ -132,11 +141,50 @@ def _inventory(root: Path) -> tuple[list[PurePosixPath], list[PurePosixPath], li
                 visit(Path(entry.path), child)
             elif stat.S_ISREG(details.st_mode):
                 files.append(child)
+                fingerprints[child] = (
+                    details.st_dev, details.st_ino, details.st_size,
+                    details.st_mtime_ns, details.st_mode,
+                )
             else:
                 forbidden.append(f"{child_text}: special file")
 
     visit(root, PurePosixPath())
-    return files, directories, forbidden
+    return files, directories, forbidden, fingerprints
+
+
+def _allowed_delivery_path(path: PurePosixPath, *, directory: bool) -> bool:
+    text = path.as_posix()
+    if text in _SAFE_IGNORED_LOCKS:
+        return not directory
+    if directory:
+        if len(path.parts) == 1:
+            return text in _REQUIRED_DIRECTORIES
+        return path.parts[0] in {"03-文章", "04-附件"}
+    if text in _REQUIRED_FILES:
+        return True
+    if len(path.parts) == 2 and path.parts[0] == "02-项目":
+        return path.suffix.casefold() == ".md"
+    if len(path.parts) >= 3 and path.parts[0] == "03-文章":
+        return path.suffix.casefold() == ".md"
+    if len(path.parts) >= 3 and path.parts[0] == "04-附件":
+        return path.suffix.casefold() in _IMAGE_EXTENSIONS
+    return False
+
+
+def _inventory_policy_errors(
+    files: list[PurePosixPath],
+    directories: list[PurePosixPath],
+    fingerprints: dict[PurePosixPath, tuple[int, ...]],
+) -> list[str]:
+    errors = [path.as_posix() for path in files + directories if _is_forbidden(path)]
+    errors.extend(path.as_posix() for path in files if not _allowed_delivery_path(path, directory=False))
+    errors.extend(path.as_posix() for path in directories if not _allowed_delivery_path(path, directory=True))
+    for path in files:
+        size = fingerprints.get(path, (0, 0, 0))[2]
+        limit = _MAX_IMAGE_SIZE if path.parts and path.parts[0] == "04-附件" else _MAX_TEXT_SIZE
+        if size > limit:
+            errors.append(f"{path.as_posix()}: file too large")
+    return errors
 
 
 def _is_forbidden(path: PurePosixPath) -> bool:
@@ -159,7 +207,7 @@ def _is_forbidden(path: PurePosixPath) -> bool:
 
 
 def _text(path: Path) -> str:
-    return _open_regular(path).decode("utf-8")
+    return _open_regular(path, max_bytes=_MAX_TEXT_SIZE).decode("utf-8")
 
 
 def _frontmatter(path: Path) -> dict[str, object] | None:
@@ -186,6 +234,12 @@ def _frontmatter(path: Path) -> dict[str, object] | None:
             return None
         result[field] = value
     return result
+
+
+def _safe_json_scalar(value: object) -> bool:
+    if value is None or type(value) in {str, int, bool}:
+        return True
+    return type(value) is float and math.isfinite(value)
 
 
 def _resolve_local_target(
@@ -261,8 +315,7 @@ def _scan_links(root: Path, files: list[PurePosixPath]) -> list[str]:
             raw = match.group(1).split("|", 1)[0].strip()
             if not _resolve_local_target(relative, raw, existing, markdown_by_stem, markdown=True):
                 errors.append(f"{relative.as_posix()} -> {raw}")
-        for match in _IMAGE_LINK.finditer(contents):
-            raw = match.group(1).strip()
+        for _, _, raw in markdown_image_destinations(contents):
             if not _resolve_local_target(relative, raw, existing, markdown_by_stem, markdown=False):
                 errors.append(f"{relative.as_posix()} -> {raw}")
     return sorted(set(errors))
@@ -270,7 +323,7 @@ def _scan_links(root: Path, files: list[PurePosixPath]) -> list[str]:
 
 def _scan_secrets(root: Path, files: list[PurePosixPath]) -> list[str]:
     findings: list[str] = []
-    text_suffixes = {".md", ".json", ".txt", ".yaml", ".yml", ".csv", ".html"}
+    text_suffixes = {".md", ".json", ".svg"}
     for relative in files:
         if relative.suffix.casefold() not in text_suffixes:
             continue
@@ -278,7 +331,19 @@ def _scan_secrets(root: Path, files: list[PurePosixPath]) -> list[str]:
             contents = _text(root.joinpath(*relative.parts))
         except (OSError, UnicodeError):
             continue
-        if any(pattern.search(contents) for pattern in (_SECRET_VALUE, _AUTHORIZATION, _COOKIE_HEADER, _ABSOLUTE_PATH)):
+        candidates = [contents]
+        decoded = contents
+        for _ in range(3):
+            next_value = unquote(decoded)
+            if next_value == decoded:
+                break
+            candidates.append(next_value)
+            decoded = next_value
+        if any(
+            pattern.search(candidate)
+            for candidate in candidates
+            for pattern in (_SECRET_VALUE, _AUTHORIZATION, _COOKIE_HEADER, _ABSOLUTE_PATH)
+        ):
             findings.append(relative.as_posix())
     return sorted(findings)
 
@@ -343,10 +408,23 @@ def _manifest_report(root: Path, files: list[PurePosixPath]) -> tuple[list[str],
             errors.append(f"{label}: article file missing")
             continue
         frontmatter = _frontmatter(root.joinpath(*relative.parts))
-        if frontmatter is None or set(frontmatter) != set(_FRONTMATTER_FIELDS):
+        if frontmatter is None or not set(_FRONTMATTER_FIELDS).issubset(frontmatter):
             errors.append(f"{label}: invalid frontmatter")
-        elif any(frontmatter[field] != record[field] for field in _FRONTMATTER_FIELDS):
-            errors.append(f"{label}: frontmatter disagrees with manifest")
+        elif any(not _safe_json_scalar(value) for value in frontmatter.values()):
+            errors.append(f"{label}: unsafe extra frontmatter")
+        else:
+            if any(frontmatter[field] != record[field] for field in _FRONTMATTER_FIELDS):
+                errors.append(f"{label}: frontmatter disagrees with manifest")
+            try:
+                contents = _text(root.joinpath(*relative.parts))
+                closing = contents.find("\n---\n", 4)
+                if closing < 0:
+                    raise ValueError
+                body = contents[closing + len("\n---\n") :].lstrip("\n")
+                if canonical_body_hash(body) != record["content_hash"]:
+                    errors.append(f"{label}: body hash disagrees with manifest")
+            except (OSError, UnicodeError, ValueError):
+                errors.append(f"{label}: article body is unreadable")
         attachments = record.get("attachments")
         safe_attachments = [_safe_relative(item) for item in attachments] if isinstance(attachments, list) else []
         if (
@@ -411,30 +489,38 @@ def _status_report(root: Path, article_count: int) -> tuple[list[str], int, int]
     if len(report_rows) != numbers["项目数"] or failed != numbers["失败项目数"]:
         errors.append("report project counters disagree with rows")
     warning = "局部失败" in home
+    attachment_warning = "## 附件警告" in report
     if failed and not warning:
         errors.append("partial failure warning is missing")
-    if not failed and warning:
+    if not failed and warning and not attachment_warning:
         errors.append("home has a stale partial failure warning")
     return sorted(set(errors)), numbers["项目数"], failed
 
 
 def lint_vault(vault: Path) -> dict[str, object]:
     root = Path(vault)
-    files, directories, inventory_errors = _inventory(root)
+    files, directories, inventory_errors, fingerprints = _inventory(root)
     file_set = set(files)
     directory_set = set(directories)
     forbidden = list(inventory_errors)
-    forbidden.extend(path.as_posix() for path in files + directories if _is_forbidden(path))
+    policy_errors = _inventory_policy_errors(files, directories, fingerprints)
+    forbidden.extend(policy_errors)
+    oversized = {
+        path for path in files
+        if fingerprints.get(path, (0, 0, 0))[2]
+        > (_MAX_IMAGE_SIZE if path.parts and path.parts[0] == "04-附件" else _MAX_TEXT_SIZE)
+    }
+    readable_files = [path for path in files if path not in oversized]
     for required in _REQUIRED_DIRECTORIES:
         if PurePosixPath(required) not in directory_set:
             forbidden.append(f"{required}: required directory missing")
     for required in _REQUIRED_FILES:
         if PurePosixPath(required) not in file_set:
             forbidden.append(f"{required}: required file missing")
-    manifest_errors, article_count = _manifest_report(root, files)
+    manifest_errors, article_count = _manifest_report(root, readable_files)
     status_errors, project_count, failed_projects = _status_report(root, article_count)
-    broken_links = _scan_links(root, files)
-    secrets = _scan_secrets(root, files)
+    broken_links = _scan_links(root, readable_files)
+    secrets = _scan_secrets(root, readable_files)
     report: dict[str, object] = {
         "broken_links": broken_links,
         "secrets": secrets,
@@ -458,14 +544,82 @@ def _output_path(output: Path, now: datetime) -> Path:
     return output / f"英诺被投项目资讯库-{now:%Y%m%d-%H%M}.zip"
 
 
+def _available_output(output: Path, now_value: datetime) -> tuple[Path, Path]:
+    explicit = output.suffix.casefold() == ".zip"
+    candidate = _output_path(output, now_value)
+    summary = candidate.with_suffix(".summary.md")
+    if explicit:
+        if candidate.exists() or summary.exists():
+            raise DeliveryValidationError({"errors": ["explicit output already exists"]})
+        return candidate, summary
+    for number in range(1000):
+        if number:
+            candidate = output / f"英诺被投项目资讯库-{now_value:%Y%m%d-%H%M}-{number:02d}.zip"
+            summary = candidate.with_suffix(".summary.md")
+        if not candidate.exists() and not summary.exists():
+            return candidate, summary
+    raise DeliveryValidationError({"errors": ["unable to allocate delivery filename"]})
+
+
+def _snapshot_vault(source: Path, snapshot: Path) -> None:
+    files, directories, inventory_errors, fingerprints = _inventory(source)
+    policy_errors = _inventory_policy_errors(files, directories, fingerprints)
+    if inventory_errors or policy_errors:
+        raise DeliveryValidationError({"errors": sorted(inventory_errors + policy_errors)})
+    snapshot.mkdir()
+    for relative in sorted(directories, key=lambda item: (len(item.parts), item.as_posix())):
+        snapshot.joinpath(*relative.parts).mkdir()
+    for relative in sorted(files, key=lambda item: item.as_posix()):
+        if relative.as_posix() in _SAFE_IGNORED_LOCKS:
+            continue
+        path = source.joinpath(*relative.parts)
+        try:
+            details = path.lstat()
+        except OSError:
+            raise DeliveryValidationError({"errors": [f"{relative.as_posix()}: changed during snapshot"]}) from None
+        actual = (details.st_dev, details.st_ino, details.st_size, details.st_mtime_ns, details.st_mode)
+        if actual != fingerprints.get(relative):
+            raise DeliveryValidationError({"errors": [f"{relative.as_posix()}: changed during snapshot"]})
+        try:
+            payload = _open_regular(path)
+        except OSError:
+            raise DeliveryValidationError({"errors": [f"{relative.as_posix()}: changed during snapshot"]}) from None
+        destination = snapshot.joinpath(*relative.parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(payload)
+
+
+def _reserve_output_pair(destination: Path, summary: Path) -> None:
+    created: list[Path] = []
+    try:
+        for path in (destination, summary):
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            os.close(descriptor)
+            created.append(path)
+    except OSError:
+        for path in created:
+            path.unlink(missing_ok=True)
+        raise DeliveryValidationError({"errors": ["delivery output was claimed concurrently"]}) from None
+
+
 def build_delivery_zip(
     vault: Path,
     output: Path,
     *,
     now=lambda: datetime.now().astimezone(),
 ) -> dict[str, object]:
-    root = Path(vault).resolve()
-    destination = _output_path(Path(output), now())
+    raw_root = Path(vault)
+    try:
+        root_details = raw_root.lstat()
+    except OSError:
+        raise DeliveryValidationError({"errors": ["vault root is missing"]}) from None
+    if stat.S_ISLNK(root_details.st_mode) or not stat.S_ISDIR(root_details.st_mode):
+        raise DeliveryValidationError({"errors": ["vault root is not a regular directory"]})
+    root = raw_root.resolve()
+    if not root.name or "\\" in root.name or root.name in {".", ".."}:
+        raise DeliveryValidationError({"errors": ["unsafe vault folder name"]})
+    output_value = Path(output)
+    destination, summary_path = _available_output(output_value, now())
     destination_parent = destination.parent.resolve()
     try:
         destination.resolve(strict=False).relative_to(root)
@@ -473,19 +627,32 @@ def build_delivery_zip(
         pass
     else:
         raise DeliveryValidationError({"errors": ["output must be outside vault"]})
-    report = lint_vault(root)
-    if report["errors"]:
-        raise DeliveryValidationError(report)
     destination_parent.mkdir(parents=True, exist_ok=True)
-    summary_path = destination.with_suffix(".summary.md")
     zip_temp: Path | None = None
     summary_temp: Path | None = None
     zip_installed = False
     summary_installed = False
+    outputs_reserved = False
+    lock_handle = None
+    snapshot_context = tempfile.TemporaryDirectory(prefix="inno-delivery-snapshot-")
     try:
+        lock_path = root / ".vault.lock"
+        if lock_path.exists():
+            lock_descriptor = os.open(
+                lock_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+            lock_handle = os.fdopen(lock_descriptor, "rb")
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+        snapshot = Path(snapshot_context.name) / "vault"
+        _snapshot_vault(root, snapshot)
+        report = lint_vault(snapshot)
+        if report["errors"]:
+            raise DeliveryValidationError(report)
+        _reserve_output_pair(destination, summary_path)
+        outputs_reserved = True
         with tempfile.NamedTemporaryFile(dir=destination_parent, prefix=".delivery-", suffix=".tmp", delete=False) as handle:
             zip_temp = Path(handle.name)
-        files, directories, inventory_errors = _inventory(root)
+        files, directories, inventory_errors, _ = _inventory(snapshot)
         if inventory_errors:
             raise DeliveryValidationError({"errors": inventory_errors})
         included_files = [path for path in files if path.as_posix() not in _SAFE_IGNORED_LOCKS]
@@ -498,7 +665,7 @@ def build_delivery_zip(
             for relative in sorted(included_files, key=lambda item: item.as_posix()):
                 if _is_forbidden(relative):
                     raise DeliveryValidationError({"errors": [relative.as_posix()]})
-                payload = _open_regular(root.joinpath(*relative.parts))
+                payload = _open_regular(snapshot.joinpath(*relative.parts))
                 archive.writestr(f"{top}/{relative.as_posix()}", payload)
         digest = hashlib.sha256(zip_temp.read_bytes()).hexdigest()
         summary = (
@@ -519,6 +686,7 @@ def build_delivery_zip(
         os.replace(summary_temp, summary_path)
         summary_temp = None
         summary_installed = True
+        outputs_reserved = False
         return {
             "zip_path": destination,
             "summary_path": summary_path,
@@ -528,12 +696,16 @@ def build_delivery_zip(
             "zip_sha256": digest,
         }
     except BaseException:
-        if zip_installed and destination.exists():
+        if (zip_installed or outputs_reserved) and destination.exists():
             destination.unlink()
-        if summary_installed and summary_path.exists():
+        if (summary_installed or outputs_reserved) and summary_path.exists():
             summary_path.unlink()
         raise
     finally:
+        if lock_handle is not None:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            lock_handle.close()
+        snapshot_context.cleanup()
         for temporary in (zip_temp, summary_temp):
             if temporary is not None and temporary.exists():
                 temporary.unlink()

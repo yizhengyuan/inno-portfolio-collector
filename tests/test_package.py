@@ -9,9 +9,11 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from inno_collector import package as package_module
 
 from inno_collector.cli import main
 from inno_collector.identity import article_key
+from inno_collector.ingest import canonical_body_hash
 from inno_collector.models import NormalizedArticle, ProjectRunResult
 from inno_collector.package import (
     DeliveryValidationError,
@@ -194,6 +196,81 @@ class PackageTests(unittest.TestCase):
         report = lint_vault(self.vault)
         self.assertEqual(report["status_errors"], [])
         self.assertEqual(report["failed_projects"], 1)
+
+    def test_whitelist_rejects_every_unexpected_delivery_file(self) -> None:
+        for relative in ("debug.log", "README", "dist/x.zip", "02-项目/nested/x.md", "04-附件/x/file.txt", "nested.zip"):
+            with self.subTest(relative=relative):
+                path = self.vault / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("harmless", encoding="utf-8")
+                self.assertTrue(lint_vault(self.vault)["forbidden_files"])
+                path.unlink()
+                while path.parent != self.vault:
+                    try:
+                        path.parent.rmdir()
+                    except OSError:
+                        break
+                    path = path.parent
+
+    def test_encoded_and_json_quoted_secrets_are_rejected(self) -> None:
+        page = self.vault / "02-项目/bad.md"
+        for payload in (
+            '{"auth-key":"secret"}', '{"Cookie":"sid=x"}',
+            '{"Authorization":"Bearer abc"}', "pass_ticket%253Dsecret",
+            "file%253A%252F%252F%252FUsers%252Falice%252Fx",
+        ):
+            with self.subTest(payload=payload):
+                page.write_text(payload, encoding="utf-8")
+                self.assertTrue(lint_vault(self.vault)["secrets"])
+
+    def test_body_tamper_is_detected_and_extra_safe_frontmatter_is_allowed(self) -> None:
+        record = next(iter(self.manifest()["articles"].values()))
+        path = self.vault / record["path"]
+        original = path.read_text(encoding="utf-8")
+        path.write_text(original.replace("---\n\n", 'type: "article"\n---\n\n', 1), encoding="utf-8")
+        self.assertEqual(lint_vault(self.vault)["manifest_errors"], [])
+        path.write_text(path.read_text(encoding="utf-8").replace("内容。", "内容被篡改。"), encoding="utf-8")
+        self.assertTrue(lint_vault(self.vault)["manifest_errors"])
+
+    def test_parenthesized_image_and_rewritten_asset_have_same_canonical_hash(self) -> None:
+        exporter = "正文\n![](../images/source/a(b).png \"图\")\n"
+        delivered = "正文\n![](../../04-附件/项目/文章-key/a(b).png \"图\")\n"
+        self.assertEqual(canonical_body_hash(exporter), canonical_body_hash(delivered))
+
+    def test_attachment_warning_requires_home_warning_but_not_failed_project(self) -> None:
+        report = self.vault / "90-系统/collection-report.md"
+        report.write_text(report.read_text(encoding="utf-8") + "\n## 附件警告\n\n- 图片失败\n", encoding="utf-8")
+        home = self.vault / "00-首页.md"
+        home.write_text(home.read_text(encoding="utf-8").replace("## 最近文章", "> ⚠️ 本次采集存在局部失败，请查看采集状态与报告。\n\n## 最近文章"), encoding="utf-8")
+        result = lint_vault(self.vault)
+        self.assertEqual(result["status_errors"], [])
+        self.assertEqual(result["failed_projects"], 0)
+
+    def test_default_collision_versions_pair_and_explicit_existing_refuses(self) -> None:
+        now = lambda: datetime(2026, 7, 11, 10, 5)
+        first = build_delivery_zip(self.vault, self.root / "dist", now=now)
+        second = build_delivery_zip(self.vault, self.root / "dist", now=now)
+        self.assertNotEqual(first["zip_path"], second["zip_path"])
+        self.assertTrue(str(second["zip_path"]).endswith("-01.zip"))
+        explicit = self.root / "fixed.zip"
+        explicit.write_bytes(b"old")
+        with self.assertRaises(DeliveryValidationError):
+            build_delivery_zip(self.vault, explicit)
+        self.assertEqual(explicit.read_bytes(), b"old")
+
+    def test_source_file_injected_after_snapshot_lint_never_enters_zip(self) -> None:
+        original_lint = package_module.lint_vault
+
+        def inject_after_snapshot(path: Path) -> dict[str, object]:
+            result = original_lint(path)
+            (self.vault / "late.log").write_text("Cookie: secret", encoding="utf-8")
+            return result
+
+        output = self.root / "snapshot.zip"
+        with patch("inno_collector.package.lint_vault", side_effect=inject_after_snapshot):
+            build_delivery_zip(self.vault, output)
+        with zipfile.ZipFile(output) as archive:
+            self.assertFalse(any(name.endswith("late.log") for name in archive.namelist()))
 
     def test_output_inside_vault_is_refused_and_failed_write_leaves_no_half_package(self) -> None:
         with self.assertRaises(DeliveryValidationError):
