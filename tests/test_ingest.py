@@ -184,6 +184,22 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertEqual(result.rejected, ())
         self.assertEqual(result.valid[0].source_image_dir, image_dir.resolve())
 
+    def test_symlinked_images_root_is_never_accepted(self) -> None:
+        self.write_article()
+        with tempfile.TemporaryDirectory() as external_directory:
+            external_images = Path(external_directory)
+            (external_images / "article-assets").mkdir()
+            (self.root / "images").symlink_to(
+                external_images, target_is_directory=True
+            )
+            self.write_index([self.row(image_dir="images/article-assets")])
+
+            result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.rejected, ())
+        self.assertEqual(len(result.valid), 1)
+        self.assertIsNone(result.valid[0].source_image_dir)
+
     def test_unsafe_or_unavailable_image_directories_do_not_reject_articles(self) -> None:
         self.write_article()
         images_root = self.root / "images"
@@ -404,6 +420,62 @@ class IngestAccountOutputTests(unittest.TestCase):
 
         self.assertEqual(result.valid, ())
         self.assertEqual(result.rejected[0].reason, "invalid_body")
+
+    def test_file_start_frontmatter_is_ignored_for_body_validation(self) -> None:
+        frontmatter = (
+            "---\n"
+            'title: "真实导出文章"\n'
+            "published: 2026-07-01T09:30:00+08:00\n"
+            "source_url: https://mp.weixin.qq.com/s/frontmatter"
+            "?pass_ticket=secret&token=private\n"
+            "tags:\n"
+            "  - 投资组合\n"
+            "  - 微信文章\n"
+            "description: 这是一段较长的导出元数据说明，不属于用户可见正文。\n"
+            "---   \n"
+        )
+        bodies = (
+            ("仅元数据", frontmatter + " \t\n", "frontmatter-only"),
+            ("登录页", frontmatter + "请登录后继续\n", "frontmatter-login"),
+            (
+                "错误页",
+                frontmatter + "此内容因违规无法查看\n",
+                "frontmatter-error",
+            ),
+            ("正常正文", frontmatter + LONG_BODY, "frontmatter-normal"),
+        )
+        rows: list[dict[str, str]] = []
+        for title, body, slug in bodies:
+            filename = f"{slug}.md"
+            self.write_article(filename, body)
+            rows.append(
+                self.row(
+                    title=title,
+                    source_url=f"https://mp.weixin.qq.com/s/{slug}",
+                    markdown_path=filename,
+                )
+            )
+        self.write_index(rows)
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual([article.title for article in result.valid], ["正常正文"])
+        self.assertEqual(
+            [(article.title, article.reason) for article in result.rejected],
+            [
+                ("仅元数据", "invalid_body"),
+                ("登录页", "invalid_body"),
+                ("错误页", "invalid_body"),
+            ],
+        )
+
+    def test_visible_text_keeps_content_around_body_divider(self) -> None:
+        body = "第一部分是普通正文。\n\n---\n\n第二部分仍然是普通正文。"
+
+        visible = ingest_module._visible_text(body)
+
+        self.assertIn("第一部分是普通正文", visible)
+        self.assertIn("第二部分仍然是普通正文", visible)
 
     def test_rejects_known_download_error_templates(self) -> None:
         markers = (

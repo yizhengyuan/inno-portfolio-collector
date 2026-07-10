@@ -47,6 +47,9 @@ _DOWNLOAD_ERROR_TEMPLATES = (
     "已停止访问该网页",
     "该内容无法查看",
 )
+_FRONTMATTER_RE = re.compile(
+    r"\A---[ \t]*\n.*?\n---[ \t]*(?:\n|\Z)", re.DOTALL
+)
 _HTML_HIDDEN_BLOCK_RE = re.compile(
     r"<(script|style)\b[^>]*>.*?</\1\s*>", re.IGNORECASE | re.DOTALL
 )
@@ -290,7 +293,10 @@ def _source_image_dir(root: Path, value: object) -> Path | None:
         return None
 
     try:
-        images_root = (root / "images").resolve()
+        images_root_path = root / "images"
+        if images_root_path.is_symlink():
+            return None
+        images_root = images_root_path.resolve()
         resolved = (root / relative).resolve()
         resolved.relative_to(images_root)
         if resolved == images_root or not resolved.is_dir():
@@ -305,7 +311,8 @@ def _normalize_body(value: str) -> str:
 
 
 def _visible_text(body: str) -> str:
-    visible = _HTML_HIDDEN_BLOCK_RE.sub(" ", body)
+    visible = _FRONTMATTER_RE.sub("", body, count=1)
+    visible = _HTML_HIDDEN_BLOCK_RE.sub(" ", visible)
     visible = _MARKDOWN_IMAGE_RE.sub(lambda match: match.group(1), visible)
     visible = _MARKDOWN_LINK_RE.sub(lambda match: match.group(1), visible)
     visible = _HTML_TAG_RE.sub(" ", visible)
