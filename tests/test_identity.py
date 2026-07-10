@@ -39,10 +39,45 @@ class CanonicalUrlTests(unittest.TestCase):
         self.assertEqual(second, expected)
         self.assertNotIn("token", first)
 
-    def test_other_paths_drop_query_and_fragment(self) -> None:
+    def test_rejects_non_article_paths_and_invalid_legacy_queries(self) -> None:
+        invalid_values = (
+            "https://mp.weixin.qq.com/",
+            "https://mp.weixin.qq.com/s",
+            "https://mp.weixin.qq.com/mp/appmsgalbum?token=x#part",
+            "https://mp.weixin.qq.com/other/path",
+            "https://mp.weixin.qq.com/s/a/b",
+            "https://mp.weixin.qq.com/s?__biz=wx&mid=1&idx=2",
+            "https://mp.weixin.qq.com/s?__biz=wx&mid=1&idx=2&sn=",
+            "https://mp.weixin.qq.com/s?__biz=wx&mid=1&idx=2&sn=a&sn=b",
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "^unsupported article URL$"
+                ):
+                    canonical_url(value)
+
+    def test_rejects_userinfo_and_non_default_ports(self) -> None:
+        invalid_values = (
+            "https://user@mp.weixin.qq.com/s/article",
+            "https://mp.weixin.qq.com:444/s/article",
+            "http://mp.weixin.qq.com:8080/s/article",
+        )
+
+        for value in invalid_values:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(
+                    ValueError, "^unsupported article URL$"
+                ):
+                    canonical_url(value)
+
+    def test_accepts_default_ports_and_removes_them(self) -> None:
+        expected = "https://mp.weixin.qq.com/s/article"
+
+        self.assertEqual(canonical_url("http://mp.weixin.qq.com:80/s/article"), expected)
         self.assertEqual(
-            canonical_url("https://mp.weixin.qq.com/mp/appmsgalbum?token=x#part"),
-            "https://mp.weixin.qq.com/mp/appmsgalbum",
+            canonical_url("https://mp.weixin.qq.com:443/s/article"), expected
         )
 
     def test_rejects_non_wechat_hosts_and_unsupported_schemes(self) -> None:
@@ -128,6 +163,20 @@ class SelectSinceTests(unittest.TestCase):
 
         self.assertEqual(select_since(rows, "2025-01-01"), [valid])
 
+    def test_skips_bad_article_urls_without_aborting_the_batch(self) -> None:
+        invalid = {
+            "id": 2,
+            "publish_time": "2025-02-02",
+            "url": "https://example.com/s/not-wechat",
+        }
+        valid = {
+            "id": 1,
+            "publish_time": "2025-02-01",
+            "url": "https://mp.weixin.qq.com/s/valid-row",
+        }
+
+        self.assertEqual(select_since([invalid, valid], "2025-01-01"), [valid])
+
     def test_sorts_newest_publish_time_then_numeric_id(self) -> None:
         rows = [
             {
@@ -151,6 +200,49 @@ class SelectSinceTests(unittest.TestCase):
             [row["id"] for row in select_since(rows, "2025-01-01")],
             ["1", "10", "2"],
         )
+
+    def test_sorts_mixed_times_in_utc_and_normalizes_non_numeric_ids(self) -> None:
+        rows = [
+            {
+                "id": "not-a-number",
+                "publish_time": "2026-01-02",
+                "url": "https://mp.weixin.qq.com/s/midnight-bad-id",
+            },
+            {
+                "id": "5",
+                "publish_time": "2026-01-02",
+                "url": "https://mp.weixin.qq.com/s/midnight-id-five",
+            },
+            {
+                "id": "99",
+                "publish_time": "2026-01-02T01:00:00+02:00",
+                "url": "https://mp.weixin.qq.com/s/previous-utc-day",
+            },
+            {
+                "id": "also-not-a-number",
+                "publish_time": "2026-01-01T20:00:00-05:00",
+                "url": "https://mp.weixin.qq.com/s/newest-utc",
+            },
+        ]
+
+        self.assertEqual(
+            [row["url"].rsplit("/", 1)[-1] for row in select_since(rows, "2026-01-01")],
+            [
+                "newest-utc",
+                "midnight-id-five",
+                "midnight-bad-id",
+                "previous-utc-day",
+            ],
+        )
+
+    def test_overflowing_numeric_id_is_normalized_without_aborting(self) -> None:
+        row = {
+            "id": float("inf"),
+            "publish_time": "2026-01-02",
+            "url": "https://mp.weixin.qq.com/s/overflowing-id",
+        }
+
+        self.assertEqual(select_since([row], "2026-01-01"), [row])
 
     def test_stringifies_url_values_and_exposes_list_of_dict_contract(self) -> None:
         class ArticleUrl:

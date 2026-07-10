@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import date, datetime
+from datetime import date, datetime, time, timezone
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -12,21 +12,36 @@ def canonical_url(value: str) -> str:
     try:
         parsed = urlsplit(value.strip())
         hostname = parsed.hostname
+        port = parsed.port
     except (AttributeError, TypeError, ValueError):
         raise ValueError("unsupported article URL") from None
 
     if parsed.scheme not in {"http", "https"} or hostname != "mp.weixin.qq.com":
         raise ValueError("unsupported article URL")
+    if parsed.username is not None or parsed.password is not None:
+        raise ValueError("unsupported article URL")
+    default_port = 80 if parsed.scheme == "http" else 443
+    if port is not None and port != default_port:
+        raise ValueError("unsupported article URL")
 
     path = parsed.path.rstrip("/") or "/s"
-    query = ""
     if path == "/s":
         stable_items = sorted(
             (key, item)
             for key, item in parse_qsl(parsed.query, keep_blank_values=True)
             if key in STABLE_QUERY_KEYS
         )
+        if (
+            len(stable_items) != len(STABLE_QUERY_KEYS)
+            or {key for key, _ in stable_items} != STABLE_QUERY_KEYS
+            or any(not item for _, item in stable_items)
+        ):
+            raise ValueError("unsupported article URL")
         query = urlencode(stable_items)
+    elif path.startswith("/s/") and path.count("/") == 2 and len(path) > 3:
+        query = ""
+    else:
+        raise ValueError("unsupported article URL")
 
     return urlunsplit(("https", "mp.weixin.qq.com", path, query, ""))
 
@@ -51,6 +66,32 @@ def _published_date(value: object) -> date | None:
             return None
 
 
+def _published_datetime(value: object) -> datetime | None:
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+
+    try:
+        published = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            published_date = date.fromisoformat(text_value[:10])
+        except ValueError:
+            return None
+        return datetime.combine(published_date, time.min, tzinfo=timezone.utc)
+
+    if published.tzinfo is None:
+        return published.replace(tzinfo=timezone.utc)
+    return published.astimezone(timezone.utc)
+
+
+def _numeric_id(value: object) -> int:
+    try:
+        return int(value or 0)
+    except (OverflowError, TypeError, ValueError):
+        return 0
+
+
 def select_since(rows: list[dict], since: str) -> list[dict]:
     cutoff = date.fromisoformat(since)
     selected: list[dict] = []
@@ -62,7 +103,10 @@ def select_since(rows: list[dict], since: str) -> list[dict]:
         if published is None or published < cutoff or not url:
             continue
 
-        key = article_key(url)
+        try:
+            key = article_key(url)
+        except ValueError:
+            continue
         if key in seen:
             continue
         seen.add(key)
@@ -70,8 +114,9 @@ def select_since(rows: list[dict], since: str) -> list[dict]:
 
     selected.sort(
         key=lambda row: (
-            str(row.get("publish_time") or ""),
-            int(row.get("id") or 0),
+            _published_datetime(row.get("publish_time"))
+            or datetime.min.replace(tzinfo=timezone.utc),
+            _numeric_id(row.get("id")),
         ),
         reverse=True,
     )
