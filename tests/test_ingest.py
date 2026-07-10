@@ -1,0 +1,313 @@
+from __future__ import annotations
+
+import codecs
+import csv
+import hashlib
+import json
+import shutil
+import tempfile
+import unittest
+from datetime import datetime
+from pathlib import Path
+
+from inno_collector.identity import article_key
+from inno_collector.ingest import ingest_account_output, yaml_string
+from inno_collector.models import ProjectAccount
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+FIELDS = ("title", "publish_time", "source_url", "markdown_path", "status")
+LONG_BODY = "# 正文\n\n" + "这是一段用于验证文章采集与正文规范化的中文内容。" * 12
+
+
+class IngestAccountOutputTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary_directory.name)
+        self.project = ProjectAccount(project="项目甲", account="创新观察")
+
+    def tearDown(self) -> None:
+        self.temporary_directory.cleanup()
+
+    def write_index(
+        self,
+        rows: list[dict[str, str]],
+        *,
+        encoding: str = "utf-8",
+    ) -> None:
+        with (self.root / "index.csv").open("w", encoding=encoding, newline="") as stream:
+            writer = csv.DictWriter(stream, fieldnames=FIELDS)
+            writer.writeheader()
+            writer.writerows(rows)
+
+    def write_article(self, name: str = "article.md", body: str = LONG_BODY) -> Path:
+        path = self.root / name
+        path.write_text(body, encoding="utf-8")
+        return path
+
+    def row(self, **updates: str) -> dict[str, str]:
+        row = {
+            "title": "一篇有效文章",
+            "publish_time": "2026-04-03T12:30:00+08:00",
+            "source_url": "https://mp.weixin.qq.com/s/valid-article",
+            "markdown_path": "article.md",
+            "status": "success",
+        }
+        row.update(updates)
+        return row
+
+    def test_ingests_exporter_fixture_into_task2_model(self) -> None:
+        shutil.copy(FIXTURES / "exporter-article.md", self.root)
+        shutil.copy(FIXTURES / "exporter-index.csv", self.root / "index.csv")
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.rejected, ())
+        self.assertEqual(len(result.valid), 1)
+        article = result.valid[0]
+        expected_url = "https://mp.weixin.qq.com/s/exporter-fixture"
+        self.assertEqual(article.key, article_key(expected_url))
+        self.assertEqual(article.project, "项目甲")
+        self.assertEqual(article.account, "创新观察")
+        self.assertEqual(article.published, "2026-05-18")
+        self.assertEqual(article.source_url, expected_url)
+        self.assertNotIn("pass_ticket", article.source_url)
+        self.assertEqual(article.source_markdown, (self.root / "exporter-article.md").resolve())
+        self.assertIsNone(article.source_image_dir)
+        self.assertTrue(article.body.endswith("\n"))
+        self.assertFalse(article.body.endswith("\n\n"))
+        self.assertEqual(
+            article.content_hash,
+            "sha256:" + hashlib.sha256(article.body.encode("utf-8")).hexdigest(),
+        )
+        collected_at = datetime.fromisoformat(article.collected_at)
+        self.assertIsNotNone(collected_at.tzinfo)
+        self.assertEqual(collected_at.microsecond, 0)
+
+    def test_rejects_short_login_prompt_without_losing_valid_row(self) -> None:
+        self.write_article()
+        self.write_article("login.md", "请登录后扫码登录，输入验证码继续。")
+        self.write_index(
+            [
+                self.row(),
+                self.row(
+                    title="登录提示",
+                    source_url="https://mp.weixin.qq.com/s/login-prompt",
+                    markdown_path="login.md",
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual([article.title for article in result.valid], ["一篇有效文章"])
+        self.assertEqual(
+            [(article.title, article.reason) for article in result.rejected],
+            [("登录提示", "invalid_body")],
+        )
+
+    def test_normalizes_crlf_and_cr_before_hashing(self) -> None:
+        first = self.root / "first"
+        second = self.root / "second"
+        first.mkdir()
+        second.mkdir()
+        lf_body = "# 标题\n\n" + "正文内容足够长，用于确认不同换行格式产生相同摘要。\n" * 10
+        crlf_body = lf_body.replace("\n", "\r\n")
+        (first / "article.md").write_bytes(lf_body.encode("utf-8"))
+        (second / "article.md").write_bytes(crlf_body.encode("utf-8"))
+        row = self.row()
+        for directory in (first, second):
+            with (directory / "index.csv").open("w", encoding="utf-8", newline="") as stream:
+                writer = csv.DictWriter(stream, fieldnames=FIELDS)
+                writer.writeheader()
+                writer.writerow(row)
+
+        first_article = ingest_account_output(self.project, first).valid[0]
+        second_article = ingest_account_output(self.project, second).valid[0]
+
+        self.assertNotIn("\r", second_article.body)
+        self.assertEqual(first_article.body, second_article.body)
+        self.assertEqual(first_article.content_hash, second_article.content_hash)
+
+    def test_non_success_status_is_download_failed_before_other_validation(self) -> None:
+        self.write_index(
+            [
+                self.row(
+                    title="",
+                    publish_time="bad",
+                    source_url="not a url",
+                    markdown_path="missing.md",
+                    status=" FAILED ",
+                )
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(len(result.valid), 0)
+        self.assertEqual(result.rejected[0].reason, "download_failed")
+        self.assertIsInstance(result.rejected[0].title, str)
+        self.assertIsInstance(result.rejected[0].source_url, str)
+
+    def test_missing_or_non_file_markdown_is_missing_file(self) -> None:
+        (self.root / "directory.md").mkdir()
+        self.write_index(
+            [
+                self.row(markdown_path="missing.md"),
+                self.row(
+                    title="目录",
+                    source_url="https://mp.weixin.qq.com/s/directory",
+                    markdown_path="directory.md",
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(
+            [article.reason for article in result.rejected],
+            ["missing_file", "missing_file"],
+        )
+
+    def test_rejects_parent_traversal_and_absolute_markdown_paths(self) -> None:
+        absolute = self.root / "absolute.md"
+        absolute.write_text(LONG_BODY, encoding="utf-8")
+        self.write_index(
+            [
+                self.row(markdown_path="../outside.md"),
+                self.row(
+                    title="绝对路径",
+                    source_url="https://mp.weixin.qq.com/s/absolute",
+                    markdown_path=str(absolute),
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(
+            [article.reason for article in result.rejected],
+            ["invalid_path", "invalid_path"],
+        )
+
+    def test_rejects_invalid_url_and_invalid_publish_date_independently(self) -> None:
+        self.write_article()
+        self.write_index(
+            [
+                self.row(source_url="https://example.com/not-wechat"),
+                self.row(
+                    title="坏日期",
+                    publish_time="2026-02-30",
+                    source_url="https://mp.weixin.qq.com/s/bad-date",
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(
+            [article.reason for article in result.rejected],
+            ["invalid_url", "invalid_metadata"],
+        )
+
+    def test_rejects_empty_title_and_too_short_body(self) -> None:
+        self.write_article("short.md", "# 短文\n内容不足。")
+        self.write_index(
+            [
+                self.row(title=""),
+                self.row(
+                    title="短正文",
+                    source_url="https://mp.weixin.qq.com/s/short-body",
+                    markdown_path="short.md",
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(
+            [article.reason for article in result.rejected],
+            ["invalid_metadata", "invalid_body"],
+        )
+
+    def test_long_article_discussing_login_is_not_mistaken_for_prompt(self) -> None:
+        body = "# 登录系统设计复盘\n\n" + (
+            "本文讨论用户登录、扫码登录和验证码流程的设计取舍，并记录完整技术分析。"
+            * 30
+        )
+        self.write_article(body=body)
+        self.write_index([self.row(title="登录系统设计复盘")])
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(len(result.valid), 1)
+        self.assertEqual(result.rejected, ())
+
+    def test_rejects_known_download_error_templates(self) -> None:
+        rows: list[dict[str, str]] = []
+        for index, message in enumerate(
+            ("下载失败", "获取文章失败", "该内容已被发布者删除"), start=1
+        ):
+            name = f"error-{index}.md"
+            self.write_article(name, message)
+            rows.append(
+                self.row(
+                    title=message,
+                    source_url=f"https://mp.weixin.qq.com/s/error-{index}",
+                    markdown_path=name,
+                )
+            )
+        self.write_index(rows)
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(
+            [article.reason for article in result.rejected],
+            ["invalid_body", "invalid_body", "invalid_body"],
+        )
+
+    def test_duplicate_canonical_key_keeps_first_valid_article(self) -> None:
+        self.write_article()
+        self.write_index(
+            [
+                self.row(
+                    title="第一篇",
+                    source_url="https://mp.weixin.qq.com/s/same?scene=1",
+                ),
+                self.row(
+                    title="重复篇",
+                    source_url="https://mp.weixin.qq.com/s/same?pass_ticket=secret",
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual([article.title for article in result.valid], ["第一篇"])
+        self.assertEqual(
+            [(article.title, article.reason) for article in result.rejected],
+            [("重复篇", "duplicate")],
+        )
+
+    def test_reads_utf8_sig_index(self) -> None:
+        self.write_article()
+        self.write_index([self.row(title="带 BOM 的索引")], encoding="utf-8-sig")
+        self.assertTrue((self.root / "index.csv").read_bytes().startswith(codecs.BOM_UTF8))
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual([article.title for article in result.valid], ["带 BOM 的索引"])
+
+
+class YamlStringTests(unittest.TestCase):
+    def test_returns_json_quoted_string_for_frontmatter_reuse(self) -> None:
+        value = '标题: "双引号"\n下一行'
+
+        rendered = yaml_string(value)
+
+        self.assertEqual(rendered, '"标题: \\"双引号\\"\\n下一行"')
+        self.assertEqual(json.loads(rendered), value)
+
+
+if __name__ == "__main__":
+    unittest.main()
