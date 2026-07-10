@@ -29,6 +29,12 @@ _MIN_BODY_CHARACTERS = 80
 _PROMPT_COVERAGE_THRESHOLD = 0.25
 _DOWNLOAD_ERROR_MAX_LENGTH = 800
 _DOWNLOAD_ERROR_MAX_PREFIX = 80
+_ERROR_MARKER_QUOTE_PAIRS = (
+    ("“", "”"),
+    ("‘", "’"),
+    ('"', '"'),
+    ("'", "'"),
+)
 _LOGIN_PROMPTS = (
     "扫码登录",
     "请登录",
@@ -307,7 +313,9 @@ def _source_image_dir(root: Path, value: object) -> Path | None:
 
 
 def _normalize_body(value: str) -> str:
-    return value.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
+    normalized = value.replace("\r\n", "\n").replace("\r", "\n").strip()
+    normalized = _FRONTMATTER_RE.sub("", normalized, count=1).strip()
+    return normalized + "\n"
 
 
 def _visible_text(body: str) -> str:
@@ -322,7 +330,8 @@ def _visible_text(body: str) -> str:
 
 
 def _is_download_error(visible: str) -> bool:
-    compact = "".join(character for character in visible if not character.isspace())
+    unquoted = _without_quoted_error_markers(visible)
+    compact = "".join(character for character in unquoted if not character.isspace())
     if not compact:
         return False
 
@@ -346,6 +355,14 @@ def _is_download_error(visible: str) -> bool:
         for marker, count in zip(_DOWNLOAD_ERROR_TEMPLATES, counts)
     )
     return marker_characters / len(compact) >= _PROMPT_COVERAGE_THRESHOLD
+
+
+def _without_quoted_error_markers(value: str) -> str:
+    unquoted = value
+    for marker in _DOWNLOAD_ERROR_TEMPLATES:
+        for opening, closing in _ERROR_MARKER_QUOTE_PAIRS:
+            unquoted = unquoted.replace(f"{opening}{marker}{closing}", "")
+    return unquoted
 
 
 def _invalid_body(body: str) -> bool:

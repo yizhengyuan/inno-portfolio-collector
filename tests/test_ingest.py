@@ -469,6 +469,46 @@ class IngestAccountOutputTests(unittest.TestCase):
             ],
         )
 
+    def test_frontmatter_metadata_does_not_change_body_or_content_hash(self) -> None:
+        rows: list[dict[str, str]] = []
+        metadata_values = (
+            ("2026-07-01T09:30:00+08:00", 101, 7),
+            ("2026-07-02T10:45:12+08:00", 9999, 888),
+        )
+        for index, (downloaded_at, read_count, like_count) in enumerate(
+            metadata_values, start=1
+        ):
+            filename = f"metadata-{index}.md"
+            frontmatter = (
+                "---\n"
+                f"downloaded_at: {downloaded_at}\n"
+                f"read_count: {read_count}\n"
+                f"like_count: {like_count}\n"
+                "---\n"
+            )
+            self.write_article(filename, frontmatter + LONG_BODY)
+            rows.append(
+                self.row(
+                    title=f"相同正文{index}",
+                    source_url=f"https://mp.weixin.qq.com/s/metadata-{index}",
+                    markdown_path=filename,
+                )
+            )
+        self.write_index(rows)
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.rejected, ())
+        self.assertEqual(len(result.valid), 2)
+        self.assertEqual(result.valid[0].body, result.valid[1].body)
+        self.assertEqual(result.valid[0].content_hash, result.valid[1].content_hash)
+        self.assertEqual(result.valid[0].body, LONG_BODY.strip() + "\n")
+        for article in result.valid:
+            self.assertNotIn("downloaded_at", article.body)
+            self.assertNotIn("read_count", article.body)
+            self.assertNotIn("like_count", article.body)
+            self.assertNotIn("---", article.body)
+
     def test_visible_text_keeps_content_around_body_divider(self) -> None:
         body = "第一部分是普通正文。\n\n---\n\n第二部分仍然是普通正文。"
 
@@ -530,6 +570,46 @@ class IngestAccountOutputTests(unittest.TestCase):
 
         self.assertEqual(len(result.valid), 1)
         self.assertEqual(result.rejected, ())
+
+    def test_medium_governance_articles_may_quote_early_error_marker(self) -> None:
+        marker = "此内容因违规无法查看"
+        quote_styles = (
+            ("中文双引号", "“", "”"),
+            ("ASCII双引号", '"', '"'),
+        )
+        rows: list[dict[str, str]] = []
+        for index, (title, opening, closing) in enumerate(quote_styles, start=1):
+            body = (
+                "# 内容治理案例\n\n"
+                f"本文开头引用平台提示语{opening}{marker}{closing}，仅用于研究说明。"
+                + "文章随后完整讨论审核标准、申诉流程、治理透明度和用户权益保障。"
+                * 10
+            )
+            visible = ingest_module._visible_text(body)
+            compact = "".join(
+                character for character in visible if not character.isspace()
+            )
+            self.assertGreaterEqual(len(compact), 222)
+            self.assertLessEqual(len(compact), 600)
+            self.assertLess(compact.index(marker), 80)
+            filename = f"quoted-marker-{index}.md"
+            self.write_article(filename, body)
+            rows.append(
+                self.row(
+                    title=title,
+                    source_url=f"https://mp.weixin.qq.com/s/quoted-marker-{index}",
+                    markdown_path=filename,
+                )
+            )
+        self.write_index(rows)
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.rejected, ())
+        self.assertEqual(
+            [article.title for article in result.valid],
+            ["中文双引号", "ASCII双引号"],
+        )
 
     def test_rejected_urls_never_retain_credentials_query_or_fragment(self) -> None:
         self.write_article()
