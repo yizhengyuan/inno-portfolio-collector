@@ -16,7 +16,14 @@ from inno_collector.models import ProjectAccount
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
-FIELDS = ("title", "publish_time", "source_url", "markdown_path", "status")
+FIELDS = (
+    "title",
+    "publish_time",
+    "source_url",
+    "markdown_path",
+    "image_dir",
+    "status",
+)
 LONG_BODY = "# 正文\n\n" + "这是一段用于验证文章采集与正文规范化的中文内容。" * 12
 
 
@@ -51,6 +58,7 @@ class IngestAccountOutputTests(unittest.TestCase):
             "publish_time": "2026-04-03T12:30:00+08:00",
             "source_url": "https://mp.weixin.qq.com/s/valid-article",
             "markdown_path": "article.md",
+            "image_dir": "",
             "status": "success",
         }
         row.update(updates)
@@ -105,6 +113,48 @@ class IngestAccountOutputTests(unittest.TestCase):
             [(article.title, article.reason) for article in result.rejected],
             [("登录提示", "invalid_body")],
         )
+
+    def test_preserves_safe_existing_image_directory(self) -> None:
+        self.write_article()
+        image_dir = self.root / "images" / "文章"
+        image_dir.mkdir(parents=True)
+        (image_dir / "001.jpg").write_bytes(b"image")
+        self.write_index([self.row(image_dir="images/文章")])
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.rejected, ())
+        self.assertEqual(result.valid[0].source_image_dir, image_dir.resolve())
+
+    def test_unsafe_or_unavailable_image_directories_do_not_reject_articles(self) -> None:
+        self.write_article()
+        not_a_directory = self.root / "image-file"
+        not_a_directory.write_bytes(b"image")
+        existing_directory = self.root / "absolute-images"
+        existing_directory.mkdir()
+        image_dirs = (
+            "../outside-images",
+            "missing-images",
+            "image-file",
+            str(existing_directory),
+            "C:\\outside\\images",
+        )
+        self.write_index(
+            [
+                self.row(
+                    title=f"图片目录样本{index}",
+                    source_url=f"https://mp.weixin.qq.com/s/image-dir-{index}",
+                    image_dir=image_dir,
+                )
+                for index, image_dir in enumerate(image_dirs, start=1)
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.rejected, ())
+        self.assertEqual(len(result.valid), len(image_dirs))
+        self.assertTrue(all(article.source_image_dir is None for article in result.valid))
 
     def test_normalizes_crlf_and_cr_before_hashing(self) -> None:
         first = self.root / "first"
@@ -243,13 +293,55 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertEqual(len(result.valid), 1)
         self.assertEqual(result.rejected, ())
 
+    def test_medium_complete_article_with_single_login_mentions_is_valid(self) -> None:
+        body = (
+            "# 产品说明\n\n"
+            + "本文完整介绍产品背景、使用步骤、数据处理方法与常见问题。" * 6
+            + "首次使用时可以扫码登录，并通过验证码确认身份。"
+            + "完成认证后即可阅读后续章节和操作示例。" * 3
+        )
+        compact_length = sum(not character.isspace() for character in body)
+        self.assertGreaterEqual(compact_length, 100)
+        self.assertLessEqual(compact_length, 300)
+        self.write_article(body=body)
+        self.write_index([self.row(title="包含登录说明的完整文章")])
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(len(result.valid), 1)
+        self.assertEqual(result.rejected, ())
+
+    def test_repeated_login_prompt_over_500_characters_is_invalid(self) -> None:
+        body = "请登录后扫码登录并输入验证码继续访问。" * 60
+        self.assertGreater(sum(not character.isspace() for character in body), 500)
+        self.write_article(body=body)
+        self.write_index([self.row(title="重复登录提示")])
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(result.valid, ())
+        self.assertEqual(result.rejected[0].reason, "invalid_body")
+
     def test_rejects_known_download_error_templates(self) -> None:
+        markers = (
+            "下载失败",
+            "获取文章失败",
+            "此内容发送失败无法查看",
+            "此内容因违规无法查看",
+            "该内容已被发布者删除",
+            "此内容已被删除",
+            "当前内容暂时无法查看",
+            "已停止访问该网页",
+            "该内容无法查看",
+        )
         rows: list[dict[str, str]] = []
-        for index, message in enumerate(
-            ("下载失败", "获取文章失败", "该内容已被发布者删除"), start=1
-        ):
+        for index, message in enumerate(markers, start=1):
             name = f"error-{index}.md"
-            self.write_article(name, message)
+            body = message + "这段填充文字只用于保证样本长度足够但不构成有效文章正文。" * 8
+            self.assertGreaterEqual(
+                sum(not character.isspace() for character in body), 80
+            )
+            self.write_article(name, body)
             rows.append(
                 self.row(
                     title=message,
@@ -263,8 +355,46 @@ class IngestAccountOutputTests(unittest.TestCase):
 
         self.assertEqual(
             [article.reason for article in result.rejected],
-            ["invalid_body", "invalid_body", "invalid_body"],
+            ["invalid_body"] * len(markers),
         )
+
+    def test_rejected_urls_never_retain_credentials_query_or_fragment(self) -> None:
+        self.write_article()
+        self.write_index(
+            [
+                self.row(
+                    title="下载失败",
+                    source_url=(
+                        "https://user:password@example.com/download"
+                        "?pass_ticket=TOPSECRET&token=x#fragment"
+                    ),
+                    status="failed",
+                ),
+                self.row(
+                    title="无效来源",
+                    source_url=(
+                        "http://example.com/not-wechat"
+                        "?pass_ticket=TOPSECRET&token=x#fragment"
+                    ),
+                ),
+            ]
+        )
+
+        result = ingest_account_output(self.project, self.root)
+
+        self.assertEqual(
+            [article.reason for article in result.rejected],
+            ["download_failed", "invalid_url"],
+        )
+        self.assertEqual(
+            [article.source_url for article in result.rejected],
+            ["https://example.com/download", "http://example.com/not-wechat"],
+        )
+        for article in result.rejected:
+            self.assertNotIn("?", article.source_url)
+            self.assertNotIn("pass_ticket", article.source_url)
+            self.assertNotIn("token", article.source_url)
+            self.assertNotIn("TOPSECRET", article.source_url)
 
     def test_duplicate_canonical_key_keeps_first_valid_article(self) -> None:
         self.write_article()

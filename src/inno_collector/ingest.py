@@ -2,16 +2,18 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import ipaddress
 import json
 from datetime import date, datetime
 from pathlib import Path, PureWindowsPath
+from urllib.parse import urlsplit, urlunsplit
 
 from .identity import article_key, canonical_url
 from .models import IngestResult, NormalizedArticle, ProjectAccount, RejectedArticle
 
 
 _MIN_BODY_CHARACTERS = 80
-_SHORT_PROMPT_CHARACTERS = 500
+_PROMPT_COVERAGE_THRESHOLD = 0.25
 _LOGIN_PROMPTS = (
     "扫码登录",
     "请登录",
@@ -22,7 +24,13 @@ _LOGIN_PROMPTS = (
 _DOWNLOAD_ERROR_TEMPLATES = (
     "下载失败",
     "获取文章失败",
+    "此内容发送失败无法查看",
+    "此内容因违规无法查看",
     "该内容已被发布者删除",
+    "此内容已被删除",
+    "当前内容暂时无法查看",
+    "已停止访问该网页",
+    "该内容无法查看",
 )
 
 
@@ -87,6 +95,9 @@ def ingest_account_output(project: ProjectAccount, root: Path) -> IngestResult:
                 continue
 
             digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+            source_image_dir = _source_image_dir(
+                output_root, row.get("image_dir")
+            )
             valid.append(
                 NormalizedArticle(
                     key=key,
@@ -99,7 +110,7 @@ def ingest_account_output(project: ProjectAccount, root: Path) -> IngestResult:
                     content_hash=f"sha256:{digest}",
                     body=body,
                     source_markdown=source_markdown,
-                    source_image_dir=None,
+                    source_image_dir=source_image_dir,
                 )
             )
             seen_keys.add(key)
@@ -120,7 +131,55 @@ def _safe_rejected_url(value: str) -> str:
     try:
         return canonical_url(value)
     except ValueError:
-        return value
+        pass
+
+    try:
+        parsed = urlsplit(value.strip())
+        hostname = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        return ""
+    scheme = parsed.scheme.casefold()
+    if scheme not in {"http", "https"} or hostname is None:
+        return ""
+
+    safe_hostname = _safe_hostname(hostname)
+    if safe_hostname is None or any(
+        ord(character) < 32 or ord(character) == 127 for character in parsed.path
+    ):
+        return ""
+    if port is not None and port < 1:
+        return ""
+
+    default_port = 80 if scheme == "http" else 443
+    netloc = safe_hostname
+    if port is not None and port != default_port:
+        netloc = f"{netloc}:{port}"
+    return urlunsplit((scheme, netloc, parsed.path, "", ""))
+
+
+def _safe_hostname(value: str) -> str | None:
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        try:
+            hostname = value.encode("idna").decode("ascii").rstrip(".")
+        except UnicodeError:
+            return None
+        labels = hostname.split(".")
+        if not hostname or any(
+            not label
+            or len(label) > 63
+            or label.startswith("-")
+            or label.endswith("-")
+            or not all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        ):
+            return None
+        return hostname.casefold()
+    if address.version == 6:
+        return f"[{address.compressed}]"
+    return address.compressed
 
 
 def _published_date(value: object) -> str | None:
@@ -158,16 +217,38 @@ def _source_markdown(root: Path, value: object) -> tuple[Path | None, str | None
     return resolved, None
 
 
+def _source_image_dir(root: Path, value: object) -> Path | None:
+    text = _safe_string(value).strip()
+    if not text:
+        return None
+    relative = Path(text)
+    if relative.is_absolute() or PureWindowsPath(text).is_absolute():
+        return None
+
+    try:
+        resolved = (root / relative).resolve()
+        resolved.relative_to(root)
+        if not resolved.is_dir():
+            return None
+    except (OSError, RuntimeError, ValueError):
+        return None
+    return resolved
+
+
 def _normalize_body(value: str) -> str:
     return value.replace("\r\n", "\n").replace("\r", "\n").strip() + "\n"
 
 
 def _invalid_body(body: str) -> bool:
-    character_count = sum(not character.isspace() for character in body)
+    compact_body = "".join(
+        character for character in body if not character.isspace()
+    )
+    character_count = len(compact_body)
     if character_count < _MIN_BODY_CHARACTERS:
         return True
     if any(template in body for template in _DOWNLOAD_ERROR_TEMPLATES):
         return True
-    return character_count < _SHORT_PROMPT_CHARACTERS and any(
-        prompt in body for prompt in _LOGIN_PROMPTS
+    prompt_characters = sum(
+        compact_body.count(prompt) * len(prompt) for prompt in _LOGIN_PROMPTS
     )
+    return prompt_characters / character_count >= _PROMPT_COVERAGE_THRESHOLD
