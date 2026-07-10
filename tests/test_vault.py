@@ -465,6 +465,8 @@ class VaultWriterTests(unittest.TestCase):
         self.assertIn("last_sync", status)
         self.assertIn("2026-07-14T08:09:10+08:00", status)
         self.assertIn("零文章账号", status)
+        home = (self.vault / "00-首页.md").read_text(encoding="utf-8")
+        self.assertIn("最近更新时间：2026-07-14T08:09:10+08:00", home)
 
     def test_colliding_safe_project_names_get_unique_deterministic_pages(self) -> None:
         first = self.article(
@@ -544,7 +546,7 @@ class VaultWriterTests(unittest.TestCase):
             },
         )
 
-    def test_copies_only_safe_images_and_rewrites_only_existing_local_links(
+    def test_copies_only_safe_images_and_rewrites_existing_local_links(
         self,
     ) -> None:
         image_directory = self.root / "export" / "images" / "源 图"
@@ -559,7 +561,6 @@ class VaultWriterTests(unittest.TestCase):
         body = (
             "![本地](../images/%E6%BA%90%20%E5%9B%BE/nested/a%20b.png)\n"
             "![远程](https://example.com/remote.png)\n"
-            "![缺失](../images/%E6%BA%90%20%E5%9B%BE/missing.jpg)\n"
         )
         article = self.article(body=body, source_image_dir=image_directory)
 
@@ -578,11 +579,10 @@ class VaultWriterTests(unittest.TestCase):
         self.assertIn("../../04-附件/项目甲/", rendered)
         self.assertIn("nested/a%20b.png", rendered)
         self.assertIn("https://example.com/remote.png", rendered)
-        self.assertIn("../images/%E6%BA%90%20%E5%9B%BE/missing.jpg", rendered)
 
     def test_same_hash_late_images_update_body_once_then_stay_unchanged(self) -> None:
         body = "![后补](../images/later/a.png)\n"
-        article = self.article(body=body, source_image_dir=None)
+        article = self.article(body="正文等待后补。\n", source_image_dir=None)
         writer = VaultWriter(self.vault)
         writer.apply([article], [self.project_result()])
         path = self.article_path()
@@ -592,7 +592,7 @@ class VaultWriterTests(unittest.TestCase):
         (image_directory / "a.png").write_bytes(b"late-image")
 
         updated = writer.apply(
-            [replace(article, source_image_dir=image_directory)],
+            [replace(article, body=body, source_image_dir=image_directory)],
             [self.project_result()],
         )
 
@@ -602,7 +602,7 @@ class VaultWriterTests(unittest.TestCase):
         updated_mtime = path.stat().st_mtime_ns
 
         unchanged = writer.apply(
-            [replace(article, source_image_dir=image_directory)],
+            [replace(article, body=body, source_image_dir=image_directory)],
             [self.project_result()],
         )
 
@@ -702,7 +702,7 @@ class VaultWriterTests(unittest.TestCase):
         self.assertIn("附件", report)
         self.assertIn("保留", report)
 
-    def test_single_image_copy_failure_keeps_old_snapshot_and_continues(self) -> None:
+    def test_single_image_copy_failure_with_unresolved_reference_rolls_back(self) -> None:
         image_directory = self.root / "export" / "images" / "partial-copy"
         image_directory.mkdir(parents=True)
         (image_directory / "a.png").write_bytes(b"old-a")
@@ -712,6 +712,10 @@ class VaultWriterTests(unittest.TestCase):
         )
         writer = VaultWriter(self.vault)
         writer.apply([original], [self.project_result()])
+        manifest_path = self.vault / "90-系统" / "manifest.json"
+        old_manifest = manifest_path.read_bytes()
+        article_path = self.article_path()
+        old_article = article_path.read_bytes()
         old_attachment = self.vault / self.manifest()["articles"][original.key][
             "attachments"
         ][0]
@@ -734,21 +738,131 @@ class VaultWriterTests(unittest.TestCase):
             original_copy(source, destination)
 
         with patch.object(vault_module, "_atomic_copy", side_effect=fail_b):
-            result = writer.apply([changed], [self.project_result()])
+            with self.assertRaisesRegex(
+                vault_module.AttachmentSyncError,
+                "^unresolved local image references$",
+            ):
+                writer.apply([changed], [self.project_result()])
 
-        self.assertEqual(result, VaultApplyResult(created=0, updated=1, unchanged=0))
-        record = self.manifest()["articles"][changed.key]
-        self.assertEqual(record["attachments"], [str(old_attachment.relative_to(self.vault))])
+        self.assertEqual(manifest_path.read_bytes(), old_manifest)
+        self.assertEqual(article_path.read_bytes(), old_article)
         self.assertEqual(old_attachment.read_bytes(), b"old-a")
-        rendered = self.article_path().read_text(encoding="utf-8")
-        self.assertIn("../../04-附件/", rendered)
-        self.assertIn("../images/partial-copy/b.png", rendered)
-        self.assertIn("https://example.com/image.png", rendered)
-        report = (self.vault / "90-系统" / "collection-report.md").read_text(
-            encoding="utf-8"
+
+    def test_missing_image_source_with_partial_old_mapping_rolls_back(self) -> None:
+        image_directory = self.root / "export" / "images" / "old-snapshot"
+        image_directory.mkdir(parents=True)
+        (image_directory / "known.png").write_bytes(b"known")
+        original = self.article(
+            body="![known](../images/old-snapshot/known.png)\n",
+            source_image_dir=image_directory,
         )
-        self.assertIn("附件", report)
-        self.assertNotIn("/Users/private", report)
+        writer = VaultWriter(self.vault)
+        writer.apply([original], [self.project_result()])
+        manifest_path = self.vault / "90-系统" / "manifest.json"
+        old_manifest = manifest_path.read_bytes()
+        article_path = self.article_path()
+        old_article = article_path.read_bytes()
+        old_attachment = self.vault / self.manifest()["articles"][original.key][
+            "attachments"
+        ][0]
+        changed = replace(
+            original,
+            content_hash="sha256:missing-source-partial-old-mapping",
+            body=(
+                "![known](../images/old-snapshot/known.png)\n"
+                "![unknown](../images/old-snapshot/unknown.png)\n"
+            ),
+            source_image_dir=None,
+        )
+
+        with self.assertRaisesRegex(
+            vault_module.AttachmentSyncError,
+            "^unresolved local image references$",
+        ):
+            writer.apply([changed], [self.project_result()])
+
+        self.assertEqual(manifest_path.read_bytes(), old_manifest)
+        self.assertEqual(article_path.read_bytes(), old_article)
+        self.assertEqual(old_attachment.read_bytes(), b"known")
+
+    def test_new_article_without_image_source_rejects_encoded_local_reference(
+        self,
+    ) -> None:
+        article = self.article(
+            body=(
+                "![missing](../images/%E6%BA%90%20%E7%9B%AE%E5%BD%95/a%20b.png)\n"
+                "![remote](https://example.com/image.png)\n"
+            ),
+            source_image_dir=None,
+        )
+
+        with self.assertRaisesRegex(
+            vault_module.AttachmentSyncError,
+            "^unresolved local image references$",
+        ):
+            VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        self.assertFalse((self.vault / "90-系统" / "manifest.json").exists())
+        self.assertEqual(list((self.vault / "03-文章").rglob("*.md")), [])
+        self.assertEqual(list((self.vault / "04-附件").rglob("*")), [])
+
+    def test_new_article_with_empty_image_source_rejects_missing_reference(
+        self,
+    ) -> None:
+        image_directory = self.root / "export" / "images" / "empty-source"
+        image_directory.mkdir(parents=True)
+        article = self.article(
+            body="![missing](../images/empty-source/missing.png)\n",
+            source_image_dir=image_directory,
+        )
+
+        with self.assertRaisesRegex(
+            vault_module.AttachmentSyncError,
+            "^unresolved local image references$",
+        ):
+            VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        self.assertFalse((self.vault / "90-系统" / "manifest.json").exists())
+        self.assertEqual(list((self.vault / "03-文章").rglob("*.md")), [])
+        self.assertEqual(list((self.vault / "04-附件").rglob("*")), [])
+
+    def test_new_article_rolls_back_partial_snapshot_when_one_reference_is_missing(
+        self,
+    ) -> None:
+        image_directory = self.root / "export" / "images" / "partial-source"
+        image_directory.mkdir(parents=True)
+        (image_directory / "present.png").write_bytes(b"present")
+        article = self.article(
+            body=(
+                "![present](../images/partial-source/present.png)\n"
+                "![missing](../images/partial-source/missing%20image.png)\n"
+            ),
+            source_image_dir=image_directory,
+        )
+
+        with self.assertRaisesRegex(
+            vault_module.AttachmentSyncError,
+            "^unresolved local image references$",
+        ):
+            VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        self.assertFalse((self.vault / "90-系统" / "manifest.json").exists())
+        self.assertEqual(list((self.vault / "03-文章").rglob("*.md")), [])
+        self.assertEqual(list((self.vault / "04-附件").rglob("*")), [])
+
+    def test_remote_image_reference_does_not_require_local_snapshot(self) -> None:
+        article = self.article(
+            body="![remote](https://example.com/image.png)\n",
+            source_image_dir=None,
+        )
+
+        result = VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        self.assertEqual(result, VaultApplyResult(created=1, updated=0, unchanged=0))
+        self.assertIn(
+            "https://example.com/image.png",
+            self.article_path().read_text(encoding="utf-8"),
+        )
 
     def test_new_article_attachment_failure_is_rejected_without_any_artifacts(
         self,
@@ -1190,6 +1304,52 @@ class VaultWriterTests(unittest.TestCase):
             with self.subTest(key=article.key):
                 metadata = self.frontmatter(self.vault / records[article.key]["path"])
                 self.assertEqual(metadata["source_url"], article.source_url)
+
+    def test_full_collision_refetch_removes_unreferenced_shared_article_only(
+        self,
+    ) -> None:
+        first = self.article(
+            key="sha256:" + "c" * 64,
+            title="共享旧文章",
+            source_url="https://mp.weixin.qq.com/s/shared-first",
+        )
+        second = replace(
+            first,
+            key="sha256:" + "d" * 64,
+            source_url="https://mp.weixin.qq.com/s/shared-second",
+        )
+        writer = VaultWriter(self.vault)
+        writer.apply([first, second], [self.project_result()])
+        manifest_path = self.vault / "90-系统" / "manifest.json"
+        manifest = self.manifest()
+        shared_relative = "03-文章/项目甲/legacy-shared.md"
+        shared_path = self.vault / shared_relative
+        shared_path.write_bytes(
+            (self.vault / manifest["articles"][first.key]["path"]).read_bytes()
+        )
+        manual_path = shared_path.with_name("manual-note.md")
+        manual_path.write_text("manual", encoding="utf-8")
+        for article in (first, second):
+            manifest["articles"][article.key]["path"] = shared_relative
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+        )
+
+        writer.apply(
+            [
+                replace(first, content_hash="sha256:shared-first-v2"),
+                replace(second, content_hash="sha256:shared-second-v2"),
+            ],
+            [self.project_result()],
+        )
+
+        records = self.manifest()["articles"]
+        self.assertNotEqual(records[first.key]["path"], records[second.key]["path"])
+        self.assertFalse(shared_path.exists())
+        self.assertEqual(manual_path.read_text(encoding="utf-8"), "manual")
+        for article in (first, second):
+            self.assertTrue((self.vault / records[article.key]["path"]).is_file())
 
     def test_manifest_collision_without_incoming_keeps_disk_and_requests_refetch(
         self,
