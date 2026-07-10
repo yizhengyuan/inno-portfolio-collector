@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import html
 import json
@@ -19,11 +20,34 @@ from .state import ManifestStore
 
 
 _UNSAFE_FILENAME = re.compile(r'[/\\:*?"<>|\[\]]')
-_SHA256_KEY = re.compile(r"^sha256:([0-9a-fA-F]{8,})$")
+_SHA256_KEY = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 _PUBLISHED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 _IMAGE_LINK = re.compile(r"(!\[[^\]\n]*\]\()([^\)\n]+)(\))")
 _ARTICLE_BODY = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
+_ARTICLE_METADATA_FIELDS = (
+    "project",
+    "account",
+    "title",
+    "published",
+    "source_url",
+    "collected_at",
+    "content_hash",
+)
+_YAML_TYPED_SCALARS = {
+    "null",
+    "true",
+    "false",
+    "yes",
+    "no",
+    "on",
+    "off",
+    "~",
+}
+_ABSOLUTE_PATH = re.compile(
+    r"(?<![:\w])/(?:Users|private|var|tmp)/[^\s|]+|"
+    r"(?i:(?<![\w])(?:[A-Z]:\\)[^\s|]+)"
+)
 
 
 def _safe_filename(value: str, fallback: str, limit: int = 96) -> str:
@@ -49,8 +73,9 @@ def _safe_filename(value: str, fallback: str, limit: int = 96) -> str:
 def _key_suffix(key: str) -> str:
     match = _SHA256_KEY.fullmatch(key)
     if match is not None:
-        return match.group(1)[:8].lower()
-    return hashlib.sha256(key.encode("utf-8")).hexdigest()[:8]
+        key_digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        return f"{match.group(1).lower()}-{key_digest}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
 def _safe_relative_path(value: object) -> PurePosixPath | None:
@@ -132,6 +157,54 @@ def _remove_directory(path: Path) -> None:
     if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
         raise ValueError("unsafe attachment directory")
     shutil.rmtree(path)
+
+
+def _files_equal(first: Path, second: Path) -> bool:
+    try:
+        if first.stat().st_size != second.stat().st_size:
+            return False
+        with first.open("rb") as first_handle, second.open("rb") as second_handle:
+            while True:
+                first_chunk = first_handle.read(1 << 20)
+                second_chunk = second_handle.read(1 << 20)
+                if first_chunk != second_chunk:
+                    return False
+                if not first_chunk:
+                    return True
+    except OSError:
+        return False
+
+
+def _directory_snapshots_equal(first: Path, second: Path) -> bool:
+    def regular_files(root: Path) -> dict[PurePosixPath, Path] | None:
+        files: dict[PurePosixPath, Path] = {}
+        try:
+            paths = list(root.rglob("*"))
+        except OSError:
+            return None
+        for path in paths:
+            try:
+                details = path.lstat()
+            except OSError:
+                return None
+            if stat.S_ISLNK(details.st_mode):
+                return None
+            if stat.S_ISREG(details.st_mode):
+                files[PurePosixPath(*path.relative_to(root).parts)] = path
+            elif not stat.S_ISDIR(details.st_mode):
+                return None
+        return files
+
+    first_files = regular_files(first)
+    second_files = regular_files(second)
+    if first_files is None or second_files is None:
+        return False
+    if set(first_files) != set(second_files):
+        return False
+    return all(
+        _files_equal(first_files[relative], second_files[relative])
+        for relative in first_files
+    )
 
 
 def _new_backup_path(parent: Path, asset_name: str) -> Path:
@@ -230,17 +303,68 @@ def _read_status(path: Path, fallback: str) -> str:
         return fallback
     if not lines or lines[0].strip() != "---":
         return fallback
-    for line in lines[1:]:
+    for index, line in enumerate(lines[1:], start=1):
         if line.strip() == "---":
             break
         if not line.startswith("read_status:"):
             continue
+        for following in lines[index + 1 :]:
+            if following.strip() == "---":
+                break
+            if not following.strip():
+                continue
+            if following.startswith((" ", "\t")):
+                return fallback
+            break
+        raw_value = line.partition(":")[2].strip()
         try:
-            value = json.loads(line.partition(":")[2].strip())
+            value = json.loads(raw_value)
         except (json.JSONDecodeError, TypeError):
-            return fallback
+            return _plain_read_status(raw_value, fallback)
         return value if isinstance(value, str) else fallback
     return fallback
+
+
+def _plain_read_status(value: str, fallback: str) -> str:
+    if (
+        not value
+        or len(value) > 64
+        or value.casefold() in _YAML_TYPED_SCALARS
+        or re.fullmatch(r"[-+]?\d+(?:\.\d+)?", value) is not None
+        or any(
+            character in "#[]{}|>&*!,:`\"'"
+            or unicodedata.category(character) == "Cc"
+            for character in value
+        )
+    ):
+        return fallback
+    return value
+
+
+def _read_article_metadata(path: Path) -> dict[str, str] | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    if not lines or lines[0] != "---":
+        return None
+    metadata: dict[str, str] = {}
+    for line in lines[1:]:
+        if line == "---":
+            break
+        name, separator, raw_value = line.partition(": ")
+        if not separator or name not in _ARTICLE_METADATA_FIELDS:
+            continue
+        try:
+            value = json.loads(raw_value)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(value, str):
+            return None
+        metadata[name] = value
+    if set(metadata) != set(_ARTICLE_METADATA_FIELDS):
+        return None
+    return metadata
 
 
 def _read_article_body(path: Path) -> str | None:
@@ -255,12 +379,29 @@ def _read_article_body(path: Path) -> str | None:
 
 
 def _plain_cell(value: object) -> str:
+    return _external_text(value).replace("|", "\\|")
+
+
+def _external_text(value: object) -> str:
     text = "".join(
         " " if unicodedata.category(character) == "Cc" else character
         for character in str(value)
     )
     text = " ".join(text.split())
-    return html.escape(text, quote=False).replace("|", "\\|")
+    return html.escape(text, quote=False)
+
+
+def _wiki_alias(value: object) -> str:
+    return (
+        _external_text(value)
+        .replace("|", "｜")
+        .replace("[", "［")
+        .replace("]", "］")
+    )
+
+
+def _redact_error(value: object) -> str:
+    return _ABSOLUTE_PATH.sub("[path]", str(value))
 
 
 def _table(project_results: list[ProjectRunResult]) -> str:
@@ -281,7 +422,7 @@ def _table(project_results: list[ProjectRunResult]) -> str:
                     str(result.skipped),
                     str(result.failed),
                     _plain_cell(result.status),
-                    _plain_cell(result.error),
+                    _plain_cell(_redact_error(result.error)),
                 )
             )
             + " |"
@@ -358,6 +499,56 @@ class VaultWriter:
         filename = f"{published}-{title}-{_key_suffix(key)}.md"
         return PurePosixPath("03-文章", project, filename)
 
+    def _path_collision_key(self, path: PurePosixPath) -> str:
+        return unicodedata.normalize("NFC", path.as_posix()).casefold()
+
+    def _allocated_record_path(
+        self,
+        key: str,
+        record: dict[str, object],
+        occupied: set[str],
+    ) -> PurePosixPath:
+        candidate = self._new_record_path(
+            key,
+            record.get("project", ""),
+            record.get("title", ""),
+            record.get("published", ""),
+        )
+        collision_key = self._path_collision_key(candidate)
+        if collision_key not in occupied:
+            occupied.add(collision_key)
+            return candidate
+        digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+        for length in range(12, len(digest) + 1, 4):
+            extended = candidate.with_name(
+                f"{candidate.stem}-{digest[:length]}{candidate.suffix}"
+            )
+            collision_key = self._path_collision_key(extended)
+            if collision_key not in occupied:
+                occupied.add(collision_key)
+                return extended
+        raise ValueError("unable to allocate unique article path")
+
+    def _resolve_manifest_path_collisions(self, store: ManifestStore) -> None:
+        groups: dict[str, list[str]] = {}
+        for key, record in store.data["articles"].items():
+            path = _article_relative_path(record.get("path"))
+            if path is not None:
+                groups.setdefault(self._path_collision_key(path), []).append(key)
+        occupied = {
+            collision_key
+            for collision_key, keys in groups.items()
+            if len(keys) == 1
+        }
+        for keys in groups.values():
+            if len(keys) < 2:
+                continue
+            for key in sorted(keys):
+                record = store.data["articles"][key]
+                record["path"] = self._allocated_record_path(
+                    key, record, occupied
+                ).as_posix()
+
     def _attachment_root(self, article: NormalizedArticle) -> PurePosixPath:
         project = _safe_filename(article.project, "未命名项目", 80)
         title = _safe_filename(article.title, "未命名文章", 80)
@@ -371,17 +562,18 @@ class VaultWriter:
         list[str],
         dict[str, PurePosixPath],
         _AttachmentCommit | None,
+        str | None,
     ]:
         source = article.source_image_dir
         if source is None:
-            return [], {}, None
+            return [], {}, None, None
         source_path = Path(source)
         try:
             if source_path.is_symlink() or not source_path.is_dir():
-                return [], {}, None
+                return [], {}, None, "附件源暂不可用，已保留上次快照"
             source_root = source_path.resolve(strict=True)
         except (OSError, RuntimeError):
-            return [], {}, None
+            return [], {}, None, "附件源暂不可用，已保留上次快照"
 
         attachment_root = self._attachment_root(article)
         final_directory = self._path(attachment_root)
@@ -407,10 +599,14 @@ class VaultWriter:
         backup_directory: Path | None = None
         copied: list[str] = []
         mapping: dict[str, PurePosixPath] = {}
+        walk_errors: list[OSError] = []
         try:
             assert stage_directory is not None
             for directory, directory_names, filenames in os.walk(
-                source_root, topdown=True, followlinks=False
+                source_root,
+                topdown=True,
+                onerror=walk_errors.append,
+                followlinks=False,
             ):
                 current = Path(directory)
                 directory_names[:] = sorted(
@@ -429,7 +625,9 @@ class VaultWriter:
                         details = candidate.lstat()
                         resolved = candidate.resolve(strict=True)
                         resolved.relative_to(source_root)
-                    except (OSError, RuntimeError, ValueError):
+                    except (OSError, RuntimeError):
+                        return [], {}, None, "附件文件不可读，已保留上次快照"
+                    except ValueError:
                         continue
                     if not stat.S_ISREG(details.st_mode) or stat.S_ISLNK(
                         details.st_mode
@@ -441,10 +639,23 @@ class VaultWriter:
                     stage_destination = stage_directory.joinpath(
                         *relative_posix.parts
                     )
-                    _atomic_copy(resolved, stage_destination)
+                    try:
+                        _atomic_copy(resolved, stage_destination)
+                    except OSError:
+                        return [], {}, None, "附件复制失败，已保留上次快照"
                     destination_text = destination_relative.as_posix()
                     copied.append(destination_text)
                     mapping[relative_posix.as_posix()] = destination_relative
+
+            if walk_errors:
+                return [], {}, None, "附件目录不可读，已保留上次快照"
+
+            if copied and final_exists and _directory_snapshots_equal(
+                stage_directory, final_directory
+            ):
+                _remove_directory(stage_directory)
+                stage_directory = None
+                return sorted(copied), mapping, None, None
 
             if not copied:
                 _remove_directory(stage_directory)
@@ -460,8 +671,8 @@ class VaultWriter:
                         final_present=False,
                     )
                     backup_directory = None
-                    return [], {}, commit
-                return [], {}, None
+                    return [], {}, commit, None
+                return [], {}, None, None
 
             if final_exists:
                 backup_directory = _new_backup_path(
@@ -482,7 +693,7 @@ class VaultWriter:
                 final_present=True,
             )
             backup_directory = None
-            return sorted(copied), mapping, commit
+            return sorted(copied), mapping, commit, None
         finally:
             if stage_directory is not None:
                 _remove_directory(stage_directory)
@@ -609,6 +820,7 @@ class VaultWriter:
         self,
         store: ManifestStore,
         project_results: list[ProjectRunResult],
+        attachment_warnings: list[str],
     ) -> None:
         sorted_results = sorted(
             project_results,
@@ -653,14 +865,14 @@ class VaultWriter:
                 ),
                 reverse=True,
             )
-            lines = [f"# {_plain_cell(project)}", ""]
+            lines = [f"# {_wiki_alias(project)}", ""]
             if not articles:
                 lines.append("暂无文章。")
             for _, record in articles:
                 relative = _article_relative_path(record["path"])
                 assert relative is not None
                 target = PurePosixPath("..") / relative
-                title = str(record.get("title", "未命名文章")).replace("|", "-")
+                title = _wiki_alias(record.get("title", "未命名文章"))
                 published = _plain_cell(record.get("published", ""))
                 lines.append(f"- {published} [[{target.as_posix()}|{title}]]")
             page_name = project_page_stems[project] + ".md"
@@ -681,19 +893,58 @@ class VaultWriter:
             if stat.S_ISREG(details.st_mode) and not stat.S_ISLNK(details.st_mode):
                 entry.unlink()
 
+        last_sync = max(
+            (
+                str(record.get("collected_at", ""))
+                for record in records.values()
+                if str(record.get("collected_at", ""))
+            ),
+            default="无",
+        )
+        failed_projects = sum(
+            result.failed > 0
+            or result.status.strip().casefold() not in {"success", "ok", "completed"}
+            for result in sorted_results
+        )
         home_lines = [
             "# 英诺项目文章库",
             "",
             "[[01-采集状态|采集状态]]",
             "",
             f"总文章数：{len(records)}",
-            "",
-            "## 项目",
+            f"最近更新时间：{_external_text(last_sync)}",
             "",
         ]
+        if failed_projects or attachment_warnings:
+            home_lines.extend(
+                ["> ⚠️ 本次采集存在局部失败，请查看采集状态与报告。", ""]
+            )
+        recent_articles = sorted(
+            (
+                (key, record)
+                for key, record in records.items()
+                if _article_relative_path(record.get("path")) is not None
+            ),
+            key=lambda item: (
+                str(item[1].get("published", "")),
+                str(item[1].get("collected_at", "")),
+                item[0],
+            ),
+            reverse=True,
+        )[:5]
+        home_lines.extend(["## 最近文章", ""])
+        if not recent_articles:
+            home_lines.append("暂无文章。")
+        for _, record in recent_articles:
+            relative = _article_relative_path(record.get("path"))
+            assert relative is not None
+            home_lines.append(
+                f"- [[{relative.as_posix()}|{_wiki_alias(record.get('title', '未命名文章'))}]]"
+            )
+        home_lines.extend(["", "## 项目", ""])
         home_lines.extend(
             f"- [[02-项目/{project_page_stems[project]}|"
-            f"{_plain_cell(project)}]]"
+            f"{_wiki_alias(project)}]]"
             for project in project_names
         )
         _atomic_write(
@@ -701,14 +952,14 @@ class VaultWriter:
             ("\n".join(home_lines).rstrip() + "\n").encode("utf-8"),
         )
 
-        status = "# 采集状态\n\n" + _table(sorted_results) + "\n"
+        status = (
+            "# 采集状态\n\n"
+            f"最后同步时间：{_external_text(last_sync)}\n\n"
+            + _table(sorted_results)
+            + "\n"
+        )
         _atomic_write(self._path("01-采集状态.md"), status.encode("utf-8"))
 
-        failed_projects = sum(
-            result.failed > 0
-            or result.status.strip().casefold() not in {"success", "ok", "completed"}
-            for result in sorted_results
-        )
         report = (
             "# 本次采集报告\n\n"
             f"- 项目数：{len(sorted_results)}\n"
@@ -718,6 +969,11 @@ class VaultWriter:
             + _table(sorted_results)
             + "\n"
         )
+        if attachment_warnings:
+            report += "\n## 附件警告\n\n" + "\n".join(
+                f"- {_plain_cell(warning)}"
+                for warning in sorted(set(attachment_warnings))
+            ) + "\n"
         _atomic_write(
             self._path("90-系统/collection-report.md"), report.encode("utf-8")
         )
@@ -727,6 +983,8 @@ class VaultWriter:
             "文章 frontmatter 中的 `read_status` 默认为 `unread`，"
             "可人工修改；"
             "后续内容更新会优先保留该值。\n\n"
+            "`02-项目` 由系统根据 manifest 管理；其中过期的系统生成 Markdown "
+            "页面会在同步时清理，请勿在该目录保存手工 `.md` 文件。\n\n"
             "`90-系统` 保存 manifest、采集报告和本说明，"
             "请勿随意删除。\n"
         )
@@ -737,12 +995,33 @@ class VaultWriter:
         articles: list[NormalizedArticle],
         project_results: list[ProjectRunResult],
     ) -> VaultApplyResult:
+        self.root.mkdir(parents=True, exist_ok=True)
+        lock_path = self.root / ".vault.lock"
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        with os.fdopen(descriptor, "a+b") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+            try:
+                return self._apply_locked(articles, project_results)
+            finally:
+                fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+
+    def _apply_locked(
+        self,
+        articles: list[NormalizedArticle],
+        project_results: list[ProjectRunResult],
+    ) -> VaultApplyResult:
         for relative in ("02-项目", "03-文章", "04-附件", "90-系统"):
             self._path(relative).mkdir(parents=True, exist_ok=True)
         store = ManifestStore(self._path("90-系统/manifest.json"))
+        self._resolve_manifest_path_collisions(store)
         created = updated = unchanged = 0
         seen: set[str] = set()
         stale_attachment_roots: set[PurePosixPath] = set()
+        attachment_warnings: list[str] = []
         committed_updates: list[
             tuple[_ArticleCommit | None, _AttachmentCommit | None]
         ] = []
@@ -779,8 +1058,19 @@ class VaultWriter:
                         attachments,
                         attachment_mapping,
                         attachment_commit,
+                        attachment_warning,
                     ) = self._copy_attachments(article)
-                    if article.source_image_dir is None and existing is not None:
+                    if attachment_warning is not None:
+                        attachments = (
+                            []
+                            if existing is None
+                            else self._safe_attachments(existing.get("attachments"))
+                        )
+                        attachment_mapping = self._attachment_mapping(attachments)
+                        attachment_warnings.append(
+                            f"{article.project} / {article.title}：{attachment_warning}"
+                        )
+                    elif article.source_image_dir is None and existing is not None:
                         attachments = self._safe_attachments(
                             existing.get("attachments")
                         )
@@ -795,12 +1085,22 @@ class VaultWriter:
                         if destination.is_file()
                         else None
                     )
+                    existing_metadata = (
+                        _read_article_metadata(destination)
+                        if destination.is_file()
+                        else None
+                    )
+                    expected_metadata = {
+                        field: getattr(article, field)
+                        for field in _ARTICLE_METADATA_FIELDS
+                    }
 
                     same_hash = (
                         existing is not None
                         and existing.get("content_hash") == article.content_hash
                         and destination.is_file()
                         and existing_body == rendered_body
+                        and existing_metadata == expected_metadata
                     )
                     if same_hash:
                         unchanged += 1
@@ -840,6 +1140,7 @@ class VaultWriter:
                 committed_updates.append((article_commit, attachment_commit))
 
             self._sanitize_manifest(store)
+            self._resolve_manifest_path_collisions(store)
             store.save()
         except BaseException:
             for article_commit, attachment_commit in reversed(committed_updates):
@@ -864,5 +1165,5 @@ class VaultWriter:
             key=PurePosixPath.as_posix,
         ):
             _remove_directory(self._path(stale_root))
-        self._write_indexes(store, project_results)
+        self._write_indexes(store, project_results, attachment_warnings)
         return VaultApplyResult(created, updated, unchanged)
