@@ -5,6 +5,7 @@ import subprocess
 import sys
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import Mock, patch
 
 from inno_collector.exporter import (
@@ -177,7 +178,7 @@ class MooreExporterAdapterTests(unittest.TestCase):
     def test_collection_commands_accept_explicit_limits(self) -> None:
         runner = FakeRunner(
             (0, json.dumps({"ok": True}), ""),
-            (0, json.dumps({"ok": True}), ""),
+            (0, json.dumps({"ok": True, "articles": []}), ""),
         )
         adapter = self.adapter(runner)
 
@@ -224,6 +225,22 @@ class MooreExporterAdapterTests(unittest.TestCase):
 
         self.assertEqual(adapter.accounts(), [])
         self.assertEqual(adapter.articles(7), [])
+
+    def test_collection_fields_must_be_present(self) -> None:
+        for field in ("accounts", "articles"):
+            with self.subTest(field=field):
+                runner = FakeRunner((0, json.dumps({"ok": True}), ""))
+                adapter = self.adapter(runner)
+
+                with self.assertRaises(ExporterCommandError) as raised:
+                    if field == "accounts":
+                        adapter.accounts()
+                    else:
+                        adapter.articles(7)
+
+                self.assertEqual(
+                    str(raised.exception), f"exporter returned invalid {field}"
+                )
 
     def test_large_successful_articles_payload_is_not_truncated(self) -> None:
         articles = [{"id": 1, "body": "x" * 10000}]
@@ -344,6 +361,26 @@ class MooreExporterAdapterTests(unittest.TestCase):
                     self.adapter(runner).auth_check()
                 self.assertNotIn("secret", str(raised.exception))
 
+    def test_sanitize_redacts_quoted_authorization_formats(self) -> None:
+        cases = (
+            ('"Authorization": "Bearer json-secret"', "json-secret"),
+            ("{'Authorization': 'Bearer dict-secret'}", "dict-secret"),
+        )
+
+        for message, secret in cases:
+            with self.subTest(message=message):
+                sanitized = _sanitize(message)
+                self.assertNotIn(secret, sanitized)
+                self.assertIn("[REDACTED]", sanitized)
+
+                runner = FakeRunner(
+                    (0, json.dumps({"ok": False, "error": message}), "")
+                )
+                with self.assertRaises(ExporterCommandError) as raised:
+                    self.adapter(runner).auth_check()
+                self.assertNotIn(secret, str(raised.exception))
+                self.assertIn("[REDACTED]", str(raised.exception))
+
     def test_error_diagnostic_length_is_bounded(self) -> None:
         runner = FakeRunner((2, json.dumps({"ok": True}), "failure: " + "x" * 10000))
 
@@ -385,24 +422,54 @@ class MooreExporterAdapterTests(unittest.TestCase):
 
     @patch("inno_collector.exporter.subprocess.run")
     def test_default_runner_sets_subprocess_timeout(self, run: Mock) -> None:
-        run.return_value = subprocess.CompletedProcess(
-            args=["exporter"],
-            returncode=0,
-            stdout="out",
-            stderr="err",
-        )
+        def write_output(command: list[str], **kwargs: Any) -> object:
+            kwargs["stdout"].write("out")
+            kwargs["stderr"].write("err")
+            return subprocess.CompletedProcess(args=command, returncode=0)
+
+        run.side_effect = write_output
         command = ["exporter", "auth"]
 
         result = _default_runner(command)
 
         self.assertEqual(result, (0, "out", "err"))
-        run.assert_called_once_with(
-            command,
-            text=True,
-            capture_output=True,
-            check=False,
-            timeout=300,
+        args, kwargs = run.call_args
+        self.assertEqual(args, (command,))
+        self.assertIs(kwargs["text"], True)
+        self.assertIs(kwargs["check"], False)
+        self.assertEqual(kwargs["timeout"], 300)
+        self.assertIn("stdout", kwargs)
+        self.assertIn("stderr", kwargs)
+        self.assertTrue(hasattr(kwargs["stdout"], "write"))
+        self.assertTrue(hasattr(kwargs["stderr"], "write"))
+        self.assertNotIn("capture_output", kwargs)
+
+    def test_output_over_limit_becomes_stable_error(self) -> None:
+        cases = (
+            ("stdout", "MAX_STDOUT_BYTES"),
+            ("stderr", "MAX_STDERR_BYTES"),
         )
+        for stream_name, limit_name in cases:
+            with self.subTest(stream=stream_name):
+                def write_oversized_output(
+                    command: list[str], **kwargs: Any
+                ) -> object:
+                    kwargs[stream_name].write("oversized-secret-output")
+                    return subprocess.CompletedProcess(args=command, returncode=0)
+
+                with patch(f"inno_collector.exporter.{limit_name}", 8), patch(
+                    "inno_collector.exporter.subprocess.run"
+                ) as run:
+                    run.side_effect = write_oversized_output
+                    adapter = MooreExporterAdapter(self.script, self.runtime_dir)
+
+                    with self.assertRaises(ExporterCommandError) as raised:
+                        adapter.auth_check()
+
+                self.assertEqual(
+                    str(raised.exception), "exporter output exceeded safe limit"
+                )
+                self.assertNotIn("oversized-secret-output", str(raised.exception))
 
 
 if __name__ == "__main__":

@@ -4,8 +4,10 @@ import json
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from pathlib import Path
+from typing import TextIO
 
 from .models import ProjectAccount
 
@@ -13,6 +15,9 @@ from .models import ProjectAccount
 Runner = Callable[[list[str]], tuple[int, str, str]]
 MAX_DIAGNOSTIC_LENGTH = 4096
 EXPORTER_TIMEOUT_SECONDS = 300
+SPOOL_MAX_MEMORY_BYTES = 1 << 20
+MAX_STDOUT_BYTES = 64 << 20
+MAX_STDERR_BYTES = 1 << 20
 SECRET_RE = re.compile(
     r"(?i)(auth-key|pass_ticket|appmsg_token|token|ticket|uin)=([^&\s\"']+)"
 )
@@ -21,7 +26,8 @@ DELIMITED_SECRET_RE = re.compile(
     r"(?:\"|')?\s*[:=]\s*)(?:\"[^\"]*\"|'[^']*'|[^&\s,\"']+)"
 )
 AUTHORIZATION_RE = re.compile(
-    r"(?i)(authorization\s*:\s*bearer\s+)(?:\"[^\"]*\"|'[^']*'|[^\s,\"']+)"
+    r"(?i)(?<![\w-])((?:\"|')?authorization(?:\"|')?\s*[:=]\s*"
+    r"(?:\"|')?bearer\s+)[^\s,}\"']+"
 )
 CLI_SECRET_RE = re.compile(
     r"(?i)(--(?:auth-key|pass_ticket|appmsg_token|token|ticket|uin)\s+)"
@@ -33,15 +39,40 @@ class ExporterCommandError(RuntimeError):
     pass
 
 
+class _ExporterOutputLimitError(RuntimeError):
+    pass
+
+
+def _read_output(stream: TextIO, max_bytes: int) -> str:
+    stream.flush()
+    stream.seek(0, 2)
+    if stream.tell() > max_bytes:
+        raise _ExporterOutputLimitError
+    stream.seek(0)
+    return stream.read()
+
+
 def _default_runner(command: list[str]) -> tuple[int, str, str]:
-    result = subprocess.run(
-        command,
-        text=True,
-        capture_output=True,
-        check=False,
-        timeout=EXPORTER_TIMEOUT_SECONDS,
-    )
-    return result.returncode, result.stdout, result.stderr
+    with tempfile.SpooledTemporaryFile(
+        max_size=SPOOL_MAX_MEMORY_BYTES,
+        mode="w+",
+        encoding="utf-8",
+    ) as stdout_file, tempfile.SpooledTemporaryFile(
+        max_size=SPOOL_MAX_MEMORY_BYTES,
+        mode="w+",
+        encoding="utf-8",
+    ) as stderr_file:
+        result = subprocess.run(
+            command,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+            check=False,
+            timeout=EXPORTER_TIMEOUT_SECONDS,
+        )
+        stdout = _read_output(stdout_file, MAX_STDOUT_BYTES)
+        stderr = _read_output(stderr_file, MAX_STDERR_BYTES)
+    return result.returncode, stdout, stderr
 
 
 def _sanitize(message: str) -> str:
@@ -53,8 +84,10 @@ def _sanitize(message: str) -> str:
 
 
 def _object_list(payload: dict, field: str) -> list[dict]:
-    rows = payload.get(field, [])
-    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+    rows = payload.get(field)
+    if field not in payload or not isinstance(rows, list) or any(
+        not isinstance(row, dict) for row in rows
+    ):
         raise ExporterCommandError(f"exporter returned invalid {field}")
     return rows
 
@@ -83,6 +116,8 @@ class MooreExporterAdapter:
             code, stdout, stderr = self.runner(argv)
         except subprocess.TimeoutExpired:
             raise ExporterCommandError("exporter command timed out") from None
+        except _ExporterOutputLimitError:
+            raise ExporterCommandError("exporter output exceeded safe limit") from None
         try:
             payload = json.loads(stdout)
         except json.JSONDecodeError as exc:
