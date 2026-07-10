@@ -575,7 +575,13 @@ class IngestAccountOutputTests(unittest.TestCase):
         marker = "此内容因违规无法查看"
         cases = (
             ("中文引用", f"“平台页面显示：{marker}，请稍后再试”", True),
+            ("多行中文引用", f"“平台页面显示：\n{marker}\n请稍后再试”", True),
             ("ASCII引用", f'" {marker} "', True),
+            (
+                "英文所有格",
+                f"author's note says {marker} before reader's review.",
+                False,
+            ),
             ("未闭合引用", f"“平台页面显示：{marker}，请稍后再试", False),
             ("未加引号", marker, False),
         )
@@ -620,6 +626,26 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertEqual(
             [(article.title, article.reason) for article in result.rejected],
             [(title, "invalid_body") for title in expected_rejected],
+        )
+
+    def test_quote_span_limit_and_closing_are_required(self) -> None:
+        marker = "此内容因违规无法查看"
+        overlong = f"“{marker}{'说明' * 1001}{marker}”"
+        unclosed = f'"平台页面显示：{marker}，请稍后再试'
+
+        self.assertGreater(len(overlong), 2000)
+        self.assertIn(
+            marker,
+            ingest_module._without_quoted_error_markers(overlong),
+        )
+        self.assertIn(
+            marker,
+            ingest_module._without_quoted_error_markers(unclosed),
+        )
+        ordinary_quote = '研究者说“这是普通引用”，文章继续讨论治理。'
+        self.assertEqual(
+            ingest_module._without_quoted_error_markers(ordinary_quote),
+            ordinary_quote,
         )
 
     def test_rejected_urls_never_retain_credentials_query_or_fragment(self) -> None:

@@ -29,6 +29,7 @@ _MIN_BODY_CHARACTERS = 80
 _PROMPT_COVERAGE_THRESHOLD = 0.25
 _DOWNLOAD_ERROR_MAX_LENGTH = 800
 _DOWNLOAD_ERROR_MAX_PREFIX = 80
+_MAX_QUOTED_SPAN_CHARACTERS = 2000
 _LOGIN_PROMPTS = (
     "扫码登录",
     "请登录",
@@ -65,10 +66,13 @@ _BARE_URL_RE = re.compile(
 )
 _MARKDOWN_MARKER_RE = re.compile(r"[`*_~#>|]+")
 _QUOTED_SPAN_PATTERNS = (
-    re.compile(r"“[^”\n]*”"),
-    re.compile(r"‘[^’\n]*’"),
-    re.compile(r'"[^"\n]*"'),
-    re.compile(r"'[^'\n]*'"),
+    re.compile(rf"“[^”]{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}”"),
+    re.compile(rf"‘[^’]{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}’"),
+    re.compile(rf'"[^"]{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}"'),
+    re.compile(
+        rf"(?<![A-Za-z0-9])'[^']{{0,{_MAX_QUOTED_SPAN_CHARACTERS}}}'"
+        r"(?![A-Za-z0-9])"
+    ),
 )
 
 
