@@ -205,6 +205,43 @@ class ManifestStoreTests(unittest.TestCase):
         self.assertEqual(ManifestStore(self.path).data["articles"], expected)
         self.assertEqual(second.data["articles"], expected)
 
+    def test_stale_store_does_not_overwrite_record_it_did_not_change(self) -> None:
+        seed = ManifestStore(self.path)
+        seed.upsert("sha256:existing", {"title": "v0"})
+        seed.save()
+        first = ManifestStore(self.path)
+        second = ManifestStore(self.path)
+
+        first.upsert("sha256:existing", {"title": "v1"})
+        first.save()
+        second.upsert("sha256:new", {"title": "new"})
+        second.save()
+
+        self.assertEqual(
+            ManifestStore(self.path).data["articles"],
+            {
+                "sha256:existing": {"title": "v1"},
+                "sha256:new": {"title": "new"},
+            },
+        )
+
+    def test_stale_store_does_not_restore_record_deleted_by_another_store(self) -> None:
+        seed = ManifestStore(self.path)
+        seed.upsert("sha256:deleted", {"title": "delete me"})
+        seed.save()
+        first = ManifestStore(self.path)
+        second = ManifestStore(self.path)
+
+        del first.data["articles"]["sha256:deleted"]
+        first.save()
+        second.upsert("sha256:new", {"title": "new"})
+        second.save()
+
+        self.assertEqual(
+            ManifestStore(self.path).data["articles"],
+            {"sha256:new": {"title": "new"}},
+        )
+
     def test_save_takes_and_releases_an_exclusive_file_lock(self) -> None:
         store = ManifestStore(self.path)
         store.upsert("sha256:key", {"title": "value"})

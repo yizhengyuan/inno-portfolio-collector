@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import date, datetime, time, timezone
+from datetime import date, datetime
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 
@@ -66,25 +66,6 @@ def _published_date(value: object) -> date | None:
             return None
 
 
-def _published_datetime(value: object) -> datetime | None:
-    text_value = str(value or "").strip()
-    if not text_value:
-        return None
-
-    try:
-        published = datetime.fromisoformat(text_value.replace("Z", "+00:00"))
-    except ValueError:
-        try:
-            published_date = date.fromisoformat(text_value[:10])
-        except ValueError:
-            return None
-        return datetime.combine(published_date, time.min, tzinfo=timezone.utc)
-
-    if published.tzinfo is None:
-        return published.replace(tzinfo=timezone.utc)
-    return published.astimezone(timezone.utc)
-
-
 def _numeric_id(value: object) -> int:
     try:
         return int(value or 0)
@@ -114,8 +95,7 @@ def select_since(rows: list[dict], since: str) -> list[dict]:
 
     selected.sort(
         key=lambda row: (
-            _published_datetime(row.get("publish_time"))
-            or datetime.min.replace(tzinfo=timezone.utc),
+            str(row.get("publish_time") or ""),
             _numeric_id(row.get("id")),
         ),
         reverse=True,

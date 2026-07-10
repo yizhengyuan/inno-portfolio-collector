@@ -201,7 +201,7 @@ class SelectSinceTests(unittest.TestCase):
             ["1", "10", "2"],
         )
 
-    def test_sorts_mixed_times_in_utc_and_normalizes_non_numeric_ids(self) -> None:
+    def test_sorts_mixed_times_by_raw_publish_string_and_safe_numeric_id(self) -> None:
         rows = [
             {
                 "id": "not-a-number",
@@ -228,11 +228,28 @@ class SelectSinceTests(unittest.TestCase):
         self.assertEqual(
             [row["url"].rsplit("/", 1)[-1] for row in select_since(rows, "2026-01-01")],
             [
-                "newest-utc",
+                "previous-utc-day",
                 "midnight-id-five",
                 "midnight-bad-id",
-                "previous-utc-day",
+                "newest-utc",
             ],
+        )
+
+    def test_raw_publish_string_order_takes_precedence_over_utc_order(self) -> None:
+        raw_string_newer = {
+            "id": 1,
+            "publish_time": "2026-01-02T00:00:00+14:00",
+            "url": "https://mp.weixin.qq.com/s/raw-string-newer",
+        }
+        utc_newer = {
+            "id": 2,
+            "publish_time": "2026-01-01T23:00:00+00:00",
+            "url": "https://mp.weixin.qq.com/s/utc-newer",
+        }
+
+        self.assertEqual(
+            select_since([utc_newer, raw_string_newer], "2026-01-01"),
+            [raw_string_newer, utc_newer],
         )
 
     def test_overflowing_numeric_id_is_normalized_without_aborting(self) -> None:

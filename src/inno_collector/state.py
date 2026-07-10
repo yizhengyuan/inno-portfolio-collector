@@ -46,6 +46,7 @@ class ManifestStore:
         else:
             data = _read_manifest(self.path)
         self.data = data
+        self._base_articles = copy.deepcopy(data["articles"])
         return data
 
     def get(self, key: str) -> dict[str, Any] | None:
@@ -57,6 +58,14 @@ class ManifestStore:
 
     def save(self) -> None:
         _validate_manifest(self.data)
+        current_articles = self.data["articles"]
+        changed_keys = {
+            key
+            for key in self._base_articles.keys() | current_articles.keys()
+            if key not in self._base_articles
+            or key not in current_articles
+            or self._base_articles[key] != current_articles[key]
+        }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         temporary_path: Path | None = None
@@ -73,7 +82,11 @@ class ManifestStore:
                     "version": 1,
                     "articles": copy.deepcopy(disk_data["articles"]),
                 }
-                merged["articles"].update(copy.deepcopy(self.data["articles"]))
+                for key in changed_keys:
+                    if key in current_articles:
+                        merged["articles"][key] = copy.deepcopy(current_articles[key])
+                    else:
+                        merged["articles"].pop(key, None)
                 _validate_manifest(merged)
 
                 with tempfile.NamedTemporaryFile(
@@ -98,6 +111,7 @@ class ManifestStore:
 
                 os.replace(temporary_path, self.path)
                 self.data = copy.deepcopy(merged)
+                self._base_articles = copy.deepcopy(merged["articles"])
             finally:
                 if temporary_path is not None and temporary_path.exists():
                     temporary_path.unlink()
