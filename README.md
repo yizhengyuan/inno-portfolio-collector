@@ -53,6 +53,8 @@ python3 -m venv .venv
 
 文章版权、图片及附件版权归原作者或其他权利人所有。使用者应仅在获得授权或法律允许的范围内采集、保存和分享内容。
 
+本项目的自有代码以 [MIT License](LICENSE) 开源。进度、缺陷和功能建议在 [GitHub Issues](https://github.com/yizhengyuan/inno-portfolio-collector/issues) 中统一管理；贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
+
 ## 兼容命令行测试
 
 底层 Python 模块仍保留 `unittest`、内容包和 Helper 协议入口，供开发、自动化验收与故障排查使用；它们不是朋友日常使用的前置条件。

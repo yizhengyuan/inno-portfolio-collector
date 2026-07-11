@@ -1,0 +1,33 @@
+name: 功能建议
+description: 提出一项有明确用户价值的改进
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: dropdown
+    id: audience
+    attributes:
+      label: 主要用户
+      options:
+        - 采集者
+        - 阅读者
+        - 开发者或发布者
+    validations:
+      required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: 需要解决的问题
+      description: 请先描述使用场景，不要只描述界面或技术方案。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: 期望结果
+    validations:
+      required: true
+  - type: textarea
+    id: compliance
+    attributes:
+      label: 隐私、版权或登录边界
+      description: 如果功能会处理公众号凭据或文章内容，请说明安全边界。

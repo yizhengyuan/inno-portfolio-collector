@@ -19,3 +19,7 @@ runtime/
 macos/.build/
 .build-macos/
 *.spec
+
+# Local design workspace and user-owned source material.
+/.superpowers/
+/英诺项目清单-2026/
