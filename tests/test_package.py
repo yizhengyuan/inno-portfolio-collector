@@ -234,6 +234,8 @@ class PackageTests(unittest.TestCase):
             '{"auth-key":"secret"}', '{"Cookie":"sid=x"}',
             '{"Authorization":"Bearer abc"}', "pass_ticket%253Dsecret",
             "file%253A%252F%252F%252FUsers%252Falice%252Fx",
+            "auth-key%2525253Dsecret",
+            "auth-key%" + "25" * 9 + "3Dsecret",
         ):
             with self.subTest(payload=payload):
                 page.write_text(payload, encoding="utf-8")
@@ -252,6 +254,33 @@ class PackageTests(unittest.TestCase):
         exporter = "正文\n![](../images/source/a(b).png \"图\")\n"
         delivered = "正文\n![](../../04-附件/项目/文章-key/a(b).png \"图\")\n"
         self.assertEqual(canonical_body_hash(exporter), canonical_body_hash(delivered))
+
+    def test_vault_rewrites_parenthesized_exporter_image_end_to_end(self) -> None:
+        image_dir = self.root / "export/images/source"
+        image_dir.mkdir(parents=True)
+        (image_dir / "a(b).png").write_bytes(b"png")
+        url = "https://mp.weixin.qq.com/s/parenthesized-image"
+        body = '正文\n![](../images/source/a(b).png "图")\n'
+        article = NormalizedArticle(
+            key=article_key(url), project="括号项目", account="括号账号",
+            title="括号文章", published="2026-07-11", source_url=url,
+            collected_at="2026-07-11T10:00:00+08:00",
+            content_hash=canonical_body_hash(body), body=body,
+            source_markdown=self.root / "source.md", source_image_dir=image_dir,
+        )
+        result = ProjectRunResult(
+            project="括号项目", account="括号账号", discovered=1,
+            downloaded=1, skipped=0, failed=0, status="success", error="",
+            last_sync="2026-07-11T10:00:00+08:00",
+        )
+
+        VaultWriter(self.vault).apply([article], [result])
+
+        record = self.manifest()["articles"][article.key]
+        rendered = (self.vault / record["path"]).read_text(encoding="utf-8")
+        self.assertIn("a%28b%29.png", rendered)
+        self.assertNotIn("../images/source", rendered)
+        self.assertEqual(lint_vault(self.vault)["errors"], [])
 
     def test_attachment_warning_requires_home_warning_but_not_failed_project(self) -> None:
         report = self.vault / "90-系统/collection-report.md"
@@ -292,12 +321,26 @@ class PackageTests(unittest.TestCase):
         with self.assertRaises(DeliveryValidationError):
             build_delivery_zip(self.vault, self.vault / "bad.zip")
         output = self.root / "out.zip"
-        with patch("inno_collector.package.os.replace", side_effect=OSError("boom")):
-            with self.assertRaises(OSError):
+        with patch("inno_collector.package.os.link", side_effect=OSError("boom")):
+            with self.assertRaises(DeliveryValidationError):
                 build_delivery_zip(self.vault, output)
         self.assertFalse(output.exists())
         self.assertFalse(output.with_suffix(".summary.md").exists())
         self.assertFalse(any(self.root.glob(".*.tmp")))
+
+    def test_concurrent_output_claim_is_never_overwritten(self) -> None:
+        output = self.root / "claimed.zip"
+        real_link = os.link
+
+        def competitor_claim(source: Path, destination: Path, **kwargs: object) -> None:
+            Path(destination).write_bytes(b"competitor")
+            real_link(source, destination, **kwargs)
+
+        with patch("inno_collector.package.os.link", side_effect=competitor_claim):
+            with self.assertRaises(DeliveryValidationError):
+                build_delivery_zip(self.vault, output)
+
+        self.assertEqual(output.read_bytes(), b"competitor")
 
     def test_cli_lint_and_package_emit_json_and_use_nonzero_for_invalid(self) -> None:
         self.assertEqual(main(["lint", "--vault", str(self.vault)]), 0)

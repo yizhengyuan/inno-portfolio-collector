@@ -67,6 +67,7 @@ _SAFE_IGNORED_LOCKS = {".vault.lock", "90-系统/manifest.json.lock"}
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 _MAX_TEXT_SIZE = 16 * 1024 * 1024
 _MAX_IMAGE_SIZE = 128 * 1024 * 1024
+_MAX_URL_DECODE_DEPTH = 8
 
 
 def _collision_key(value: str) -> str:
@@ -343,17 +344,20 @@ def _scan_secrets(root: Path, files: list[PurePosixPath]) -> list[str]:
             continue
         candidates = [contents]
         decoded = contents
-        for _ in range(3):
+        excessive_encoding = False
+        for _ in range(_MAX_URL_DECODE_DEPTH):
             next_value = unquote(decoded)
             if next_value == decoded:
                 break
             candidates.append(next_value)
             decoded = next_value
+        else:
+            excessive_encoding = unquote(decoded) != decoded
         if any(
             pattern.search(candidate)
             for candidate in candidates
             for pattern in (_SECRET_VALUE, _AUTHORIZATION, _COOKIE_HEADER, _ABSOLUTE_PATH)
-        ):
+        ) or excessive_encoding:
             findings.append(relative.as_posix())
     return sorted(findings)
 
@@ -604,17 +608,26 @@ def _snapshot_vault(
     return snapshot_hashes, set(directories)
 
 
-def _reserve_output_pair(destination: Path, summary: Path) -> None:
-    created: list[Path] = []
+def _install_no_replace(source: Path, destination: Path) -> tuple[int, int]:
     try:
-        for path in (destination, summary):
-            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            os.close(descriptor)
-            created.append(path)
+        os.link(source, destination, follow_symlinks=False)
+        details = destination.lstat()
     except OSError:
-        for path in created:
-            path.unlink(missing_ok=True)
-        raise DeliveryValidationError({"errors": ["delivery output was claimed concurrently"]}) from None
+        raise DeliveryValidationError(
+            {"errors": ["delivery output was claimed concurrently"]}
+        ) from None
+    return details.st_dev, details.st_ino
+
+
+def _remove_installed(path: Path, identity: tuple[int, int] | None) -> None:
+    if identity is None:
+        return
+    try:
+        details = path.lstat()
+    except OSError:
+        return
+    if (details.st_dev, details.st_ino) == identity:
+        path.unlink(missing_ok=True)
 
 
 def build_delivery_zip(
@@ -645,9 +658,8 @@ def build_delivery_zip(
     destination_parent.mkdir(parents=True, exist_ok=True)
     zip_temp: Path | None = None
     summary_temp: Path | None = None
-    zip_installed = False
-    summary_installed = False
-    outputs_reserved = False
+    zip_identity: tuple[int, int] | None = None
+    summary_identity: tuple[int, int] | None = None
     lock_handle = None
     snapshot_context = tempfile.TemporaryDirectory(prefix="inno-delivery-snapshot-")
     try:
@@ -663,8 +675,6 @@ def build_delivery_zip(
         report = lint_vault(snapshot)
         if report["errors"]:
             raise DeliveryValidationError(report)
-        _reserve_output_pair(destination, summary_path)
-        outputs_reserved = True
         with tempfile.NamedTemporaryFile(dir=destination_parent, prefix=".delivery-", suffix=".tmp", delete=False) as handle:
             zip_temp = Path(handle.name)
         files, directories, inventory_errors, _ = _inventory(snapshot)
@@ -701,13 +711,12 @@ def build_delivery_zip(
             handle.write(summary)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(zip_temp, destination)
+        zip_identity = _install_no_replace(zip_temp, destination)
+        summary_identity = _install_no_replace(summary_temp, summary_path)
+        zip_temp.unlink()
         zip_temp = None
-        zip_installed = True
-        os.replace(summary_temp, summary_path)
+        summary_temp.unlink()
         summary_temp = None
-        summary_installed = True
-        outputs_reserved = False
         return {
             "zip_path": destination,
             "summary_path": summary_path,
@@ -717,10 +726,8 @@ def build_delivery_zip(
             "zip_sha256": digest,
         }
     except BaseException:
-        if (zip_installed or outputs_reserved) and destination.exists():
-            destination.unlink()
-        if (summary_installed or outputs_reserved) and summary_path.exists():
-            summary_path.unlink()
+        _remove_installed(destination, zip_identity)
+        _remove_installed(summary_path, summary_identity)
         raise
     finally:
         if lock_handle is not None:

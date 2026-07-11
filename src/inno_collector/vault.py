@@ -14,7 +14,7 @@ import uuid
 from pathlib import Path, PurePosixPath
 from urllib.parse import unquote
 
-from .ingest import yaml_string
+from .ingest import markdown_image_destinations, yaml_string
 from .models import NormalizedArticle, ProjectRunResult, VaultApplyResult
 from .state import ManifestStore
 
@@ -30,7 +30,6 @@ class ManifestPathCollisionError(RuntimeError):
 _UNSAFE_FILENAME = re.compile(r'[/\\:*?"<>|\[\]#^]')
 _SHA256_KEY = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 _PUBLISHED_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
-_IMAGE_LINK = re.compile(r"(!\[[^\]\n]*\]\()([^\)\n]+)(\))")
 _ARTICLE_BODY = re.compile(r"\A---\n.*?\n---\n\n", re.DOTALL)
 _IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".svg"}
 _ARTICLE_METADATA_FIELDS = (
@@ -818,10 +817,10 @@ class VaultWriter:
         if not mapping:
             return body
 
-        def replace_link(match: re.Match[str]) -> str:
-            raw_target = match.group(2)
+        replacements: list[tuple[int, int, str]] = []
+        for start, end, raw_target in markdown_image_destinations(body):
             if raw_target.casefold().startswith(("http://", "https://")):
-                return match.group(0)
+                continue
             decoded = unquote(raw_target)
             target = PurePosixPath(decoded)
             if (
@@ -830,20 +829,32 @@ class VaultWriter:
                 or target.parts[2] in {"", ".", ".."}
                 or any(part in {"", ".", ".."} for part in target.parts[3:])
             ):
-                return match.group(0)
+                continue
             source_relative = PurePosixPath(*target.parts[3:]).as_posix()
             copied = mapping.get(source_relative)
             if copied is None:
-                return match.group(0)
+                continue
             rewritten = (PurePosixPath("..", "..") / copied).as_posix()
-            rewritten = rewritten.replace(" ", "%20")
-            return f"{match.group(1)}{rewritten}{match.group(3)}"
+            for literal, encoded in (
+                ("%", "%25"),
+                (" ", "%20"),
+                ("(", "%28"),
+                (")", "%29"),
+                ("#", "%23"),
+                ("?", "%3F"),
+            ):
+                rewritten = rewritten.replace(literal, encoded)
+            replacements.append((start, end, rewritten))
 
-        return _IMAGE_LINK.sub(replace_link, body)
+        rewritten_body = body
+        for start, end, replacement in reversed(replacements):
+            rewritten_body = (
+                rewritten_body[:start] + replacement + rewritten_body[end:]
+            )
+        return rewritten_body
 
     def _has_exporter_image_reference(self, body: str) -> bool:
-        for match in _IMAGE_LINK.finditer(body):
-            raw_target = match.group(2)
+        for _, _, raw_target in markdown_image_destinations(body):
             if raw_target.casefold().startswith(("http://", "https://")):
                 continue
             target = PurePosixPath(unquote(raw_target))
