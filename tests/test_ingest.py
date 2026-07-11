@@ -759,10 +759,16 @@ class IngestAccountOutputTests(unittest.TestCase):
                 ),
             ]
         )
+        first_collection_time = datetime(
+            2026, 7, 11, 1, 2, 3, tzinfo=timezone.utc
+        )
+        expected_collected_at = first_collection_time.astimezone().isoformat(
+            timespec="seconds"
+        )
         fake_datetime = Mock()
         fake_datetime.fromisoformat.side_effect = datetime.fromisoformat
         fake_datetime.now.side_effect = (
-            datetime(2026, 7, 11, 1, 2, 3, tzinfo=timezone.utc),
+            first_collection_time,
             datetime(2026, 7, 11, 1, 2, 4, tzinfo=timezone.utc),
         )
 
@@ -772,7 +778,7 @@ class IngestAccountOutputTests(unittest.TestCase):
         self.assertEqual(len(result.valid), 2)
         self.assertEqual(
             {article.collected_at for article in result.valid},
-            {"2026-07-11T09:02:03+08:00"},
+            {expected_collected_at},
         )
         fake_datetime.now.assert_called_once_with()
 

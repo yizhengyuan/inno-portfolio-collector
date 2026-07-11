@@ -10,10 +10,11 @@ if [[ -n "${INNO_READER_HELPER:-}" ]]; then
 fi
 cd "$ROOT/macos"
 
-FRAMEWORKS="/Library/Developer/CommandLineTools/Library/Developer/Frameworks"
-LIBRARIES="/Library/Developer/CommandLineTools/Library/Developer/usr/lib"
+DEVELOPER_ROOT="${DEVELOPER_DIR:-$(xcode-select -p)}"
+FRAMEWORKS="$DEVELOPER_ROOT/Library/Developer/Frameworks"
+LIBRARIES="$DEVELOPER_ROOT/Library/Developer/usr/lib"
 
-if [[ -d "$FRAMEWORKS/Testing.framework" ]]; then
+if [[ "${DEVELOPER_ROOT:t}" == "CommandLineTools" && -d "$FRAMEWORKS/Testing.framework" ]]; then
   exec swift test --enable-swift-testing --disable-xctest \
     -Xswiftc -F -Xswiftc "$FRAMEWORKS" \
     -Xlinker "-F$FRAMEWORKS" \
