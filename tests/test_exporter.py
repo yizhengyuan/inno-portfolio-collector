@@ -55,6 +55,35 @@ class MooreExporterAdapterTests(unittest.TestCase):
             ],
         )
 
+    def test_frozen_command_prefix_replaces_python_and_script(self) -> None:
+        runner = FakeRunner((0, json.dumps({"ok": True}), ""))
+        adapter = MooreExporterAdapter(
+            self.script,
+            self.runtime_dir,
+            runner=runner,
+            command_prefix=("/Applications/Inno.app/Contents/PlugIns/MooreExporterHelper",),
+        )
+
+        adapter.auth_check()
+
+        self.assertEqual(
+            runner.calls,
+            [[
+                "/Applications/Inno.app/Contents/PlugIns/MooreExporterHelper",
+                "--runtime-dir",
+                str(self.runtime_dir),
+                "exporter-auth-check",
+            ]],
+        )
+
+    def test_empty_frozen_command_prefix_is_rejected(self) -> None:
+        with self.assertRaises(ValueError):
+            MooreExporterAdapter(
+                self.script,
+                self.runtime_dir,
+                command_prefix=(),
+            )
+
     def test_nonzero_exit_raises_a_sanitized_error(self) -> None:
         runner = FakeRunner(
             (2, json.dumps({"ok": True}), "login failed pass_ticket=secret")

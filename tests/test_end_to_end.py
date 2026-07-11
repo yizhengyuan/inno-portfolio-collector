@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 import tempfile
 import unittest
 import zipfile
@@ -8,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from inno_collector.cli import build_parser
+from inno_collector.cli import build_parser, main
 from inno_collector.config import load_projects
 from inno_collector.package import build_delivery_zip, lint_vault
 from inno_collector.pipeline import CollectionPipeline
@@ -193,3 +194,90 @@ class TenProjectDeliveryTests(unittest.TestCase):
             overridden = build_parser().parse_args(["collect"])
         self.assertEqual(overridden.exporter_script, Path("/custom/exporter.py"))
         self.assertEqual(overridden.exporter_runtime, Path("/custom/runtime"))
+
+    def test_cli_update_and_draft_round_trip_preserves_human_work(self) -> None:
+        projects = load_projects(REPOSITORY / "config/projects.json")
+        backend = OfflineExporter(projects)
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / "runtime"
+            pipeline = CollectionPipeline(
+                backend,
+                runtime_dir=runtime,
+                now=lambda: NOW,
+                sleep=lambda _seconds: None,
+            )
+            pipeline.run(projects, since="2026-01-01")
+            collector_vault = runtime / "vault/英诺被投项目资讯库"
+            baseline = root / "baseline.inno-update"
+            reader_vault = root / "reader-vault"
+
+            self.assertEqual(
+                main([
+                    "package-update", "--vault", str(collector_vault),
+                    "--output", str(baseline),
+                    "--created-at", "2026-07-11T12:00:00Z",
+                ]),
+                0,
+            )
+            self.assertEqual(
+                main(["apply-update", "--package", str(baseline), "--vault", str(reader_vault)]),
+                0,
+            )
+            manifest = json.loads(
+                (reader_vault / "90-系统/manifest.json").read_text(encoding="utf-8")
+            )
+            source_id = next(iter(manifest["articles"]))
+            draft = reader_vault / "10-编辑稿/round-trip.md"
+            draft.write_text(
+                "---\n"
+                'draft_id: "round-trip-draft"\n'
+                "draft_version: 1\n"
+                'author: "朋友甲"\n'
+                'title: "往返稿件"\n'
+                'updated_at: "2026-07-11T13:00:00+08:00"\n'
+                f'source_ids: ["{source_id}"]\n'
+                "---\n\n人工内容不可覆盖。\n",
+                encoding="utf-8",
+            )
+            original_draft = draft.read_bytes()
+
+            backend.rows[1].append(
+                {
+                    "id": 999,
+                    "url": "https://mp.weixin.qq.com/s/new-incremental",
+                    "publish_time": "2026-07-11 10:00:00",
+                    "title": "新增资讯",
+                }
+            )
+            pipeline.run(projects, since="2026-01-01")
+            incremental = root / "incremental.inno-update"
+            self.assertEqual(
+                main([
+                    "package-update", "--vault", str(collector_vault),
+                    "--output", str(incremental), "--base-package", str(baseline),
+                    "--created-at", "2026-07-11T13:30:00Z",
+                ]),
+                0,
+            )
+            self.assertEqual(
+                main(["apply-update", "--package", str(incremental), "--vault", str(reader_vault)]),
+                0,
+            )
+            self.assertEqual(draft.read_bytes(), original_draft)
+
+            draft_package = root / "drafts.inno-drafts"
+            self.assertEqual(
+                main([
+                    "package-drafts", "--vault", str(reader_vault),
+                    "--draft", "10-编辑稿/round-trip.md", "--output", str(draft_package),
+                    "--exported-at", "2026-07-11T14:00:00+08:00",
+                ]),
+                0,
+            )
+            inbox = root / "inbox"
+            self.assertEqual(
+                main(["receive-drafts", "--package", str(draft_package), "--inbox", str(inbox)]),
+                0,
+            )
+            self.assertEqual(len([path for path in inbox.iterdir() if path.is_dir()]), 1)

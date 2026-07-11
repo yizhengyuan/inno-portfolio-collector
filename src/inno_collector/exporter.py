@@ -78,15 +78,18 @@ class MooreExporterAdapter:
         script: Path,
         runtime_dir: Path,
         runner: Runner = _default_runner,
+        command_prefix: tuple[str, ...] | None = None,
     ) -> None:
+        if command_prefix is not None and not command_prefix:
+            raise ValueError("exporter command prefix must not be empty")
         self.script = script
         self.runtime_dir = runtime_dir
         self.runner = runner
+        self.command_prefix = command_prefix or (sys.executable, str(self.script))
 
     def _execute(self, command: str, *arguments: str) -> tuple[int, dict, str]:
         argv = [
-            sys.executable,
-            str(self.script),
+            *self.command_prefix,
             "--runtime-dir",
             str(self.runtime_dir),
             command,

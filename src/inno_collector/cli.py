@@ -8,10 +8,13 @@ from dataclasses import asdict
 from pathlib import Path
 
 from .config import load_projects
+from .dashboard import build_dashboard
 from .diagnostics import sanitize_diagnostic
+from .draft_package import build_draft_package, receive_draft_package
 from .exporter import MooreExporterAdapter
 from .package import DeliveryValidationError, build_delivery_zip, lint_vault
 from .pipeline import CollectionPipeline
+from .update_package import apply_update_package, build_update_package
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -53,11 +56,67 @@ def build_parser() -> argparse.ArgumentParser:
     lint.add_argument(
         "--vault", type=Path, default=Path("runtime/vault/英诺被投项目资讯库")
     )
+    package_update = sub.add_parser("package-update")
+    package_update.add_argument("--vault", type=Path, required=True)
+    package_update.add_argument("--output", type=Path, required=True)
+    package_update.add_argument("--base-package", type=Path)
+    package_update.add_argument("--created-at")
+    apply_update = sub.add_parser("apply-update")
+    apply_update.add_argument("--package", type=Path, required=True)
+    apply_update.add_argument("--vault", type=Path, required=True)
+    package_drafts = sub.add_parser("package-drafts")
+    package_drafts.add_argument("--vault", type=Path, required=True)
+    package_drafts.add_argument("--draft", action="append", required=True)
+    package_drafts.add_argument("--output", type=Path, required=True)
+    package_drafts.add_argument("--exported-at", required=True)
+    receive_drafts = sub.add_parser("receive-drafts")
+    receive_drafts.add_argument("--package", type=Path, required=True)
+    receive_drafts.add_argument("--inbox", type=Path, required=True)
+    dashboard = sub.add_parser("dashboard")
+    dashboard.add_argument("--vault", type=Path, required=True)
     return parser
+
+
+def _print_json(value: object) -> None:
+    print(json.dumps(value, ensure_ascii=False, sort_keys=True, default=str))
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    if args.command in {
+        "package-update",
+        "apply-update",
+        "package-drafts",
+        "receive-drafts",
+        "dashboard",
+    }:
+        try:
+            if args.command == "package-update":
+                result = build_update_package(
+                    args.vault,
+                    args.output,
+                    base_package=args.base_package,
+                    created_at=args.created_at,
+                )
+            elif args.command == "apply-update":
+                result = asdict(apply_update_package(args.package, args.vault))
+            elif args.command == "package-drafts":
+                result = build_draft_package(
+                    args.vault,
+                    args.draft,
+                    args.output,
+                    exported_at=args.exported_at,
+                )
+            elif args.command == "receive-drafts":
+                result = receive_draft_package(args.package, args.inbox)
+            else:
+                result = {"dashboard_path": str(build_dashboard(args.vault))}
+        except Exception as exc:
+            _print_json({"error": sanitize_diagnostic(exc)})
+            return 2
+        _print_json(result)
+        return 0
+
     if args.command == "lint":
         try:
             result = lint_vault(args.vault)
