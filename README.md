@@ -42,6 +42,7 @@ python3 -m venv .venv
 ./.venv/bin/python -m pip install -e '.[build]'
 ./.venv/bin/python scripts/build_macos_apps.py \
   --configuration release --output .build-macos/apps
+./scripts/test_swift.sh
 ```
 
 正式签名工具要求 `MACOS_SIGNING_IDENTITY`；启用公证时还要求 `APPLE_ID`、`APPLE_TEAM_ID` 和 `APPLE_APP_PASSWORD`。凭据只从环境读取，不写入发布清单。

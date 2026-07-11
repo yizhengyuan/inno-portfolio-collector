@@ -83,12 +83,29 @@ public struct CollectorContentView: View {
             }
         case .delivery:
             Text("生成带版本号和哈希校验的更新包；朋友端导入时不会覆盖人工稿件。")
-            Button("生成基线更新包") { saveUpdate() }
-                .disabled(model.isBusy)
+            HStack {
+                Button("生成基线更新包") { saveUpdate(basePackage: nil) }
+                Button("生成增量更新包…") { selectBaseAndSaveUpdate() }
+            }
+            .disabled(model.isBusy)
         case .inbox:
-            Text("导入朋友回传的编辑稿包；冲突版本会并列保留。")
+            Text("先接收朋友回传的编辑稿包；确认后才写入编辑区，冲突版本会并列保留。")
             Button("导入编辑稿包") { openDraftPackage() }
                 .disabled(model.isBusy)
+            ForEach(model.receivedDrafts) { receipt in
+                HStack {
+                    Text("待确认：\(receipt.draftCount) 份稿件")
+                    if receipt.alreadyReceived {
+                        Text("已接收过").foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("确认收录") {
+                        start { await model.acceptDraft(receipt: receipt) }
+                    }
+                    .disabled(model.isBusy)
+                }
+                .padding(.vertical, 4)
+            }
         }
     }
 
@@ -112,11 +129,20 @@ public struct CollectorContentView: View {
         }
     }
 
-    private func saveUpdate() {
+    private func saveUpdate(basePackage: URL?) {
         let panel = NSSavePanel()
-        panel.nameFieldStringValue = "英诺资讯更新.inno-update"
+        panel.nameFieldStringValue = basePackage == nil
+            ? "英诺资讯基线.inno-update" : "英诺资讯增量.inno-update"
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        start { await model.buildUpdate(destination: url, basePackage: nil) }
+        start { await model.buildUpdate(destination: url, basePackage: basePackage) }
+    }
+
+    private func selectBaseAndSaveUpdate() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.message = "选择朋友当前使用版本对应的上一份更新包"
+        guard panel.runModal() == .OK, let base = panel.url else { return }
+        saveUpdate(basePackage: base)
     }
 
     private func openDraftPackage() {

@@ -112,6 +112,32 @@ class DraftPackageTests(unittest.TestCase):
             },
         )
 
+    def test_same_path_with_different_id_never_overwrites_existing_human_draft(self) -> None:
+        existing = self.collector_vault / "10-编辑稿/稿件.md"
+        existing.write_text(
+            "---\n"
+            'draft_id: "draft-two"\n'
+            "draft_version: 1\n"
+            'author: "采集者"\n'
+            'title: "本地人工稿"\n'
+            'updated_at: "2026-07-11T12:00:00+08:00"\n'
+            f'source_ids: ["{SOURCE_ID}"]\n'
+            "---\n\n"
+            "本地人工内容不可覆盖。\n",
+            encoding="utf-8",
+        )
+        original = existing.read_bytes()
+        receipt = self.build_and_receive("different-id-same-path")
+
+        result = accept_received_draft(receipt, self.collector_vault)
+
+        self.assertEqual(existing.read_bytes(), original)
+        self.assertEqual(result["created"], 0)
+        self.assertEqual(result["conflicts"], 1)
+        conflicts = list((self.collector_vault / "10-编辑稿").glob("稿件-conflict-*.md"))
+        self.assertEqual(len(conflicts), 1)
+        self.assertIn("首版人工稿", conflicts[0].read_text(encoding="utf-8"))
+
     def test_identical_receipt_and_accept_are_idempotent(self) -> None:
         package = self.root / "same.inno-drafts"
         build_draft_package(

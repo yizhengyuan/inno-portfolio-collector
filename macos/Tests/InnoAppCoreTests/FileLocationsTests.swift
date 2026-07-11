@@ -26,6 +26,15 @@ struct FileLocationsTests {
         #expect(reader.helper.lastPathComponent == "InnoReaderHelper")
         #expect(collector.projectsConfig?.path.hasSuffix("Contents/Resources/config/projects.json") == true)
         #expect(reader.projectsConfig == nil)
+        #expect(
+            collector.vault
+                == collector.supportRoot
+                    .appendingPathComponent("Runtime/vault/英诺被投项目资讯库", isDirectory: true)
+        )
+        #expect(
+            reader.vault
+                == reader.supportRoot.appendingPathComponent("英诺被投项目资讯库", isDirectory: true)
+        )
     }
 
     @Test("all writable paths stay inside Application Support")

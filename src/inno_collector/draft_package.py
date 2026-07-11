@@ -412,8 +412,14 @@ def accept_received_draft(receipt: Path, vault: Path) -> dict[str, object]:
             unchanged += 1
             continue
         original = root.joinpath(*PurePosixPath(str(row["path"])).parts)
-        if matches:
+        if matches or original.exists():
             destination = original.with_name(f"{original.stem}-conflict-{digest[:12]}.md")
+            counter = 2
+            while destination.exists():
+                destination = original.with_name(
+                    f"{original.stem}-conflict-{digest[:12]}-{counter}.md"
+                )
+                counter += 1
             conflicts += 1
         else:
             destination = original

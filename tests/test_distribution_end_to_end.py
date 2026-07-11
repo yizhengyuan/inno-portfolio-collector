@@ -225,6 +225,19 @@ class FrozenTwoUserWorkflowTests(unittest.TestCase):
                 collector_environment,
             )
             self.assertEqual(receipt["draft_count"], 1)
+            accepted = self.call(
+                collector_helper,
+                "accept_draft",
+                {
+                    "receipt": str(receipt["receipt_path"]),
+                    "vault": str(collector_vault),
+                },
+                collector_environment,
+            )
+            self.assertEqual(accepted["draft_count"], 1)
+            self.assertTrue(
+                (collector_vault / "10-编辑稿/frozen-round-trip.md").is_file()
+            )
             self.assertEqual(lint_vault(reader_vault)["errors"], [])
             audit_reader_binary(reader_helper)
             reader_root = self.bundle_root(reader_helper)

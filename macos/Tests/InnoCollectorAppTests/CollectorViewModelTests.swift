@@ -81,22 +81,55 @@ struct CollectorViewModelTests {
         #expect(calls.map(\.command) == ["collect", "collect"])
         #expect(calls[0].arguments["dry_run"] == .boolean(true))
         #expect(calls[1].arguments["dry_run"] == .boolean(false))
+        guard case .string(let runtime) = calls[0].arguments["runtime"] else {
+            Issue.record("collection runtime is missing")
+            return
+        }
+        #expect(
+            model.locations.vault
+                == URL(fileURLWithPath: runtime, isDirectory: true)
+                    .appendingPathComponent("vault/英诺被投项目资讯库", isDirectory: true)
+        )
     }
 
     @Test("delivery and inbox actions use role paths")
     func deliveryAndInbox() async {
-        let helper = RecordingHelper()
+        let receiptURL = locations.inbox.appendingPathComponent("receipt-1", isDirectory: true)
+        let helper = RecordingHelper(responses: [
+            "receive_drafts": [
+                "receipt_path": .string(receiptURL.path),
+                "draft_count": .integer(1),
+                "existing": .boolean(false),
+            ],
+            "accept_draft": [
+                "created": .integer(1),
+                "unchanged": .integer(0),
+                "conflicts": .integer(0),
+                "draft_count": .integer(1),
+            ],
+        ])
         let model = CollectorViewModel(helper: helper, locations: locations)
         let output = URL(fileURLWithPath: "/tmp/update.inno-update")
+        let base = URL(fileURLWithPath: "/tmp/base.inno-update")
         let draft = URL(fileURLWithPath: "/tmp/drafts.inno-drafts")
 
         await model.buildUpdate(destination: output, basePackage: nil)
+        await model.buildUpdate(destination: output, basePackage: base)
         await model.receiveDrafts(package: draft)
+        let receipt = try! #require(model.receivedDrafts.first)
+        await model.acceptDraft(receipt: receipt)
 
         let calls = await helper.recordedCalls()
-        #expect(calls.map(\.command) == ["build_update", "receive_drafts"])
+        #expect(calls.map(\.command) == [
+            "build_update", "build_update", "receive_drafts", "accept_draft",
+        ])
         #expect(calls[0].arguments["output"] == .string(output.path))
-        #expect(calls[1].arguments["inbox"] == .string(locations.inbox.path))
+        #expect(calls[0].arguments["base_package"] == nil)
+        #expect(calls[1].arguments["base_package"] == .string(base.path))
+        #expect(calls[2].arguments["inbox"] == .string(locations.inbox.path))
+        #expect(calls[3].arguments["receipt"] == .string(receiptURL.path))
+        #expect(calls[3].arguments["vault"] == .string(locations.vault.path))
+        #expect(model.receivedDrafts.isEmpty)
     }
 
     @Test("busy state and stable error are visible")

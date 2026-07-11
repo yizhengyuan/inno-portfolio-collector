@@ -51,9 +51,15 @@ public struct AppLocations: Equatable, Sendable {
         let resources = bundleURL
             .appendingPathComponent("Contents/Resources", isDirectory: true)
             .standardizedFileURL
+        let vault = role == .collector
+            ? supportRoot.appendingPathComponent(
+                "Runtime/vault/英诺被投项目资讯库",
+                isDirectory: true
+            )
+            : supportRoot.appendingPathComponent("英诺被投项目资讯库", isDirectory: true)
         return Self(
             supportRoot: supportRoot,
-            vault: supportRoot.appendingPathComponent("英诺被投项目资讯库", isDirectory: true),
+            vault: vault,
             inbox: supportRoot.appendingPathComponent("DraftInbox", isDirectory: true),
             helper: helper,
             projectsConfig: role == .collector

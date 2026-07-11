@@ -14,12 +14,20 @@ public struct CollectorSummary: Equatable, Sendable {
     }
 }
 
+public struct ReceivedDraft: Equatable, Identifiable, Sendable {
+    public var id: String { receipt.path }
+    public let receipt: URL
+    public let draftCount: Int
+    public let alreadyReceived: Bool
+}
+
 @MainActor
 public final class CollectorViewModel: ObservableObject {
     @Published public private(set) var summary: CollectorSummary?
     @Published public private(set) var isBusy = false
     @Published public private(set) var lastPreflightSucceeded = false
     @Published public private(set) var errorMessage: String?
+    @Published public private(set) var receivedDrafts: [ReceivedDraft] = []
 
     private let helper: any HelperCalling
     public let locations: AppLocations
@@ -89,13 +97,44 @@ public final class CollectorViewModel: ObservableObject {
 
     public func receiveDrafts(package: URL) async {
         await perform {
-            _ = try await helper.call(
+            let result = try await helper.call(
                 command: "receive_drafts",
                 arguments: [
                     "package": .string(package.path),
                     "inbox": .string(locations.inbox.path),
                 ]
             )
+            guard
+                case .string(let rawReceipt) = result["receipt_path"],
+                case .integer(let draftCount) = result["draft_count"],
+                draftCount > 0,
+                case .boolean(let existing) = result["existing"],
+                let receipt = safeReceipt(rawReceipt)
+            else { throw HelperClientError.invalidResponse }
+            let received = ReceivedDraft(
+                receipt: receipt,
+                draftCount: draftCount,
+                alreadyReceived: existing
+            )
+            receivedDrafts.removeAll { $0.receipt == receipt }
+            receivedDrafts.append(received)
+        }
+    }
+
+    public func acceptDraft(receipt: ReceivedDraft) async {
+        guard receivedDrafts.contains(receipt), safeReceipt(receipt.receipt.path) != nil else {
+            errorMessage = "请选择有效的稿件收件记录。"
+            return
+        }
+        await perform {
+            _ = try await helper.call(
+                command: "accept_draft",
+                arguments: [
+                    "receipt": .string(receipt.receipt.path),
+                    "vault": .string(locations.vault.path),
+                ]
+            )
+            receivedDrafts.removeAll { $0.receipt == receipt.receipt }
         }
     }
 
@@ -110,6 +149,14 @@ public final class CollectorViewModel: ObservableObject {
             arguments["projects"] = .string(projectsConfig.path)
         }
         return arguments
+    }
+
+    private func safeReceipt(_ rawPath: String) -> URL? {
+        let root = locations.inbox.resolvingSymlinksInPath().standardizedFileURL
+        let candidate = URL(fileURLWithPath: rawPath)
+            .resolvingSymlinksInPath().standardizedFileURL
+        guard candidate.path.hasPrefix(root.path + "/") else { return nil }
+        return candidate
     }
 
     private func perform(_ operation: () async throws -> Void) async {
