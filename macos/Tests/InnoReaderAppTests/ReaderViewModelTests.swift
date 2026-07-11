@@ -200,4 +200,29 @@ struct ReaderViewModelTests {
 
         #expect(await helper.recordedCalls().count == before)
     }
+
+    @Test(
+        "real reader helper reports its role and rejects collection",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["INNO_READER_HELPER"] != nil,
+            "requires INNO_READER_HELPER"
+        )
+    )
+    func realReaderHelper() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["INNO_READER_HELPER"])
+        let helper = HelperClient(executable: URL(fileURLWithPath: path), timeout: 10)
+
+        let status = try await helper.call(command: "status", arguments: [:])
+        #expect(status["role"] == .string("reader"))
+        do {
+            _ = try await helper.call(command: "collect", arguments: [:])
+            Issue.record("reader helper must reject collection")
+        } catch let error as HelperClientError {
+            guard case .helperFailure(let message) = error else {
+                Issue.record("reader returned the wrong error: \(error)")
+                return
+            }
+            #expect(message == "unsupported helper command")
+        }
+    }
 }

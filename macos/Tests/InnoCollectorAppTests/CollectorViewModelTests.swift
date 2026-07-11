@@ -129,4 +129,20 @@ struct CollectorViewModelTests {
         #expect(!model.isBusy)
         #expect(model.errorMessage == nil)
     }
+
+    @Test(
+        "real collector helper reports its role",
+        .enabled(
+            if: ProcessInfo.processInfo.environment["INNO_COLLECTOR_HELPER"] != nil,
+            "requires INNO_COLLECTOR_HELPER"
+        )
+    )
+    func realCollectorHelper() async throws {
+        let path = try #require(ProcessInfo.processInfo.environment["INNO_COLLECTOR_HELPER"])
+        let helper = HelperClient(executable: URL(fileURLWithPath: path), timeout: 10)
+
+        let result = try await helper.call(command: "status", arguments: [:])
+
+        #expect(result["role"] == .string("collector"))
+    }
 }
