@@ -54,6 +54,7 @@ struct CollectorViewModelTests {
                     "failed_projects": .integer(8),
                 ]),
             ],
+            "list_received_drafts": ["receipts": .array([])],
         ])
         let model = CollectorViewModel(helper: helper, locations: locations)
 
@@ -61,6 +62,30 @@ struct CollectorViewModelTests {
 
         #expect(model.summary == CollectorSummary(articleCount: 225, projectCount: 10, failedProjects: 8))
         #expect(model.errorMessage == nil)
+    }
+
+    @Test("refresh restores validated pending draft receipts")
+    func refreshRestoresReceipts() async {
+        let receipt = locations.inbox.appendingPathComponent("receipt-restored", isDirectory: true)
+        let helper = RecordingHelper(responses: [
+            "status": ["vault_exists": .boolean(false)],
+            "list_received_drafts": [
+                "receipts": .array([
+                    .object([
+                        "receipt_path": .string(receipt.path),
+                        "draft_count": .integer(2),
+                    ]),
+                ]),
+            ],
+        ])
+        let model = CollectorViewModel(helper: helper, locations: locations)
+
+        await model.refresh()
+
+        #expect(model.receivedDrafts == [
+            ReceivedDraft(receipt: receipt, draftCount: 2, alreadyReceived: true),
+        ])
+        #expect(await helper.recordedCalls().map(\.command) == ["status", "list_received_drafts"])
     }
 
     @Test("collection requires a successful latest preflight")

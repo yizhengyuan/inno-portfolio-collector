@@ -10,6 +10,7 @@ from inno_collector.draft_package import (
     DraftPackageError,
     accept_received_draft,
     build_draft_package,
+    list_received_drafts,
     receive_draft_package,
 )
 from inno_collector.vault import VaultWriter
@@ -154,6 +155,20 @@ class DraftPackageTests(unittest.TestCase):
         self.assertEqual(first["receipt_path"], second["receipt_path"])
         self.assertEqual(accepted["created"], 1)
         self.assertEqual(repeated["unchanged"], 1)
+
+    def test_received_drafts_can_be_restored_after_restart(self) -> None:
+        receipt = self.build_and_receive("restore-after-restart")
+
+        restored = list_received_drafts(self.root / "inbox")
+
+        self.assertEqual(
+            restored,
+            {
+                "receipts": [
+                    {"receipt_path": str(receipt), "draft_count": 1},
+                ]
+            },
+        )
 
     def test_secret_and_traversal_packages_are_rejected(self) -> None:
         self.write_draft("Cookie: sid=secret")

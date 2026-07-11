@@ -90,6 +90,12 @@ def _receive_drafts(arguments: dict[str, object]) -> dict[str, object]:
     )
 
 
+def _list_received_drafts(arguments: dict[str, object]) -> dict[str, object]:
+    from .draft_package import list_received_drafts
+
+    return list_received_drafts(_path(arguments, "inbox"))
+
+
 def _accept_draft(arguments: dict[str, object]) -> dict[str, object]:
     from .draft_package import accept_received_draft
 
@@ -104,6 +110,7 @@ HANDLERS: dict[str, Handler] = {
     "collect": _collect,
     "build_update": _build_update,
     "receive_drafts": _receive_drafts,
+    "list_received_drafts": _list_received_drafts,
     "accept_draft": _accept_draft,
 }
 

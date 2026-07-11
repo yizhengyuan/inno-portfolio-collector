@@ -61,7 +61,10 @@ class HelperProtocolTests(unittest.TestCase):
     def test_role_command_sets_are_exact(self) -> None:
         self.assertEqual(
             set(COLLECTOR_HANDLERS),
-            {"status", "collect", "build_update", "receive_drafts", "accept_draft"},
+            {
+                "status", "collect", "build_update", "receive_drafts",
+                "list_received_drafts", "accept_draft",
+            },
         )
         self.assertEqual(
             set(READER_HANDLERS),

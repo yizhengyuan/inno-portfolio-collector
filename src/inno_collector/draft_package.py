@@ -359,6 +359,26 @@ def receive_draft_package(package_path: Path, inbox: Path) -> dict[str, object]:
             shutil.rmtree(stage)
 
 
+def list_received_drafts(inbox: Path) -> dict[str, object]:
+    root = Path(inbox)
+    if not root.exists():
+        return {"receipts": []}
+    try:
+        children = sorted(root.iterdir(), key=lambda path: path.name)
+    except OSError:
+        raise DraftPackageError("unable to read draft inbox") from None
+    receipts: list[dict[str, object]] = []
+    for child in children:
+        if child.name.startswith(".") or not child.is_dir() or child.is_symlink():
+            continue
+        manifest, _payloads = _read_receipt(child)
+        receipts.append({
+            "receipt_path": str(child),
+            "draft_count": len(manifest["drafts"]),
+        })
+    return {"receipts": receipts}
+
+
 def _read_receipt(receipt: Path) -> tuple[dict[str, object], dict[str, bytes]]:
     try:
         manifest = _validate_manifest(

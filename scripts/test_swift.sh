@@ -18,7 +18,8 @@ if [[ -d "$FRAMEWORKS/Testing.framework" ]]; then
     -Xswiftc -F -Xswiftc "$FRAMEWORKS" \
     -Xlinker "-F$FRAMEWORKS" \
     -Xlinker -rpath -Xlinker "$FRAMEWORKS" \
-    -Xlinker -rpath -Xlinker "$LIBRARIES"
+    -Xlinker -rpath -Xlinker "$LIBRARIES" \
+    "$@"
 fi
 
-exec swift test --enable-swift-testing --disable-xctest
+exec swift test --enable-swift-testing --disable-xctest "$@"

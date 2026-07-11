@@ -48,6 +48,27 @@ public final class CollectorViewModel: ObservableObject {
             } else if result["vault_exists"] == .boolean(false) {
                 summary = CollectorSummary(articleCount: 0, projectCount: 0, failedProjects: 0)
             }
+            let inboxResult = try await helper.call(
+                command: "list_received_drafts",
+                arguments: ["inbox": .string(locations.inbox.path)]
+            )
+            guard case .array(let rows) = inboxResult["receipts"] else {
+                throw HelperClientError.invalidResponse
+            }
+            receivedDrafts = try rows.map { row in
+                guard
+                    case .object(let values) = row,
+                    case .string(let rawReceipt) = values["receipt_path"],
+                    case .integer(let draftCount) = values["draft_count"],
+                    draftCount > 0,
+                    let receipt = safeReceipt(rawReceipt)
+                else { throw HelperClientError.invalidResponse }
+                return ReceivedDraft(
+                    receipt: receipt,
+                    draftCount: draftCount,
+                    alreadyReceived: true
+                )
+            }
         }
     }
 
@@ -153,7 +174,7 @@ public final class CollectorViewModel: ObservableObject {
 
     private func safeReceipt(_ rawPath: String) -> URL? {
         let root = locations.inbox.resolvingSymlinksInPath().standardizedFileURL
-        let candidate = URL(fileURLWithPath: rawPath)
+        let candidate = URL(fileURLWithPath: rawPath, isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
         guard candidate.path.hasPrefix(root.path + "/") else { return nil }
         return candidate

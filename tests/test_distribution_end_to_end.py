@@ -225,6 +225,19 @@ class FrozenTwoUserWorkflowTests(unittest.TestCase):
                 collector_environment,
             )
             self.assertEqual(receipt["draft_count"], 1)
+            restored = self.call(
+                collector_helper,
+                "list_received_drafts",
+                {"inbox": str(collector_home / "DraftInbox")},
+                collector_environment,
+            )
+            self.assertEqual(
+                restored["receipts"],
+                [{
+                    "receipt_path": receipt["receipt_path"],
+                    "draft_count": 1,
+                }],
+            )
             accepted = self.call(
                 collector_helper,
                 "accept_draft",
