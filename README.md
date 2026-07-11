@@ -55,6 +55,8 @@ python3 -m venv .venv
 
 本项目的自有代码以 [MIT License](LICENSE) 开源。进度、缺陷和功能建议在 [GitHub Issues](https://github.com/yizhengyuan/inno-portfolio-collector/issues) 中统一管理；贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
 
+最新的仓库、双 App、隐私与许可证技术复核见 [2026-07-12 开源与分发技术合规复核](docs/compliance/2026-07-12-open-source-and-distribution-review.md)。该复核不替代内容授权、Apple 正式签名、公证和干净账户安装验收。
+
 ## 兼容命令行测试
 
 底层 Python 模块仍保留 `unittest`、内容包和 Helper 协议入口，供开发、自动化验收与故障排查使用；它们不是朋友日常使用的前置条件。
