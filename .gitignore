@@ -17,3 +17,5 @@ env/
 runtime/
 .worktrees/
 macos/.build/
+.build-macos/
+*.spec

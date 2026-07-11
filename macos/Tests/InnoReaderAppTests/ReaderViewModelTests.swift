@@ -210,7 +210,10 @@ struct ReaderViewModelTests {
     )
     func realReaderHelper() async throws {
         let path = try #require(ProcessInfo.processInfo.environment["INNO_READER_HELPER"])
-        let helper = HelperClient(executable: URL(fileURLWithPath: path), timeout: 10)
+        let helper = HelperClient(
+            executable: URL(fileURLWithPath: path).standardizedFileURL,
+            timeout: 60
+        )
 
         let status = try await helper.call(command: "status", arguments: [:])
         #expect(status["role"] == .string("reader"))

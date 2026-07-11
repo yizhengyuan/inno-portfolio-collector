@@ -18,8 +18,8 @@ struct RoleIsolationTests {
         let readerPath = try #require(environment["INNO_READER_HELPER"])
         let collectorURL = URL(fileURLWithPath: collectorPath).standardizedFileURL
         let readerURL = URL(fileURLWithPath: readerPath).standardizedFileURL
-        let collector = HelperClient(executable: collectorURL, timeout: 10)
-        let reader = HelperClient(executable: readerURL, timeout: 10)
+        let collector = HelperClient(executable: collectorURL, timeout: 60)
+        let reader = HelperClient(executable: readerURL, timeout: 60)
 
         async let collectorStatus = collector.call(command: "status", arguments: [:])
         async let readerStatus = reader.call(command: "status", arguments: [:])

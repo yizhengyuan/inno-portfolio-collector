@@ -8,8 +8,13 @@ version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = []
 
+[project.optional-dependencies]
+build = ["pyinstaller>=6.0,<7.0"]
+
 [project.scripts]
 inno-collect = "inno_collector.cli:main"
+inno-collector-helper = "inno_collector.collector_helper:main"
+inno-reader-helper = "inno_collector.reader_helper:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

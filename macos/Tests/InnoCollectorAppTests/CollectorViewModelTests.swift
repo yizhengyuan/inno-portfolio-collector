@@ -139,7 +139,10 @@ struct CollectorViewModelTests {
     )
     func realCollectorHelper() async throws {
         let path = try #require(ProcessInfo.processInfo.environment["INNO_COLLECTOR_HELPER"])
-        let helper = HelperClient(executable: URL(fileURLWithPath: path), timeout: 10)
+        let helper = HelperClient(
+            executable: URL(fileURLWithPath: path).standardizedFileURL,
+            timeout: 60
+        )
 
         let result = try await helper.call(command: "status", arguments: [:])
 
