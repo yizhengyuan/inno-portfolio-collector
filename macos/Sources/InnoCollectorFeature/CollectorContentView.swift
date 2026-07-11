@@ -1,4 +1,5 @@
 import AppKit
+import InnoAppCore
 import SwiftUI
 
 public struct CollectorContentView: View {
@@ -8,6 +9,7 @@ public struct CollectorContentView: View {
         case library = "资料库"
         case delivery = "交付"
         case inbox = "稿件收件箱"
+        case about = "关于与许可证"
         var id: String { rawValue }
     }
 
@@ -106,6 +108,8 @@ public struct CollectorContentView: View {
                 }
                 .padding(.vertical, 4)
             }
+        case .about:
+            LegalNoticeView()
         }
     }
 
@@ -126,6 +130,7 @@ public struct CollectorContentView: View {
         case .library: "books.vertical"
         case .delivery: "shippingbox"
         case .inbox: "tray.and.arrow.down"
+        case .about: "info.circle"
         }
     }
 

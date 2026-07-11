@@ -1,4 +1,5 @@
 import AppKit
+import InnoAppCore
 import SwiftUI
 
 public struct ReaderContentView: View {
@@ -8,6 +9,7 @@ public struct ReaderContentView: View {
         case editing = "编辑"
         case updates = "更新"
         case obsidian = "Obsidian"
+        case about = "关于与许可证"
         var id: String { rawValue }
     }
 
@@ -138,6 +140,8 @@ public struct ReaderContentView: View {
             if let obsidianMessage {
                 Text(obsidianMessage).foregroundStyle(.secondary)
             }
+        case .about:
+            LegalNoticeView()
         }
     }
 
@@ -160,6 +164,7 @@ public struct ReaderContentView: View {
         case .editing: "square.and.pencil"
         case .updates: "shippingbox.and.arrow.backward"
         case .obsidian: "link"
+        case .about: "info.circle"
         }
     }
 

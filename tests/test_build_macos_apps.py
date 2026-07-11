@@ -56,6 +56,8 @@ class MacAppBundleTests(unittest.TestCase):
                 "Contents/Resources/config/projects.json",
                 "Contents/Resources/ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
                 "Contents/Resources/ThirdPartyLicenses/moore-wechat-article-downloader-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/inno-news-suite-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/THIRD_PARTY_NOTICES.md",
                 "Contents/Info.plist",
             }
             expected_reader = {
@@ -63,6 +65,8 @@ class MacAppBundleTests(unittest.TestCase):
                 "Contents/PlugIns/InnoReaderHelper",
                 "Contents/Resources/ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
                 "Contents/Resources/ThirdPartyLicenses/moore-wechat-article-downloader-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/inno-news-suite-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/THIRD_PARTY_NOTICES.md",
                 "Contents/Info.plist",
             }
             self.assertTrue(expected_collector.issubset(self.files(collector)))
@@ -71,6 +75,14 @@ class MacAppBundleTests(unittest.TestCase):
                 (collector / "Contents/Resources/config/projects.json").read_bytes(),
                 (ROOT / "config/projects.json").read_bytes(),
             )
+            for app in (collector, reader):
+                self.assertEqual(
+                    (
+                        app
+                        / "Contents/Resources/ThirdPartyLicenses/inno-news-suite-LICENSE.txt"
+                    ).read_bytes(),
+                    (ROOT / "LICENSE").read_bytes(),
+                )
             reader_files = {value.casefold() for value in self.files(reader)}
             self.assertFalse(any("collector" in value for value in reader_files))
             self.assertFalse(any("mooreexporter" in value for value in reader_files))
@@ -87,6 +99,27 @@ class MacAppBundleTests(unittest.TestCase):
                 and "/PlugIns/" in command[-1]
             ]
             self.assertEqual(helper_runtime_resigns, [])
+            strip_commands = [command for command in commands if command[0] == "strip"]
+            self.assertEqual(len(strip_commands), 2)
+            self.assertTrue(
+                all(command[1:3] == ["-S", "-x"] for command in strip_commands)
+            )
+            self.assertEqual(
+                {Path(command[-1]).name for command in strip_commands},
+                {"InnoCollectorApp", "InnoReaderApp"},
+            )
+            for strip_command in strip_commands:
+                target = strip_command[-1]
+                sign_command = next(
+                    command
+                    for command in commands
+                    if command[0] == "codesign"
+                    and "--sign" in command
+                    and command[-1] == target
+                )
+                self.assertLess(
+                    commands.index(strip_command), commands.index(sign_command)
+                )
 
     def test_plists_and_entitlements_are_least_privilege(self) -> None:
         collector = plistlib.loads((ROOT / "packaging/Info-Collector.plist").read_bytes())
@@ -106,6 +139,42 @@ class MacAppBundleTests(unittest.TestCase):
         self.assertEqual(self.extensions(reader), {"inno-update", "zip"})
         self.assertEqual(collector_entitlements, {"com.apple.security.network.client": True})
         self.assertEqual(reader_entitlements, {})
+
+    def test_bundle_rejects_local_absolute_paths_left_after_stripping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            swift, helpers = self.fixture(root)
+            (swift / "InnoReaderApp").write_bytes(
+                b"release binary /Users/alice/private/source.swift"
+            )
+
+            def run(command, **kwargs):
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with self.assertRaisesRegex(
+                build_macos_apps.AppBuildError,
+                "local absolute path",
+            ):
+                build_macos_apps.assemble_apps(
+                    swift_bin=swift,
+                    helpers=helpers,
+                    output=root / "apps",
+                    runner=run,
+                )
+
+    def test_bundle_rejects_volume_path_in_resource_without_disclosing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private_path = b"/Volumes/PrivateDisk/confidential/build.log"
+            resource = root / "Contents/Resources/notice.txt"
+            resource.parent.mkdir(parents=True)
+            resource.write_bytes(b"safe prefix\n" + private_path)
+
+            with self.assertRaises(build_macos_apps.AppBuildError) as caught:
+                build_macos_apps._audit_local_paths(root)
+
+            self.assertIn("local absolute path", str(caught.exception))
+            self.assertNotIn(private_path.decode(), str(caught.exception))
 
     @staticmethod
     def files(root: Path) -> set[str]:
