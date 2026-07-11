@@ -211,6 +211,29 @@ def _status(downloaded: int, skipped: int, failed: int) -> str:
     return "failed"
 
 
+def _cached_catalog_covers_cutoff(rows: list[dict], cutoff: date) -> bool:
+    for row in rows:
+        try:
+            article_key(str(row.get("url") or ""))
+        except (AttributeError, TypeError, ValueError):
+            continue
+        published_text = str(row.get("publish_time") or "").strip()
+        if not published_text:
+            continue
+        try:
+            published = datetime.fromisoformat(
+                published_text.replace("Z", "+00:00")
+            ).date()
+        except ValueError:
+            try:
+                published = date.fromisoformat(published_text[:10])
+            except ValueError:
+                continue
+        if published < cutoff:
+            return True
+    return False
+
+
 class CollectionPipeline:
     def __init__(
         self,
@@ -549,6 +572,8 @@ class CollectionPipeline:
         failed: int,
         error: str,
         last_sync: str,
+        *,
+        force_partial: bool = False,
     ) -> ProjectRunResult:
         return ProjectRunResult(
             project=project.project,
@@ -557,7 +582,11 @@ class CollectionPipeline:
             downloaded=downloaded,
             skipped=skipped,
             failed=failed,
-            status=_status(downloaded, skipped, failed),
+            status=(
+                "partial"
+                if force_partial and failed > 0
+                else _status(downloaded, skipped, failed)
+            ),
             error=error,
             last_sync=last_sync,
         )
@@ -683,20 +712,48 @@ class CollectionPipeline:
             run_root: Path | None = None
             vault_succeeded = False
             cleanup_error: Exception | None = None
+            partial_sync_covered = False
             stage = "catalog" if dry_run else "sync"
             try:
+                partial_sync = False
+                partial_fetched = 0
                 if not dry_run:
                     sync_payload = self._retry(
                         lambda: self.backend.sync(account_id, limit=1000)
                     )
-                    if (
-                        not isinstance(sync_payload, dict)
-                        or sync_payload.get("ok") is not True
-                    ):
+                    if not isinstance(sync_payload, dict):
                         raise PipelineConfigurationError(
                             "exporter returned unsuccessful sync response"
                         )
-                    last_sync = self.now().isoformat()
+                    if sync_payload.get("ok") is True:
+                        last_sync = self.now().isoformat()
+                    elif sync_payload.get("ok") is False:
+                        fetched = sync_payload.get("fetched_count")
+                        errors = sync_payload.get("errors")
+                        if (
+                            type(fetched) is not int
+                            or fetched <= 0
+                            or not isinstance(errors, list)
+                            or not errors
+                            or any(
+                                not isinstance(item, str) or not item.strip()
+                                for item in errors
+                            )
+                        ):
+                            raise PipelineConfigurationError(
+                                "exporter returned unsuccessful sync response"
+                            )
+                        partial_sync = True
+                        partial_fetched = fetched
+                        failed += 1
+                        issues.append(
+                            "sync: partial "
+                            + sanitize_diagnostic("; ".join(errors))
+                        )
+                    else:
+                        raise PipelineConfigurationError(
+                            "exporter returned unsuccessful sync response"
+                        )
 
                 stage = "catalog"
                 rows = self._retry(
@@ -708,6 +765,14 @@ class CollectionPipeline:
                     raise PipelineConfigurationError(
                         "exporter returned invalid article list"
                     )
+                if partial_sync and (
+                    partial_fetched <= 0
+                    or not _cached_catalog_covers_cutoff(rows, parsed_since)
+                ):
+                    raise PipelineConfigurationError(
+                        "partial sync cache does not cover cutoff"
+                    )
+                partial_sync_covered = partial_sync
                 selected, invalid_url_count = select_since_with_invalid_urls(
                     rows, since
                 )
@@ -841,6 +906,7 @@ class CollectionPipeline:
                             failed,
                             "; ".join(issues),
                             last_sync,
+                            force_partial=partial_sync_covered,
                         )
                         stage = "vault"
                         writer.apply(candidates, [provisional])
@@ -908,6 +974,7 @@ class CollectionPipeline:
                     failed,
                     error,
                     last_sync,
+                    force_partial=partial_sync_covered,
                 )
             )
 

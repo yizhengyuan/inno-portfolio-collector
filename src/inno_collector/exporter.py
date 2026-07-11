@@ -167,6 +167,45 @@ class MooreExporterAdapter:
             )
         return payload
 
+    def _run_sync(self, account_id: int, *arguments: str) -> dict:
+        code, payload, stderr = self._execute("exporter-sync", *arguments)
+        if code == 0 and payload.get("ok") is True:
+            return payload
+
+        errors = payload.get("errors")
+        fetched = payload.get("fetched_count")
+        upserted = payload.get("upserted_count")
+        if (
+            code in {0, 1}
+            and payload.get("ok") is False
+            and type(payload.get("account_id")) is int
+            and payload["account_id"] == account_id
+            and type(fetched) is int
+            and fetched >= 0
+            and type(upserted) is int
+            and 0 <= upserted <= fetched
+            and isinstance(errors, list)
+            and bool(errors)
+            and all(isinstance(item, str) and item.strip() for item in errors)
+        ):
+            return {
+                **payload,
+                "errors": [_sanitize(item) for item in errors],
+            }
+
+        partial_fields = {
+            "account_id",
+            "fetched_count",
+            "upserted_count",
+            "errors",
+        }
+        if payload.get("ok") is False and partial_fields.intersection(payload):
+            raise ExporterCommandError(
+                "exporter returned invalid partial sync response"
+            )
+        message = payload.get("error") or stderr or "exporter command failed"
+        raise ExporterCommandError(_sanitize(str(message)))
+
     def auth_check(self) -> dict:
         return self._run("exporter-auth-check")
 
@@ -174,8 +213,8 @@ class MooreExporterAdapter:
         return _object_list(self._run("exporter-accounts"), "accounts")
 
     def sync(self, account_id: int, limit: int = 1000) -> dict:
-        return self._run(
-            "exporter-sync",
+        return self._run_sync(
+            account_id,
             "--account-id",
             str(account_id),
             "--limit",

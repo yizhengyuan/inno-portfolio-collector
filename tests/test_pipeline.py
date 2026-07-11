@@ -1126,6 +1126,104 @@ class CollectionPipelineTests(unittest.TestCase):
         self.assertEqual(result.projects[0].last_sync, "")
         self.assertEqual(result.projects[0].status, "failed")
 
+    def test_partial_sync_continues_when_cached_catalog_covers_cutoff(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [
+            article_row(10, "slug-1", "2026-06-01 08:00:00"),
+            article_row(9, "old-cache-boundary", "2025-12-31 23:59:59"),
+        ]
+
+        def partial_sync(account_id: int, limit: int = 1000) -> dict:
+            backend.calls.append(("sync", account_id, limit))
+            return {
+                "ok": False,
+                "account_id": account_id,
+                "fetched_count": 447,
+                "upserted_count": 20,
+                "errors": ["last page temporary unavailable token=partial-secret"],
+            }
+
+        backend.sync = partial_sync  # type: ignore[method-assign]
+        vault = RecordingVault()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.build_pipeline(
+                backend, Path(temp_dir) / "runtime", vault
+            ).run([project], since="2026-01-01")
+
+        item = result.projects[0]
+        self.assertEqual(sum(call[0] == "sync" for call in backend.calls), 1)
+        self.assertEqual(item.downloaded, 1)
+        self.assertGreaterEqual(item.failed, 1)
+        self.assertEqual(item.status, "partial")
+        self.assertEqual(item.last_sync, "")
+        self.assertIn("sync: partial", item.error)
+        self.assertNotIn("partial-secret", item.error)
+        self.assertIn("token=[REDACTED]", item.error)
+
+    def test_partial_sync_refuses_download_when_cache_does_not_cover_cutoff(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [article_row(10, "slug-1", "2026-06-01 08:00:00")]
+
+        def partial_sync(account_id: int, limit: int = 1000) -> dict:
+            backend.calls.append(("sync", account_id, limit))
+            return {
+                "ok": False,
+                "account_id": account_id,
+                "fetched_count": 20,
+                "upserted_count": 20,
+                "errors": ["pagination stopped"],
+            }
+
+        backend.sync = partial_sync  # type: ignore[method-assign]
+        vault = RecordingVault()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.build_pipeline(
+                backend, Path(temp_dir) / "runtime", vault
+            ).run([project], since="2026-01-01")
+
+        item = result.projects[0]
+        self.assertEqual(sum(call[0] == "sync" for call in backend.calls), 1)
+        self.assertEqual(sum(call[0] == "articles" for call in backend.calls), 1)
+        self.assertEqual(sum(call[0] == "download" for call in backend.calls), 0)
+        self.assertEqual(item.downloaded, 0)
+        self.assertGreaterEqual(item.failed, 1)
+        self.assertEqual(item.status, "failed")
+        self.assertEqual(item.last_sync, "")
+        self.assertIn("sync: partial", item.error)
+
+    def test_partial_sync_with_complete_cache_and_no_new_articles_is_partial(self) -> None:
+        project = self.project(1)
+        backend = FakeBackend([project])
+        backend.rows[1] = [
+            article_row(9, "old-cache-boundary", "2025-12-31 23:59:59")
+        ]
+
+        def partial_sync(account_id: int, limit: int = 1000) -> dict:
+            backend.calls.append(("sync", account_id, limit))
+            return {
+                "ok": False,
+                "account_id": account_id,
+                "fetched_count": 447,
+                "upserted_count": 0,
+                "errors": ["last page failed"],
+            }
+
+        backend.sync = partial_sync  # type: ignore[method-assign]
+        vault = RecordingVault()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            result = self.build_pipeline(
+                backend, Path(temp_dir) / "runtime", vault
+            ).run([project], since="2026-01-01")
+
+        item = result.projects[0]
+        self.assertEqual(item.discovered, 0)
+        self.assertEqual(item.downloaded, 0)
+        self.assertEqual(item.failed, 1)
+        self.assertEqual(item.status, "partial")
+        self.assertEqual(item.last_sync, "")
+
     def test_all_accounts_are_resolved_before_any_sync_and_match_failure_is_local(self) -> None:
         projects = [self.project(1), self.project(2), self.project(3)]
         backend = FakeBackend(projects)

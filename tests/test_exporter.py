@@ -188,6 +188,64 @@ class MooreExporterAdapterTests(unittest.TestCase):
         self.assertEqual(runner.calls[0][-4:], ["--account-id", "7", "--limit", "12"])
         self.assertEqual(runner.calls[1][-4:], ["--account-id", "7", "--limit", "34"])
 
+    def test_sync_returns_strict_partial_payload_without_hiding_errors(self) -> None:
+        payload = {
+            "ok": False,
+            "account_id": 7,
+            "fetched_count": 447,
+            "upserted_count": 20,
+            "errors": ["page 10 temporary unavailable token=sync-secret"],
+        }
+        runner = FakeRunner((0, json.dumps(payload), ""))
+
+        result = self.adapter(runner).sync(7)
+
+        self.assertIs(result["ok"], False)
+        self.assertEqual(result["fetched_count"], 447)
+        self.assertNotIn("sync-secret", result["errors"][0])
+        self.assertIn("token=[REDACTED]", result["errors"][0])
+
+    def test_sync_accepts_strict_partial_payload_from_failure_exit(self) -> None:
+        payload = {
+            "ok": False,
+            "account_id": 7,
+            "fetched_count": 4,
+            "upserted_count": 2,
+            "errors": ["last page failed"],
+        }
+        runner = FakeRunner((1, json.dumps(payload), ""))
+
+        self.assertEqual(self.adapter(runner).sync(7), payload)
+
+    def test_sync_rejects_malformed_partial_payloads(self) -> None:
+        valid = {
+            "ok": False,
+            "account_id": 7,
+            "fetched_count": 4,
+            "upserted_count": 2,
+            "errors": ["last page failed"],
+        }
+        invalid_payloads = (
+            {key: value for key, value in valid.items() if key != "fetched_count"},
+            {**valid, "account_id": 8},
+            {**valid, "account_id": True},
+            {**valid, "fetched_count": -1},
+            {**valid, "upserted_count": True},
+            {**valid, "upserted_count": 5},
+            {**valid, "errors": []},
+            {**valid, "errors": [""]},
+            {**valid, "errors": ["valid", 3]},
+        )
+
+        for payload in invalid_payloads:
+            with self.subTest(payload=payload):
+                runner = FakeRunner((0, json.dumps(payload), ""))
+                with self.assertRaisesRegex(
+                    ExporterCommandError,
+                    "^exporter returned invalid partial sync response$",
+                ):
+                    self.adapter(runner).sync(7)
+
     def test_download_returns_strict_partial_payload_from_exit_one(self) -> None:
         payload = {
             "ok": False,
