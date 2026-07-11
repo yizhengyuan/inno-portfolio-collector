@@ -122,18 +122,27 @@ def markdown_image_destinations(value: str) -> list[tuple[int, int, str]]:
             nested = 0
             escaped = False
             end = len(stripped)
-            for index, character in enumerate(stripped):
-                if escaped:
-                    escaped = False
-                elif character == "\\":
-                    escaped = True
-                elif character == "(":
-                    nested += 1
-                elif character == ")" and nested:
-                    nested -= 1
-                elif character.isspace() and nested == 0:
-                    end = index
-                    break
+            exporter_path = stripped.replace("\\", "/").startswith("../images/")
+            if exporter_path:
+                title = re.search(
+                    r"\s+(?=(?:\"[^\"]*\"|'[^']*'|\([^()]*\))\s*$)",
+                    stripped,
+                )
+                if title is not None:
+                    end = title.start()
+            else:
+                for index, character in enumerate(stripped):
+                    if escaped:
+                        escaped = False
+                    elif character == "\\":
+                        escaped = True
+                    elif character == "(":
+                        nested += 1
+                    elif character == ")" and nested:
+                        nested -= 1
+                    elif character.isspace() and nested == 0:
+                        end = index
+                        break
             if end:
                 destinations.append((offset, offset + end, stripped[:end]))
         cursor = closing + 1

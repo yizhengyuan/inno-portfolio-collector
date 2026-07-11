@@ -844,6 +844,12 @@ class VaultWriter:
                 ("?", "%3F"),
             ):
                 rewritten = rewritten.replace(literal, encoded)
+            rewritten = "".join(
+                "".join(f"%{byte:02X}" for byte in character.encode("utf-8"))
+                if character.isspace()
+                else character
+                for character in rewritten
+            )
             replacements.append((start, end, rewritten))
 
         rewritten_body = body

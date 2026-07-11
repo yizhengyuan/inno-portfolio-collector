@@ -580,6 +580,39 @@ class VaultWriterTests(unittest.TestCase):
         self.assertIn("nested/a%20b.png", rendered)
         self.assertIn("https://example.com/remote.png", rendered)
 
+    def test_rewrites_exporter_image_links_with_unescaped_spaces(self) -> None:
+        image_directory = self.root / "export" / "images" / "乐新闻 _ 标题"
+        image_directory.mkdir(parents=True)
+        (image_directory / "001.gif").write_bytes(b"gif-data")
+        article = self.article(
+            body="![image](../images/乐新闻 _ 标题/001.gif)\n",
+            source_image_dir=image_directory,
+        )
+
+        VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        rendered = self.article_path().read_text(encoding="utf-8")
+        self.assertNotIn("../images/", rendered)
+        self.assertIn("../../04-附件/项目甲/", rendered)
+        self.assertIn("/001.gif", rendered)
+
+    def test_rewritten_attachment_links_encode_nonbreaking_spaces(self) -> None:
+        image_directory = self.root / "export" / "images" / "标题\u00a0后半"
+        image_directory.mkdir(parents=True)
+        (image_directory / "001.gif").write_bytes(b"gif-data")
+        article = self.article(
+            title="标题\u00a0后半",
+            body="![image](../images/标题\u00a0后半/001.gif)\n",
+            source_image_dir=image_directory,
+        )
+
+        VaultWriter(self.vault).apply([article], [self.project_result()])
+
+        rendered = self.article_path().read_text(encoding="utf-8")
+        self.assertIn("%C2%A0", rendered)
+        image_line = next(line for line in rendered.splitlines() if line.startswith("!["))
+        self.assertNotIn("\u00a0", image_line)
+
     def test_same_hash_late_images_update_body_once_then_stay_unchanged(self) -> None:
         body = "![后补](../images/later/a.png)\n"
         article = self.article(body="正文等待后补。\n", source_image_dir=None)
