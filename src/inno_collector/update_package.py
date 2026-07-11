@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import hashlib
+import fcntl
 import json
 import os
+import shutil
 import stat
 import tempfile
+import uuid
 import zipfile
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -18,7 +21,13 @@ from .content_manifest import (
     build_content_manifest,
     parse_content_manifest,
 )
-from .package import _open_regular, _safe_relative, lint_vault
+from .package import (
+    _SAFE_IGNORED_LOCKS,
+    _inventory,
+    _open_regular,
+    _safe_relative,
+    lint_vault,
+)
 
 
 class UpdatePackageError(ValueError):
@@ -37,6 +46,14 @@ _MANIFEST_FIELDS = {
 }
 _MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 _MAX_MEMBER_BYTES = 128 * 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class UpdateApplyResult:
+    previous_version: str | None
+    target_version: str
+    added_or_changed: int
+    deleted: int
 
 
 def _manifest_payload(
@@ -276,3 +293,168 @@ def build_update_package(
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
+
+
+def _copy_vault(source: Path, destination: Path) -> None:
+    files, directories, errors, _fingerprints = _inventory(source)
+    if errors:
+        raise UpdatePackageError("unsafe reader Vault")
+    for relative in sorted(directories, key=lambda item: (len(item.parts), item.as_posix())):
+        destination.joinpath(*relative.parts).mkdir(parents=True, exist_ok=True)
+    for relative in sorted(files, key=lambda item: item.as_posix()):
+        if relative.as_posix() in _SAFE_IGNORED_LOCKS:
+            continue
+        try:
+            payload = _open_regular(source.joinpath(*relative.parts))
+        except OSError:
+            raise UpdatePackageError("reader Vault changed during staging") from None
+        target = destination.joinpath(*relative.parts)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(payload)
+
+
+def _human_snapshot(root: Path) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for top in ("10-编辑稿", "11-个人笔记"):
+        directory = root / top
+        if not directory.exists():
+            continue
+        for path in sorted(directory.rglob("*")):
+            try:
+                details = path.lstat()
+            except OSError:
+                raise UpdatePackageError("unable to inspect human workspace") from None
+            if stat.S_ISLNK(details.st_mode):
+                raise UpdatePackageError("unsafe human workspace link")
+            if stat.S_ISREG(details.st_mode):
+                try:
+                    payload = _open_regular(path)
+                except OSError:
+                    raise UpdatePackageError("unable to read human workspace") from None
+                result[path.relative_to(root).as_posix()] = hashlib.sha256(payload).hexdigest()
+            elif not stat.S_ISDIR(details.st_mode):
+                raise UpdatePackageError("unsafe human workspace file")
+    return result
+
+
+def _set_reader_permissions(root: Path, target: ContentManifest) -> None:
+    for row in target.files:
+        path = root.joinpath(*PurePosixPath(row.path).parts)
+        try:
+            details = path.lstat()
+        except OSError:
+            raise UpdatePackageError("missing imported content") from None
+        if not stat.S_ISREG(details.st_mode):
+            raise UpdatePackageError("imported content is not a regular file")
+        path.chmod(0o444)
+
+
+def apply_update_package(package_path: Path, vault: Path) -> UpdateApplyResult:
+    package = Path(package_path)
+    manifest, target, payload_paths = _read_update_package(package)
+    root = Path(vault)
+    root_parent = root.parent
+    root_parent.mkdir(parents=True, exist_ok=True)
+    lock_path = root_parent / f".{root.name}.update.lock"
+    lock_descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    stage: Path | None = None
+    backup: Path | None = None
+    with os.fdopen(lock_descriptor, "a+b") as lock_handle:
+        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
+        try:
+            root_exists = root.exists()
+            if root_exists:
+                try:
+                    details = root.lstat()
+                except OSError:
+                    raise UpdatePackageError("unable to inspect reader Vault") from None
+                if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+                    raise UpdatePackageError("reader Vault is not a regular directory")
+            if manifest["kind"] == "baseline":
+                if root_exists:
+                    raise UpdatePackageError("baseline requires a missing reader Vault")
+                previous_version = None
+            else:
+                if not root_exists:
+                    raise UpdatePackageError("incremental update requires a reader Vault")
+                current = build_content_manifest(root, created_at=str(manifest["created_at"]))
+                previous_version = current.content_version
+                if previous_version != manifest["base_version"]:
+                    raise UpdatePackageError("reader Vault version does not match update base")
+
+            before_human = _human_snapshot(root) if root_exists else {}
+            stage = Path(
+                tempfile.mkdtemp(prefix=f".{root.name}.stage-", dir=root_parent)
+            )
+            if root_exists:
+                _copy_vault(root, stage)
+            for relative in (
+                "02-项目",
+                "03-文章",
+                "04-附件",
+                "10-编辑稿",
+                "11-个人笔记",
+                "80-离线看板",
+                "90-系统",
+            ):
+                (stage / relative).mkdir(parents=True, exist_ok=True)
+
+            with zipfile.ZipFile(package) as archive:
+                for relative in sorted(payload_paths):
+                    payload = archive.read(f"payload/{relative}")
+                    destination = stage.joinpath(*PurePosixPath(relative).parts)
+                    destination.parent.mkdir(parents=True, exist_ok=True)
+                    destination.write_bytes(payload)
+            for relative in manifest["deleted"]:
+                path = stage.joinpath(*PurePosixPath(str(relative)).parts)
+                try:
+                    details = path.lstat()
+                except FileNotFoundError:
+                    raise UpdatePackageError("deleted update path is missing") from None
+                if not stat.S_ISREG(details.st_mode):
+                    raise UpdatePackageError("deleted update path is not a regular file")
+                path.unlink()
+
+            if _human_snapshot(stage) != before_human:
+                raise UpdatePackageError("update changed human workspace")
+            report = lint_vault(stage)
+            if report["errors"]:
+                raise UpdatePackageError("updated Vault validation failed")
+            actual = build_content_manifest(stage, created_at=str(manifest["created_at"]))
+            if actual.content_version != target.content_version:
+                raise UpdatePackageError("updated Vault version mismatch")
+            _set_reader_permissions(stage, target)
+
+            if root_exists:
+                backup = root_parent / f".{root.name}.backup-{uuid.uuid4().hex}"
+                os.replace(root, backup)
+                try:
+                    os.replace(stage, root)
+                    stage = None
+                except BaseException:
+                    os.replace(backup, root)
+                    backup = None
+                    raise
+                shutil.rmtree(backup)
+                backup = None
+            else:
+                os.replace(stage, root)
+                stage = None
+            return UpdateApplyResult(
+                previous_version=previous_version,
+                target_version=target.content_version,
+                added_or_changed=len(payload_paths),
+                deleted=len(manifest["deleted"]),
+            )
+        except (OSError, zipfile.BadZipFile) as exc:
+            raise UpdatePackageError("unable to apply update package") from exc
+        finally:
+            if stage is not None and stage.exists():
+                shutil.rmtree(stage)
+            if backup is not None and backup.exists() and not root.exists():
+                os.replace(backup, root)
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
