@@ -37,8 +37,14 @@ class ProjectConfigTests(unittest.TestCase):
         self.assertEqual(len({item.account for item in projects}), 10)
         self.assertTrue(all(item.confidence == "high" for item in projects))
         mappings = {(item.project, item.account) for item in projects}
-        self.assertIn(("雷鸟创新", "雷鸟XR"), mappings)
+        self.assertIn(("雷鸟创新", "RayNeo雷鸟眼镜"), mappings)
+        self.assertIn(("天兵科技", "北京天兵科技有限公司"), mappings)
+        self.assertIn(("推想", "推想医疗InferVision"), mappings)
+        self.assertIn(("乐纯", "乐纯生物LePure"), mappings)
         self.assertIn(("上海傲鲨", "傲鲨智能"), mappings)
+        identifiers = {item.project: item.wechat_id for item in projects}
+        self.assertEqual(identifiers["上海傲鲨"], "ULS-Robotics")
+        self.assertEqual(identifiers["智行者"], "velobotics")
 
     def test_requires_json_array(self) -> None:
         with self.assertRaisesRegex(

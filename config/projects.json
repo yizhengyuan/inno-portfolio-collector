@@ -1,12 +1,12 @@
 [
-  {"project":"雷鸟创新","account":"雷鸟XR","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
-  {"project":"天兵科技","account":"天兵科技","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
+  {"project":"雷鸟创新","account":"RayNeo雷鸟眼镜","wechat_id":"","confidence":"high","enabled":true,"aliases":["雷鸟XR","RayNeo雷鸟创新"]},
+  {"project":"天兵科技","account":"北京天兵科技有限公司","wechat_id":"SpacePioneer2019","confidence":"high","enabled":true,"aliases":["天兵科技"]},
   {"project":"松延动力Noetix","account":"NOETIX松延动力","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
   {"project":"加速进化","account":"加速进化","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
-  {"project":"推想","account":"推想医疗","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
-  {"project":"乐纯","account":"乐纯生物","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
+  {"project":"推想","account":"推想医疗InferVision","wechat_id":"","confidence":"high","enabled":true,"aliases":["推想医疗"]},
+  {"project":"乐纯","account":"乐纯生物LePure","wechat_id":"LepureBio","confidence":"high","enabled":true,"aliases":["乐纯生物"]},
   {"project":"阿丘科技","account":"阿丘科技","wechat_id":"","confidence":"high","enabled":true,"aliases":[]},
-  {"project":"上海傲鲨","account":"傲鲨智能","wechat_id":"ULS_Robotics","confidence":"high","enabled":true,"aliases":[]},
-  {"project":"智行者","account":"智行者科技","wechat_id":"idriverplus","confidence":"high","enabled":true,"aliases":[]},
-  {"project":"人民中科","account":"人民中科","wechat_id":"","confidence":"high","enabled":true,"aliases":[]}
+  {"project":"上海傲鲨","account":"傲鲨智能","wechat_id":"ULS-Robotics","confidence":"high","enabled":true,"aliases":[]},
+  {"project":"智行者","account":"智行者科技","wechat_id":"velobotics","confidence":"high","enabled":true,"aliases":[]},
+  {"project":"人民中科","account":"人民中科","wechat_id":"peopleai2019","confidence":"high","enabled":true,"aliases":[]}
 ]
