@@ -34,7 +34,11 @@ def _default_moore_source() -> Path:
     return ROOT.parent / "moore-wechat-article-downloader/scripts"
 
 
-def pyinstaller_commands(output: Path, moore_source: Path) -> list[list[str]]:
+def pyinstaller_commands(
+    output: Path,
+    moore_source: Path,
+    codesign_identity: str | None = None,
+) -> list[list[str]]:
     output = Path(output)
     moore_source = Path(moore_source)
     for name in ("wechat_exporter.py", "wechat_downloader.py"):
@@ -66,6 +70,8 @@ def pyinstaller_commands(output: Path, moore_source: Path) -> list[list[str]]:
         ]
         if search_path is not None:
             command.extend(["--paths", str(search_path)])
+        if codesign_identity is not None:
+            command.extend(["--codesign-identity", codesign_identity])
         command.append(str(entry))
         commands.append(command)
     return commands
@@ -128,12 +134,13 @@ def build(
     output: Path,
     moore_source: Path,
     clean: bool,
+    codesign_identity: str | None = None,
     runner: Runner = subprocess.run,
 ) -> dict[str, Path]:
     output = Path(output)
     if clean and output.exists():
         shutil.rmtree(output)
-    commands = pyinstaller_commands(output, moore_source)
+    commands = pyinstaller_commands(output, moore_source, codesign_identity)
     for command in commands:
         _run(command, runner=runner, text=True, capture_output=True, timeout=900)
 
@@ -169,6 +176,7 @@ def _parser() -> argparse.ArgumentParser:
         default=_default_moore_source(),
     )
     parser.add_argument("--clean", action="store_true")
+    parser.add_argument("--codesign-identity")
     return parser
 
 
@@ -179,6 +187,7 @@ def main(argv: list[str] | None = None) -> int:
             output=arguments.output,
             moore_source=arguments.moore_source,
             clean=arguments.clean,
+            codesign_identity=arguments.codesign_identity,
         )
     except HelperBuildError as error:
         print(str(error), file=sys.stderr)
