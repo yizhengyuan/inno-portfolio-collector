@@ -87,6 +87,27 @@ class MacAppBundleTests(unittest.TestCase):
                 and "/PlugIns/" in command[-1]
             ]
             self.assertEqual(helper_runtime_resigns, [])
+            strip_commands = [command for command in commands if command[0] == "strip"]
+            self.assertEqual(len(strip_commands), 2)
+            self.assertTrue(
+                all(command[1:3] == ["-S", "-x"] for command in strip_commands)
+            )
+            self.assertEqual(
+                {Path(command[-1]).name for command in strip_commands},
+                {"InnoCollectorApp", "InnoReaderApp"},
+            )
+            for strip_command in strip_commands:
+                target = strip_command[-1]
+                sign_command = next(
+                    command
+                    for command in commands
+                    if command[0] == "codesign"
+                    and "--sign" in command
+                    and command[-1] == target
+                )
+                self.assertLess(
+                    commands.index(strip_command), commands.index(sign_command)
+                )
 
     def test_plists_and_entitlements_are_least_privilege(self) -> None:
         collector = plistlib.loads((ROOT / "packaging/Info-Collector.plist").read_bytes())
@@ -106,6 +127,28 @@ class MacAppBundleTests(unittest.TestCase):
         self.assertEqual(self.extensions(reader), {"inno-update", "zip"})
         self.assertEqual(collector_entitlements, {"com.apple.security.network.client": True})
         self.assertEqual(reader_entitlements, {})
+
+    def test_bundle_rejects_local_absolute_paths_left_after_stripping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            swift, helpers = self.fixture(root)
+            (swift / "InnoReaderApp").write_bytes(
+                b"release binary /Users/alice/private/source.swift"
+            )
+
+            def run(command, **kwargs):
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with self.assertRaisesRegex(
+                build_macos_apps.AppBuildError,
+                "local absolute path",
+            ):
+                build_macos_apps.assemble_apps(
+                    swift_bin=swift,
+                    helpers=helpers,
+                    output=root / "apps",
+                    runner=run,
+                )
 
     @staticmethod
     def files(root: Path) -> set[str]:

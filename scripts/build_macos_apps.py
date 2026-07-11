@@ -26,6 +26,9 @@ class AppBuildError(RuntimeError):
     pass
 
 
+_LOCAL_ABSOLUTE_PATH = re.compile(rb"/(?:Users|Volumes)/[^/\x00]+/")
+
+
 def _run(
     command: Sequence[str],
     *,
@@ -89,9 +92,32 @@ def _audit_reader_bundle(reader: Path, *, runner: Runner) -> None:
                 raise AppBuildError("reader bundle contains credential material")
 
 
+def _audit_local_paths(app: Path) -> None:
+    for path in app.rglob("*"):
+        try:
+            details = path.lstat()
+        except OSError:
+            raise AppBuildError("unable to audit app bundle paths") from None
+        if not stat.S_ISREG(details.st_mode):
+            continue
+        try:
+            content = path.read_bytes()
+        except OSError:
+            raise AppBuildError("unable to audit app bundle paths") from None
+        if _LOCAL_ABSOLUTE_PATH.search(content):
+            raise AppBuildError("app bundle contains local absolute path")
+
+
 def _sign_app(app: Path, role: str, *, runner: Runner) -> None:
     executable = "InnoCollectorApp" if role == "collector" else "InnoReaderApp"
     swift_executable = app / f"Contents/MacOS/{executable}"
+    _run(
+        ["strip", "-S", "-x", str(swift_executable)],
+        runner=runner,
+        text=True,
+        capture_output=True,
+    )
+    _audit_local_paths(app)
     _run(
         [
             "codesign", "--force", "--options", "runtime", "--sign", "-",
