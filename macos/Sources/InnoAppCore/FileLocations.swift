@@ -1,0 +1,96 @@
+import Foundation
+
+public enum AppRole: String, Sendable {
+    case collector
+    case reader
+
+    var bundleIdentifier: String {
+        switch self {
+        case .collector: "com.inno.news.collector"
+        case .reader: "com.inno.news.reader"
+        }
+    }
+
+    var helperName: String {
+        switch self {
+        case .collector: "InnoCollectorHelper"
+        case .reader: "InnoReaderHelper"
+        }
+    }
+}
+
+public enum AppLocationsError: Error, Equatable, Sendable {
+    case applicationSupportUnavailable
+    case unsafeBundlePath
+}
+
+public struct AppLocations: Equatable, Sendable {
+    public let supportRoot: URL
+    public let vault: URL
+    public let inbox: URL
+    public let helper: URL
+    public let projectsConfig: URL?
+
+    public static func resolve(
+        role: AppRole,
+        applicationSupport: URL,
+        bundleURL: URL
+    ) throws -> Self {
+        let supportRoot = applicationSupport
+            .appendingPathComponent(role.bundleIdentifier, isDirectory: true)
+            .standardizedFileURL
+        let plugins = bundleURL
+            .appendingPathComponent("Contents/PlugIns", isDirectory: true)
+            .standardizedFileURL
+        let helper = plugins
+            .appendingPathComponent(role.helperName, isDirectory: false)
+            .standardizedFileURL
+        guard helper.deletingLastPathComponent() == plugins else {
+            throw AppLocationsError.unsafeBundlePath
+        }
+        let resources = bundleURL
+            .appendingPathComponent("Contents/Resources", isDirectory: true)
+            .standardizedFileURL
+        return Self(
+            supportRoot: supportRoot,
+            vault: supportRoot.appendingPathComponent("英诺被投项目资讯库", isDirectory: true),
+            inbox: supportRoot.appendingPathComponent("DraftInbox", isDirectory: true),
+            helper: helper,
+            projectsConfig: role == .collector
+                ? resources.appendingPathComponent("config/projects.json", isDirectory: false)
+                : nil
+        )
+    }
+
+    public static func collector(
+        fileManager: FileManager = .default,
+        bundle: Bundle = .main
+    ) throws -> Self {
+        try live(role: .collector, fileManager: fileManager, bundle: bundle)
+    }
+
+    public static func reader(
+        fileManager: FileManager = .default,
+        bundle: Bundle = .main
+    ) throws -> Self {
+        try live(role: .reader, fileManager: fileManager, bundle: bundle)
+    }
+
+    private static func live(
+        role: AppRole,
+        fileManager: FileManager,
+        bundle: Bundle
+    ) throws -> Self {
+        guard let applicationSupport = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first else {
+            throw AppLocationsError.applicationSupportUnavailable
+        }
+        return try resolve(
+            role: role,
+            applicationSupport: applicationSupport,
+            bundleURL: bundle.bundleURL
+        )
+    }
+}
