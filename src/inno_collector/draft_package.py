@@ -371,6 +371,8 @@ def list_received_drafts(inbox: Path) -> dict[str, object]:
     for child in children:
         if child.name.startswith(".") or not child.is_dir() or child.is_symlink():
             continue
+        if (child / ".accepted").is_file():
+            continue
         manifest, _payloads = _read_receipt(child)
         receipts.append({
             "receipt_path": str(child),
@@ -452,6 +454,7 @@ def accept_received_draft(receipt: Path, vault: Path) -> dict[str, object]:
             if not target.exists():
                 _atomic_write(target, attachment_data)
         existing.setdefault(metadata.draft_id, []).append((destination, metadata, digest))
+    _atomic_write(Path(receipt) / ".accepted", b"accepted\n")
     return {
         "created": created,
         "unchanged": unchanged,

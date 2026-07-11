@@ -170,6 +170,15 @@ class DraftPackageTests(unittest.TestCase):
             },
         )
 
+    def test_accepted_receipt_is_not_restored_as_pending(self) -> None:
+        receipt = self.build_and_receive("accepted-not-pending")
+        self.assertEqual(len(list_received_drafts(self.root / "inbox")["receipts"]), 1)
+
+        accept_received_draft(receipt, self.collector_vault)
+
+        self.assertEqual(list_received_drafts(self.root / "inbox"), {"receipts": []})
+        self.assertTrue((receipt / ".accepted").is_file())
+
     def test_secret_and_traversal_packages_are_rejected(self) -> None:
         self.write_draft("Cookie: sid=secret")
         with self.assertRaises(DraftPackageError):
