@@ -24,6 +24,16 @@ private actor ReaderRecordingHelper: HelperCalling {
     func call(command: String, arguments: [String: JSONValue]) async throws -> [String: JSONValue] {
         calls.append(Call(command: command, arguments: arguments))
         if command == failureCommand { throw HelperClientError.helperFailure("更新包版本不匹配") }
+        if command == "create_draft", responses[command] == nil,
+           case .string(let id) = arguments["draft_id"],
+           case .string(let vault) = arguments["vault"] {
+            return [
+                "draft_id": .string(id),
+                "draft_path": .string(
+                    URL(fileURLWithPath: vault).appendingPathComponent("10-编辑稿/\(id).md").path
+                ),
+            ]
+        }
         return responses[command] ?? [:]
     }
 
@@ -121,5 +131,73 @@ struct ReaderViewModelTests {
         let commands = await helper.recordedCalls().map(\.command)
         #expect(commands == ["status", "preview_update", "apply_update", "rebuild_dashboard"])
         #expect(!commands.contains("collect"))
+    }
+
+    @Test("draft creation and export stay in the editable zone")
+    func draftBoundaries() async throws {
+        let paths = try locations()
+        let helper = ReaderRecordingHelper(responses: ["build_drafts": ["draft_count": .integer(1)]])
+        let model = ReaderViewModel(
+            helper: helper,
+            locations: paths,
+            author: "朋友甲",
+            now: { Date(timeIntervalSince1970: 1_788_163_200) },
+            makeDraftID: { "reader-draft-0001" }
+        )
+        let article = LibraryArticle(
+            id: "sha256:" + String(repeating: "a", count: 64),
+            title: "项目新进展",
+            project: "项目甲",
+            account: "甲公众号",
+            published: "2026-07-11",
+            sourceURL: "https://mp.weixin.qq.com/s/example",
+            relativePath: "03-文章/项目甲/source-aaaaaaaa.md"
+        )
+
+        await model.createDraft(from: article, kind: .summary)
+        #expect(model.drafts.map(\.id) == ["reader-draft-0001"])
+        await model.exportDrafts(
+            ids: ["reader-draft-0001"],
+            destination: URL(fileURLWithPath: "/tmp/friend.inno-drafts")
+        )
+
+        let calls = await helper.recordedCalls()
+        #expect(calls.map(\.command) == ["create_draft", "build_drafts"])
+        #expect(calls[0].arguments["kind"] == .string("summary"))
+        #expect(calls[0].arguments["source_ids"] == .array([.string(article.id)]))
+        #expect(calls[0].arguments["vault"] == .string(paths.vault.path))
+        #expect(calls[0].arguments["path"] == nil)
+        #expect(calls[1].arguments["draft_paths"] == .array([.string("10-编辑稿/reader-draft-0001.md")]))
+    }
+
+    @Test("draft export rejects destinations inside source and attachment zones")
+    func exportRejectsProtectedDestination() async throws {
+        let paths = try locations()
+        let helper = ReaderRecordingHelper()
+        let model = ReaderViewModel(
+            helper: helper,
+            locations: paths,
+            author: "朋友甲",
+            makeDraftID: { "reader-draft-0002" }
+        )
+        let article = LibraryArticle(
+            id: "sha256:" + String(repeating: "b", count: 64),
+            title: "文章", project: "项目", account: "公众号", published: "2026-07-11",
+            sourceURL: "", relativePath: "03-文章/项目/source-bbbbbbbb.md"
+        )
+        await model.createDraft(from: article, kind: .note)
+        let before = await helper.recordedCalls().count
+
+        await model.exportDrafts(
+            ids: ["reader-draft-0002"],
+            destination: paths.vault.appendingPathComponent("03-文章/forbidden.inno-drafts")
+        )
+        #expect(model.errorMessage == "不能把编辑稿包写入只读原文或附件目录。")
+        await model.exportDrafts(
+            ids: ["reader-draft-0002"],
+            destination: paths.vault.appendingPathComponent("04-附件/forbidden.inno-drafts")
+        )
+
+        #expect(await helper.recordedCalls().count == before)
     }
 }

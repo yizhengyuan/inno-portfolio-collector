@@ -16,6 +16,8 @@ public struct ReaderContentView: View {
     @State private var query = ""
     @State private var project = ""
     @State private var activeTask: Task<Void, Never>?
+    @State private var selectedArticleID = ""
+    @State private var obsidianMessage: String?
 
     public init(model: ReaderViewModel) {
         self.model = model
@@ -87,8 +89,28 @@ public struct ReaderContentView: View {
                     .disabled(model.isBusy)
             }
         case .editing:
-            Text("编辑稿与采集到的原文分区保存。下一批将接入新建与导出编辑稿。")
-                .foregroundStyle(.secondary)
+            Text("编辑稿只写入 10-编辑稿，不会修改采集到的原文或附件。")
+            Picker("来源文章", selection: $selectedArticleID) {
+                Text("请选择文章").tag("")
+                ForEach(model.articles) { article in
+                    Text(article.title).tag(article.id)
+                }
+            }
+            HStack {
+                ForEach(DraftKind.allCases, id: \.rawValue) { kind in
+                    Button("新建\(kind.title)") { createDraft(kind) }
+                        .disabled(model.isBusy || selectedArticle == nil)
+                }
+            }
+            if !model.drafts.isEmpty {
+                Divider()
+                Text("本次新建的编辑稿").font(.headline)
+                ForEach(model.drafts) { draft in
+                    Text("\(draft.kind.title) · \(draft.title)")
+                }
+                Button("导出全部编辑稿…") { saveDraftPackage() }
+                    .disabled(model.isBusy)
+            }
         case .updates:
             Text("先预览更新包；只有再次确认后才会写入本地资料库。")
             Button("选择更新包…") { openUpdate() }.disabled(model.isBusy)
@@ -109,6 +131,13 @@ public struct ReaderContentView: View {
         case .obsidian:
             Text("推荐安装 Obsidian，以完整使用双向链接、标签和个人笔记。")
             Text(model.locations.vault.path).textSelection(.enabled).foregroundStyle(.secondary)
+            Button("在 Obsidian 中打开") {
+                obsidianMessage = ObsidianLauncher().open(vault: model.locations.vault)
+                    ? nil : "尚未检测到 Obsidian；安装后可直接打开本地资料库，其他阅读功能不受影响。"
+            }
+            if let obsidianMessage {
+                Text(obsidianMessage).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -118,6 +147,10 @@ public struct ReaderContentView: View {
 
     private var filteredArticles: [LibraryArticle] {
         model.filteredArticles(query: query, project: project)
+    }
+
+    private var selectedArticle: LibraryArticle? {
+        model.articles.first { $0.id == selectedArticleID }
     }
 
     private func icon(for section: Section) -> String {
@@ -135,6 +168,18 @@ public struct ReaderContentView: View {
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
         start { await model.previewUpdate(package: url) }
+    }
+
+    private func createDraft(_ kind: DraftKind) {
+        guard let selectedArticle else { return }
+        start { await model.createDraft(from: selectedArticle, kind: kind) }
+    }
+
+    private func saveDraftPackage() {
+        let panel = NSSavePanel()
+        panel.nameFieldStringValue = "英诺编辑稿.inno-drafts"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        start { await model.exportDrafts(ids: model.drafts.map(\.id), destination: url) }
     }
 
     private func start(_ operation: @escaping @MainActor () async -> Void) {
