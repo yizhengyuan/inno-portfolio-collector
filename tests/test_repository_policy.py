@@ -150,6 +150,21 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertNotIn(aws_key, rendered)
         self.assertNotIn(private_key_header.decode("ascii"), rendered)
 
+    def test_github_token_allows_underscore_in_twenty_character_payload(self) -> None:
+        github_token = b"ghp_" + b"A" * 9 + b"_" + b"B" * 10
+        files = {**REQUIRED, "fixtures/github.txt": github_token}
+
+        self.assertEqual(
+            audit(files),
+            [PolicyViolation("fixtures/github.txt", "github-token")],
+        )
+
+    def test_github_token_rejects_nineteen_character_payload(self) -> None:
+        github_token = b"ghp_" + b"A" * 9 + b"_" + b"B" * 9
+        files = {**REQUIRED, "fixtures/github.txt": github_token}
+
+        self.assertEqual(audit(files), [])
+
     def test_binary_and_oversized_files_skip_content_scanning(self) -> None:
         github_token = ("ghp_" + "C" * 36).encode("ascii")
         aws_key = ("AKIA" + "D" * 16).encode("ascii")

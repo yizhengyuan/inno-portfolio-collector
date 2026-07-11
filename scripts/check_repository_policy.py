@@ -39,7 +39,7 @@ CONTENT_RULES = (
     ),
     (
         "github-token",
-        re.compile(rb"(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{50,})"),
+        re.compile(rb"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{50,})"),
     ),
     ("aws-access-key", re.compile(rb"AKIA[A-Z0-9]{16}")),
 )
