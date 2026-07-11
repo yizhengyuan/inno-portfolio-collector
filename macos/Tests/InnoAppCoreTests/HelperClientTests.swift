@@ -20,7 +20,7 @@ struct HelperClientTests {
         let executable = try fixture(
             "print(json.dumps({'id':request['id'],'ok':True,'result':{'value':'好'}}))"
         )
-        let client = HelperClient(executable: executable, timeout: 3)
+        let client = HelperClient(executable: executable, timeout: 10)
 
         let result = try await client.call(command: "status", arguments: [:])
 
@@ -32,7 +32,7 @@ struct HelperClientTests {
         let executable = try fixture(
             "print('auth-key=stderr-secret',file=sys.stderr);print(json.dumps({'id':request['id'],'ok':False,'error':'bad package'}))"
         )
-        let client = HelperClient(executable: executable, timeout: 3)
+        let client = HelperClient(executable: executable, timeout: 10)
 
         do {
             _ = try await client.call(command: "status", arguments: [:])
@@ -47,7 +47,7 @@ struct HelperClientTests {
         let executable = try fixture(
             "print(json.dumps({'id':'wrong','ok':True,'result':{}}))"
         )
-        let client = HelperClient(executable: executable, timeout: 3)
+        let client = HelperClient(executable: executable, timeout: 10)
 
         do {
             _ = try await client.call(command: "status", arguments: [:])
@@ -73,13 +73,32 @@ struct HelperClientTests {
     @Test("stdout above the configured bound is rejected")
     func outputLimit() async throws {
         let executable = try fixture("print('x'*256)")
-        let client = HelperClient(executable: executable, timeout: 3, maxOutputBytes: 64)
+        let client = HelperClient(executable: executable, timeout: 10, maxOutputBytes: 64)
 
         do {
             _ = try await client.call(command: "status", arguments: [:])
             Issue.record("expected output limit")
         } catch let error as HelperClientError {
             #expect(error == .outputTooLarge)
+        }
+    }
+
+    @Test("cancelling a call terminates the helper")
+    func cancellation() async throws {
+        let executable = try fixture("time.sleep(5)")
+        let client = HelperClient(executable: executable, timeout: 10)
+        let task = Task {
+            try await client.call(command: "status", arguments: [:])
+        }
+        try await Task.sleep(for: .milliseconds(100))
+
+        task.cancel()
+
+        do {
+            _ = try await task.value
+            Issue.record("expected cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation is distinct from timeout or helper failure.
         }
     }
 }

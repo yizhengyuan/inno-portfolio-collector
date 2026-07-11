@@ -48,7 +48,7 @@ public actor HelperClient: HelperCalling {
             throw HelperClientError.invalidResponse
         }
 
-        return try await Task.detached(priority: .userInitiated) {
+        let worker = Task.detached(priority: .userInitiated) {
             let fileManager = FileManager.default
             let outputURL = fileManager.temporaryDirectory
                 .appendingPathComponent("inno-helper-\(UUID().uuidString).json")
@@ -80,23 +80,22 @@ public actor HelperClient: HelperCalling {
                 if process.isRunning { process.terminate() }
                 throw HelperClientError.launchFailed
             }
+            defer {
+                if process.isRunning { process.terminate() }
+                process.waitUntilExit()
+            }
 
             let deadline = Date().addingTimeInterval(timeout)
             while process.isRunning {
                 let size = (try? fileManager.attributesOfItem(atPath: outputURL.path)[.size] as? NSNumber)?.intValue ?? 0
                 if size > maxOutputBytes {
-                    process.terminate()
-                    process.waitUntilExit()
                     throw HelperClientError.outputTooLarge
                 }
                 if Date() >= deadline {
-                    process.terminate()
-                    process.waitUntilExit()
                     throw HelperClientError.timedOut
                 }
-                try? await Task.sleep(nanoseconds: 10_000_000)
+                try await Task.sleep(for: .milliseconds(10))
             }
-            process.waitUntilExit()
             try? outputHandle.synchronize()
             let attributes = try? fileManager.attributesOfItem(atPath: outputURL.path)
             let size = (attributes?[.size] as? NSNumber)?.intValue ?? 0
@@ -125,6 +124,11 @@ public actor HelperClient: HelperCalling {
                 throw HelperClientError.invalidResponse
             }
             return result
-        }.value
+        }
+        return try await withTaskCancellationHandler {
+            try await worker.value
+        } onCancel: {
+            worker.cancel()
+        }
     }
 }
