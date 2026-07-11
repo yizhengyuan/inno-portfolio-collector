@@ -181,6 +181,22 @@ class PackageTests(unittest.TestCase):
         (self.vault / "90-系统/manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
         self.assertTrue(lint_vault(self.vault)["manifest_errors"])
 
+    def test_rejects_casefold_collisions_across_all_delivery_paths(self) -> None:
+        upper = package_module.PurePosixPath("04-附件/项目/A.png")
+        lower = package_module.PurePosixPath("04-附件/项目/a.png")
+        fingerprints = {
+            upper: (1, 1, 1, 1, 0),
+            lower: (1, 2, 1, 1, 0),
+        }
+
+        errors = package_module._inventory_policy_errors(
+            [upper, lower],
+            [package_module.PurePosixPath("04-附件")],
+            fingerprints,
+        )
+
+        self.assertTrue(any("collides" in error for error in errors))
+
     def test_failure_counts_must_match_and_warning_is_required(self) -> None:
         report_path = self.vault / "90-系统/collection-report.md"
         report_path.write_text(report_path.read_text(encoding="utf-8").replace("失败项目数：0", "失败项目数：1"), encoding="utf-8")

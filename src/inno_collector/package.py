@@ -179,6 +179,16 @@ def _inventory_policy_errors(
     errors = [path.as_posix() for path in files + directories if _is_forbidden(path)]
     errors.extend(path.as_posix() for path in files if not _allowed_delivery_path(path, directory=False))
     errors.extend(path.as_posix() for path in directories if not _allowed_delivery_path(path, directory=True))
+    seen_paths: dict[str, PurePosixPath] = {}
+    for path in files + directories:
+        collision = _collision_key(path.as_posix())
+        previous = seen_paths.get(collision)
+        if previous is not None and previous != path:
+            errors.append(
+                f"{path.as_posix()}: collides with {previous.as_posix()} on macOS"
+            )
+        else:
+            seen_paths[collision] = path
     for path in files:
         size = fingerprints.get(path, (0, 0, 0))[2]
         limit = _MAX_IMAGE_SIZE if path.parts and path.parts[0] == "04-附件" else _MAX_TEXT_SIZE
