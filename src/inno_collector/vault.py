@@ -1163,7 +1163,15 @@ class VaultWriter:
         articles: list[NormalizedArticle],
         project_results: list[ProjectRunResult],
     ) -> VaultApplyResult:
-        for relative in ("02-项目", "03-文章", "04-附件", "90-系统"):
+        for relative in (
+            "02-项目",
+            "03-文章",
+            "04-附件",
+            "10-编辑稿",
+            "11-个人笔记",
+            "80-离线看板",
+            "90-系统",
+        ):
             self._path(relative).mkdir(parents=True, exist_ok=True)
         store = ManifestStore(self._path("90-系统/manifest.json"))
         incoming_keys = {article.key for article in articles}

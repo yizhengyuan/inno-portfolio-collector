@@ -80,6 +80,36 @@ class PackageTests(unittest.TestCase):
         self.assertTrue(all(name.startswith(self.vault.name + "/") for name in names))
         self.assertFalse(any(name.endswith(".lock") for name in names))
 
+    def test_editable_and_dashboard_zones_have_narrow_whitelists(self) -> None:
+        allowed = {
+            "10-编辑稿/稿件.md": "---\ndraft_id: draft-1\n---\n\n正文",
+            "10-编辑稿/附件/draft-1/image.png": b"png",
+            "11-个人笔记/笔记.md": "个人笔记",
+            "80-离线看板/index.html": "<!doctype html><title>看板</title>",
+        }
+        for relative, payload in allowed.items():
+            path = self.vault / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(payload, bytes):
+                path.write_bytes(payload)
+            else:
+                path.write_text(payload, encoding="utf-8")
+
+        self.assertEqual(lint_vault(self.vault)["forbidden_files"], [])
+
+        for relative in (
+            "10-编辑稿/run.command",
+            "11-个人笔记/state.db",
+            "80-离线看板/app.js",
+            "80-离线看板/nested/index.html",
+        ):
+            with self.subTest(relative=relative):
+                path = self.vault / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("x", encoding="utf-8")
+                self.assertIn(relative, lint_vault(self.vault)["forbidden_files"])
+                path.unlink()
+
     def test_default_name_uses_injected_time(self) -> None:
         output = build_delivery_zip(
             self.vault,

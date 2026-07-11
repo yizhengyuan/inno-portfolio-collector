@@ -24,7 +24,15 @@ class DeliveryValidationError(RuntimeError):
         self.report = report
 
 
-_REQUIRED_DIRECTORIES = ("02-项目", "03-文章", "04-附件", "90-系统")
+_REQUIRED_DIRECTORIES = (
+    "02-项目",
+    "03-文章",
+    "04-附件",
+    "10-编辑稿",
+    "11-个人笔记",
+    "80-离线看板",
+    "90-系统",
+)
 _REQUIRED_FILES = (
     "00-首页.md",
     "01-采集状态.md",
@@ -153,6 +161,20 @@ def _inventory(root: Path) -> tuple[list[PurePosixPath], list[PurePosixPath], li
     return files, directories, forbidden, fingerprints
 
 
+def _allowed_human_path(path: PurePosixPath) -> bool:
+    if path.parts[0] == "11-个人笔记":
+        return path.suffix.casefold() == ".md"
+    if path.parts[0] != "10-编辑稿":
+        return False
+    if path.suffix.casefold() == ".md":
+        return True
+    return (
+        len(path.parts) >= 4
+        and path.parts[1] == "附件"
+        and path.suffix.casefold() in _IMAGE_EXTENSIONS
+    )
+
+
 def _allowed_delivery_path(path: PurePosixPath, *, directory: bool) -> bool:
     text = path.as_posix()
     if text in _SAFE_IGNORED_LOCKS:
@@ -160,9 +182,15 @@ def _allowed_delivery_path(path: PurePosixPath, *, directory: bool) -> bool:
     if directory:
         if len(path.parts) == 1:
             return text in _REQUIRED_DIRECTORIES
-        return path.parts[0] in {"03-文章", "04-附件"}
+        if path.parts[0] in {"03-文章", "04-附件", "11-个人笔记"}:
+            return True
+        return path.parts[0] == "10-编辑稿" and path.parts[1] == "附件"
     if text in _REQUIRED_FILES:
         return True
+    if text == "80-离线看板/index.html":
+        return True
+    if path.parts[0] in {"10-编辑稿", "11-个人笔记"}:
+        return _allowed_human_path(path)
     if len(path.parts) == 2 and path.parts[0] == "02-项目":
         return path.suffix.casefold() == ".md"
     if len(path.parts) >= 3 and path.parts[0] == "03-文章":
@@ -192,7 +220,13 @@ def _inventory_policy_errors(
             seen_paths[collision] = path
     for path in files:
         size = fingerprints.get(path, (0, 0, 0))[2]
-        limit = _MAX_IMAGE_SIZE if path.parts and path.parts[0] == "04-附件" else _MAX_TEXT_SIZE
+        limit = (
+            _MAX_IMAGE_SIZE
+            if path.suffix.casefold() in _IMAGE_EXTENSIONS
+            and path.parts
+            and path.parts[0] in {"04-附件", "10-编辑稿"}
+            else _MAX_TEXT_SIZE
+        )
         if size > limit:
             errors.append(f"{path.as_posix()}: file too large")
     return errors

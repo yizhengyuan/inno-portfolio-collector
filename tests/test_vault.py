@@ -119,7 +119,15 @@ class VaultWriterTests(unittest.TestCase):
         result = VaultWriter(self.vault).apply([], [])
 
         self.assertEqual(result, VaultApplyResult(created=0, updated=0, unchanged=0))
-        for relative in ("02-项目", "03-文章", "04-附件", "90-系统"):
+        for relative in (
+            "02-项目",
+            "03-文章",
+            "04-附件",
+            "10-编辑稿",
+            "11-个人笔记",
+            "80-离线看板",
+            "90-系统",
+        ):
             with self.subTest(relative=relative):
                 self.assertTrue((self.vault / relative).is_dir())
 
