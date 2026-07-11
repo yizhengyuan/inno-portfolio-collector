@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from dataclasses import asdict
 from pathlib import Path
@@ -17,19 +18,41 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="inno-collect")
     sub = parser.add_subparsers(dest="command", required=True)
     collect = sub.add_parser("collect")
-    collect.add_argument("--projects", type=Path, required=True)
-    collect.add_argument("--since", required=True)
-    collect.add_argument("--exporter-script", type=Path, required=True)
-    collect.add_argument("--exporter-runtime", type=Path, required=True)
-    collect.add_argument("--runtime", type=Path, required=True)
+    collect.add_argument("--projects", type=Path, default=Path("config/projects.json"))
+    collect.add_argument("--since", default="2026-01-01")
+    collect.add_argument(
+        "--exporter-script",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "INNO_EXPORTER_SCRIPT",
+                "../moore-wechat-article-downloader/scripts/wechat_exporter.py",
+            )
+        ).expanduser(),
+    )
+    collect.add_argument(
+        "--exporter-runtime",
+        type=Path,
+        default=Path(
+            os.environ.get(
+                "INNO_EXPORTER_RUNTIME",
+                "~/.moore/wechat-article-downloader",
+            )
+        ).expanduser(),
+    )
+    collect.add_argument("--runtime", type=Path, default=Path("runtime"))
     collect.add_argument("--dry-run", action="store_true")
     package = sub.add_parser("package")
-    package.add_argument("--vault", type=Path, required=True)
-    package_output = package.add_mutually_exclusive_group(required=True)
-    package_output.add_argument("--dist", type=Path)
+    package.add_argument(
+        "--vault", type=Path, default=Path("runtime/vault/英诺被投项目资讯库")
+    )
+    package_output = package.add_mutually_exclusive_group()
+    package_output.add_argument("--dist", type=Path, default=Path("dist"))
     package_output.add_argument("--output", type=Path)
     lint = sub.add_parser("lint")
-    lint.add_argument("--vault", type=Path, required=True)
+    lint.add_argument(
+        "--vault", type=Path, default=Path("runtime/vault/英诺被投项目资讯库")
+    )
     return parser
 
 

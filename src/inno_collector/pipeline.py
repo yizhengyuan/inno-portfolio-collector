@@ -648,6 +648,7 @@ class CollectionPipeline:
                 "catalog: " + _safe_error(exc)
             ) from None
         accepted_keys: set[str] = set()
+        seen_catalog_keys: set[str] = set()
         article_count = 0
         duplicate_count = 0
         results: list[ProjectRunResult] = []
@@ -710,6 +711,12 @@ class CollectionPipeline:
                 selected, invalid_url_count = select_since_with_invalid_urls(
                     rows, since
                 )
+                for row in selected:
+                    key = article_key(str(row.get("url") or ""))
+                    if key in seen_catalog_keys:
+                        duplicate_count += 1
+                    else:
+                        seen_catalog_keys.add(key)
                 discovered = len(selected) + invalid_url_count
                 failed += invalid_url_count
                 if invalid_url_count:
@@ -788,7 +795,6 @@ class CollectionPipeline:
                             continue
                         assert isinstance(value, NormalizedArticle)
                         if key in accepted_keys:
-                            duplicate_count += 1
                             skipped += 1
                             continue
                         candidates.append(value)
