@@ -2,7 +2,7 @@
 
 ## 结论
 
-本次复核在提交 `31bf0baeaa9683cefdfc91a81c82c6d01c9c4939` 上完成。仓库源码与重新构建的 Collector/Reader App 通过本报告列出的隐私、开源许可证、角色隔离和内容边界检查，可以关闭 GitHub Issue #3。
+本次复核从提交 `31bf0baeaa9683cefdfc91a81c82c6d01c9c4939` 开始，并在本报告所在提交完成。仓库源码与重新构建的 Collector/Reader App 通过本报告列出的隐私、开源许可证、角色隔离和内容边界检查；相关 CI 通过并合并后，可以关闭 GitHub Issue #3。
 
 这是技术合规复核，不是法律意见，也不代表任何公众号运营主体或文章权利人已经授权采集、保存或分享内容。Developer ID 签名与 Apple 公证、干净 macOS 账户验收及正式 DMG 发布仍分别由 Issues #1、#2 和 #4 跟踪；完成这些事项前，版本仍不能标记为“可给朋友正式分发”。
 
@@ -24,8 +24,8 @@
 | 项目许可证 | 通过 | 根 `LICENSE` 为 MIT License，Copyright (c) 2026 yizhengyuan。 |
 | wechat-article-exporter 许可证 | 通过 | GitHub 当前默认分支许可证与本地文件 SHA-256 均为 `485a586ef411226e84cb978f8921ff1f743b10b4f1807f78b194cb991246e072`。 |
 | Moore 下载器许可证 | 通过 | GitHub 当前默认分支许可证与本地文件 SHA-256 均为 `ccb1f5de267e74faef97c828acee0cb48980d9971db4a73ef54894d3d379f5b9`。 |
-| 双 App 第三方署名 | 通过 | 两个 App 都逐字节包含两份上游许可证和 `THIRD_PARTY_NOTICES.md`。 |
-| 当前仓库敏感信息 | 通过 | `scripts/check_repository_policy.py` 检查 100 个跟踪文件通过。 |
+| 双 App 许可证与署名 | 通过 | 两个 App 都逐字节包含项目自身 MIT License、两份上游 MIT License 和 `THIRD_PARTY_NOTICES.md`，并可从侧栏“关于与许可证”直接查看全文。 |
+| 当前仓库敏感信息 | 通过 | `scripts/check_repository_policy.py` 检查全部当前 Git 跟踪文件通过。 |
 | Git 历史敏感信息 | 通过 | 全历史未命中 GitHub PAT、AWS Access Key 或私钥头等高置信凭据。 |
 | 用户原始项目清单 | 通过 | 当前树和全历史均没有 `.superpowers/` 或 `英诺项目清单-2026/`；两个 App 也不包含该目录。 |
 | 产品项目配置 | 已确认 | Collector 按设计包含已审阅的 `config/projects.json`；这是公开产品配置，不是用户原始清单。Reader 不包含该文件。 |
@@ -34,7 +34,7 @@
 | Collector 采集能力 | 已确认 | Collector 包含 Collector Helper、Moore Helper 和项目配置；公众号凭据保留在采集者本机运行目录，不进入 App 或更新包。 |
 | 网络权限 | 通过 | Collector 仅声明 `com.apple.security.network.client=true`；Reader entitlements 为空。 |
 | 外部 AI、遥测与分析 | 通过 | 源码和构建配置未包含 DeepSeek/OpenAI、Sentry、Mixpanel、Segment 或其他遥测集成；Python 无运行时第三方依赖，Swift 无外部 package 依赖。 |
-| 文档与界面提示 | 通过 | README、Notice、贡献指南、安全政策和 App UI 明确说明凭据不共享、Reader 不采集、编辑区不修改原文，以及文章版权和授权责任。 |
+| 文档与界面提示 | 通过 | README、Notice、贡献指南和安全政策说明凭据与角色边界；编辑业务页说明不会修改采集原文；两个 App 的“关于与许可证”页面说明文章版权归属和授权责任。 |
 | 包内凭据文件 | 通过 | 两个 App 未发现 `.env`、私钥、证书容器、Cookie 数据库、更新包或稿件包。 |
 | 包内高置信密钥 | 通过 | 两个 App 的二进制与资源均未命中 GitHub PAT、AWS Access Key 或私钥头。 |
 | 本机构建路径 | 修复后通过 | 初次 release 构建在 Swift 二进制中发现本机源路径；`31bf0ba` 增加 `strip -S -x` 以及签名前 fail-closed 路径扫描。重新构建后 `/Users/` 与 `/Volumes/` 命中均为零。 |
@@ -68,7 +68,7 @@ codesign --verify --deep --strict "$TMPDIR/inno-compliance/apps/InnoCollector.ap
 codesign --verify --deep --strict "$TMPDIR/inno-compliance/apps/InnoReader.app"
 ```
 
-构建器现在会在 Swift 可执行文件签名前剥离本地符号，并扫描整个 App；任何 `/Users/<name>/` 或 `/Volumes/<name>/` 路径都会使构建失败，错误不会回显具体路径。
+构建器现在会在 Swift 可执行文件签名前剥离本地符号，并扫描 App 内全部常规文件；任何 `/Users/<name>/` 或 `/Volumes/<name>/` 路径都会使构建失败，错误不会回显具体路径。
 
 ## 分发与使用边界
 

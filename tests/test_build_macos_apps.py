@@ -56,6 +56,8 @@ class MacAppBundleTests(unittest.TestCase):
                 "Contents/Resources/config/projects.json",
                 "Contents/Resources/ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
                 "Contents/Resources/ThirdPartyLicenses/moore-wechat-article-downloader-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/inno-news-suite-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/THIRD_PARTY_NOTICES.md",
                 "Contents/Info.plist",
             }
             expected_reader = {
@@ -63,6 +65,8 @@ class MacAppBundleTests(unittest.TestCase):
                 "Contents/PlugIns/InnoReaderHelper",
                 "Contents/Resources/ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
                 "Contents/Resources/ThirdPartyLicenses/moore-wechat-article-downloader-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/inno-news-suite-LICENSE.txt",
+                "Contents/Resources/ThirdPartyLicenses/THIRD_PARTY_NOTICES.md",
                 "Contents/Info.plist",
             }
             self.assertTrue(expected_collector.issubset(self.files(collector)))
@@ -71,6 +75,14 @@ class MacAppBundleTests(unittest.TestCase):
                 (collector / "Contents/Resources/config/projects.json").read_bytes(),
                 (ROOT / "config/projects.json").read_bytes(),
             )
+            for app in (collector, reader):
+                self.assertEqual(
+                    (
+                        app
+                        / "Contents/Resources/ThirdPartyLicenses/inno-news-suite-LICENSE.txt"
+                    ).read_bytes(),
+                    (ROOT / "LICENSE").read_bytes(),
+                )
             reader_files = {value.casefold() for value in self.files(reader)}
             self.assertFalse(any("collector" in value for value in reader_files))
             self.assertFalse(any("mooreexporter" in value for value in reader_files))
@@ -149,6 +161,20 @@ class MacAppBundleTests(unittest.TestCase):
                     output=root / "apps",
                     runner=run,
                 )
+
+    def test_bundle_rejects_volume_path_in_resource_without_disclosing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            private_path = b"/Volumes/PrivateDisk/confidential/build.log"
+            resource = root / "Contents/Resources/notice.txt"
+            resource.parent.mkdir(parents=True)
+            resource.write_bytes(b"safe prefix\n" + private_path)
+
+            with self.assertRaises(build_macos_apps.AppBuildError) as caught:
+                build_macos_apps._audit_local_paths(root)
+
+            self.assertIn("local absolute path", str(caught.exception))
+            self.assertNotIn(private_path.decode(), str(caught.exception))
 
     @staticmethod
     def files(root: Path) -> set[str]:

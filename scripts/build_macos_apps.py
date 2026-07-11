@@ -55,6 +55,10 @@ def _copy_regular(source: Path, destination: Path, *, executable: bool = False) 
 
 def _copy_shared_resources(app: Path) -> None:
     licenses = app / "Contents/Resources/ThirdPartyLicenses"
+    _copy_regular(
+        ROOT / "LICENSE",
+        licenses / "inno-news-suite-LICENSE.txt",
+    )
     for name in (
         "wechat-article-exporter-LICENSE.txt",
         "moore-wechat-article-downloader-LICENSE.txt",
