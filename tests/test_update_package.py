@@ -92,8 +92,9 @@ class UpdatePackageBuildTests(unittest.TestCase):
     def test_incremental_records_added_changed_deleted_and_excludes_human_files(
         self,
     ) -> None:
-        removed = self.vault / "80-离线看板/index.html"
-        removed.write_text("<!doctype html><title>旧看板</title>", encoding="utf-8")
+        removed = self.vault / "04-附件/removed/old.png"
+        removed.parent.mkdir(parents=True, exist_ok=True)
+        removed.write_bytes(b"old")
         baseline = self.root / "baseline.inno-update"
         build_update_package(
             self.vault,
@@ -120,7 +121,7 @@ class UpdatePackageBuildTests(unittest.TestCase):
         self.assertEqual(result["kind"], "incremental")
         self.assertIn(article_path.relative_to(self.vault).as_posix(), result["included"])
         self.assertIn("04-附件/extra/new.png", result["included"])
-        self.assertEqual(result["deleted"], ["80-离线看板/index.html"])
+        self.assertEqual(result["deleted"], ["04-附件/removed/old.png"])
         self.assertFalse(any(path.startswith("10-编辑稿/") for path in result["included"]))
         manifest = self.archive_manifest(output)
         self.assertEqual(manifest["base_version"], result["base_version"])

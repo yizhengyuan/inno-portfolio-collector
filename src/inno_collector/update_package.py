@@ -21,6 +21,7 @@ from .content_manifest import (
     build_content_manifest,
     parse_content_manifest,
 )
+from .dashboard import build_dashboard
 from .package import (
     _SAFE_IGNORED_LOCKS,
     _inventory,
@@ -199,6 +200,7 @@ def build_update_package(
     created_at: str | None = None,
 ) -> dict[str, object]:
     root = Path(vault).resolve()
+    build_dashboard(root)
     report = lint_vault(root)
     if report["errors"]:
         raise UpdatePackageError("Vault validation failed")
