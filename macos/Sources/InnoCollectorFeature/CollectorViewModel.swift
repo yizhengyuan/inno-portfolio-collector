@@ -177,7 +177,7 @@ public final class CollectorViewModel: ObservableObject {
         let candidate = URL(fileURLWithPath: rawPath, isDirectory: true)
             .resolvingSymlinksInPath().standardizedFileURL
         guard candidate.path.hasPrefix(root.path + "/") else { return nil }
-        return candidate
+        return URL(fileURLWithPath: candidate.path, isDirectory: true)
     }
 
     private func perform(_ operation: () async throws -> Void) async {
