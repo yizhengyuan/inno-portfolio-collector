@@ -27,6 +27,20 @@ struct FileLocationsTests {
         #expect(collector.projectsConfig?.path.hasSuffix("Contents/Resources/config/projects.json") == true)
         #expect(reader.projectsConfig == nil)
         #expect(
+            collector.mooreHelper?.path.hasSuffix(
+                "Contents/PlugIns/MooreExporterHelper"
+            ) == true
+        )
+        #expect(
+            collector.exporterRuntime
+                == collector.supportRoot.appendingPathComponent(
+                    "ExporterRuntime",
+                    isDirectory: true
+                )
+        )
+        #expect(reader.mooreHelper == nil)
+        #expect(reader.exporterRuntime == nil)
+        #expect(
             collector.vault
                 == collector.supportRoot
                     .appendingPathComponent("Runtime/vault/英诺被投项目资讯库", isDirectory: true)
@@ -63,7 +77,13 @@ struct FileLocationsTests {
             bundleURL: bundle
         )
         let plugins = bundle.appendingPathComponent("Contents/PlugIns", isDirectory: true).standardizedFileURL
+        let collector = try AppLocations.resolve(
+            role: .collector,
+            applicationSupport: applicationSupport,
+            bundleURL: bundle
+        )
 
         #expect(locations.helper.deletingLastPathComponent() == plugins)
+        #expect(collector.mooreHelper?.deletingLastPathComponent() == plugins)
     }
 }

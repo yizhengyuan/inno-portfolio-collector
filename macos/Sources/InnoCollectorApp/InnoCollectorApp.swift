@@ -25,9 +25,20 @@ private struct CollectorRootView: View {
     @StateObject private var model: CollectorViewModel
 
     init(locations: AppLocations) {
+        let localLogin = locations.mooreHelper.flatMap { helper in
+            locations.exporterRuntime.map { runtime in
+                MooreLocalLoginServer(
+                    executable: helper,
+                    pluginsDirectory: locations.helper.deletingLastPathComponent(),
+                    runtimeDirectory: runtime,
+                    supportRoot: locations.supportRoot
+                )
+            }
+        }
         _model = StateObject(wrappedValue: CollectorViewModel(
             helper: HelperClient(executable: locations.helper),
-            locations: locations
+            locations: locations,
+            localLogin: localLogin
         ))
     }
 

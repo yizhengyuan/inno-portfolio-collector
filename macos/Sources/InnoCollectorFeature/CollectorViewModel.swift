@@ -30,11 +30,51 @@ public final class CollectorViewModel: ObservableObject {
     @Published public private(set) var receivedDrafts: [ReceivedDraft] = []
 
     private let helper: any HelperCalling
+    private let localLogin: (any LocalLoginServing)?
     public let locations: AppLocations
 
-    public init(helper: any HelperCalling, locations: AppLocations) {
+    public init(
+        helper: any HelperCalling,
+        locations: AppLocations,
+        localLogin: (any LocalLoginServing)? = nil
+    ) {
         self.helper = helper
         self.locations = locations
+        self.localLogin = localLogin
+    }
+
+    public func openLocalLogin() async {
+        guard !isBusy else { return }
+        isBusy = true
+        errorMessage = nil
+        defer { isBusy = false }
+        guard let localLogin else {
+            errorMessage = "本地登录后台不可用。"
+            return
+        }
+        do {
+            try await localLogin.open()
+        } catch is CancellationError {
+            localLogin.stop()
+            errorMessage = nil
+        } catch let error as LocalLoginError {
+            switch error {
+            case .portInUse:
+                errorMessage = "本地登录端口被占用，请关闭旧后台或重启后重试。"
+            case .browserUnavailable:
+                errorMessage = "请在浏览器打开 http://127.0.0.1:18765/。"
+            case .unavailable:
+                errorMessage = "本地登录后台不可用。"
+            case .launchFailed, .notReady:
+                errorMessage = "本地登录后台启动失败。"
+            }
+        } catch {
+            errorMessage = "本地登录后台启动失败。"
+        }
+    }
+
+    public func stopLocalLogin() {
+        localLogin?.stop()
     }
 
     public func refresh() async {

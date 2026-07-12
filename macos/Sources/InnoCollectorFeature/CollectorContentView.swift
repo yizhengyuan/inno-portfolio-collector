@@ -42,6 +42,7 @@ public struct CollectorContentView: View {
         }
         .frame(minWidth: 880, minHeight: 560)
         .task { await model.refresh() }
+        .onDisappear { model.stopLocalLogin() }
     }
 
     private var header: some View {
@@ -70,6 +71,13 @@ public struct CollectorContentView: View {
             Button("刷新状态") { start { await model.refresh() } }
                 .disabled(model.isBusy)
         case .collect:
+            Text("仅供采集者本人在这台 Mac 扫码登录；请勿分享采集端或登录状态。")
+                .foregroundStyle(.secondary)
+            Button("打开本地登录后台") {
+                start { await model.openLocalLogin() }
+            }
+            .disabled(model.isBusy)
+            Divider()
             Text("先运行预检，确认登录状态与 10 个公众号精确映射，再开始采集。")
             HStack {
                 Button("运行预检") { start { await model.preflight() } }
