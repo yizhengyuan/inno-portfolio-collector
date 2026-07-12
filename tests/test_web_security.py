@@ -5,6 +5,8 @@ import unittest
 from inno_collector.web.security import (
     MAX_REQUEST_BODY_BYTES,
     MAX_RESPONSE_BYTES,
+    MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_FILE_BYTES,
     SecurityError,
     security_headers,
     validate_bind_host,
@@ -68,6 +70,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertLessEqual(MAX_REQUEST_BODY_BYTES, 4 << 20)
         self.assertGreater(MAX_RESPONSE_BYTES, 0)
         self.assertLessEqual(MAX_RESPONSE_BYTES, 8 << 20)
+        self.assertGreater(MAX_UPLOAD_BYTES, MAX_REQUEST_BODY_BYTES)
+        self.assertGreater(MAX_UPLOAD_FILE_BYTES, 0)
+        self.assertLess(MAX_UPLOAD_FILE_BYTES, MAX_UPLOAD_BYTES)
 
 
 if __name__ == "__main__":

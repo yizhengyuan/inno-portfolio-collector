@@ -4,10 +4,15 @@ import http.client
 import io
 import json
 import os
+import hashlib
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 
 from inno_collector.web.security import MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BYTES
+from inno_collector.web.requests import UploadedFile
+from inno_collector.web.responses import FileResponse
 from inno_collector.web.server import LocalWebServer
 
 
@@ -17,6 +22,8 @@ class TestApplication:
         self.max_active_writes = 0
         self.lock = threading.Lock()
         self.release = threading.Event()
+        self.download_path = None
+        self.download_completed: list[bool] = []
 
     def __call__(self, method: str, path: str, payload: object) -> tuple[int, object]:
         if path == "/api/echo" and method == "POST":
@@ -35,6 +42,25 @@ class TestApplication:
             with self.lock:
                 self.active_writes -= 1
             return 200, {"ok": True}
+        if path == "/api/drafts/preview" and method == "POST":
+            if not isinstance(payload, UploadedFile):
+                raise TypeError("expected upload")
+            return 200, {
+                "ok": True,
+                "filename": payload.filename,
+                "size": payload.size,
+                "contents": payload.path.read_text(encoding="utf-8"),
+            }
+        if path == "/api/download" and method == "GET" and self.download_path:
+            data = self.download_path.read_bytes()
+            return FileResponse(
+                path=self.download_path,
+                filename="英诺更新.inno-update",
+                content_type="application/octet-stream",
+                size=len(data),
+                sha256=hashlib.sha256(data).hexdigest(),
+                on_complete=self.download_completed.append,
+            )
         return 404, {"ok": False, "error": {"code": "not_found", "message": "Not found"}}
 
 
@@ -134,6 +160,56 @@ class LocalWebServerTests(unittest.TestCase):
         self.assertEqual(status, 413)
         self.assertEqual(json.loads(body)["error"]["code"], "request_too_large")
 
+    def test_draft_preview_accepts_one_bounded_multipart_file(self) -> None:
+        boundary = "inno-boundary"
+        upload = b"draft-package"
+        body = (
+            f"--{boundary}\r\n"
+            'Content-Disposition: form-data; name="file"; filename="friend.inno-drafts"\r\n'
+            "Content-Type: application/octet-stream\r\n\r\n"
+        ).encode() + upload + f"\r\n--{boundary}--\r\n".encode()
+        headers = {
+            **self.write_headers(),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+
+        status, _, response = self.request(
+            "POST", "/api/drafts/preview", body=body, headers=headers
+        )
+
+        self.assertEqual(status, 200)
+        payload = json.loads(response)
+        self.assertEqual(payload["filename"], "friend.inno-drafts")
+        self.assertEqual(payload["size"], len(upload))
+        self.assertEqual(payload["contents"], upload.decode())
+        self.assertEqual(list(self.server.upload_root.iterdir()), [])
+
+    def test_draft_preview_rejects_multiple_files_and_path_filenames(self) -> None:
+        boundary = "inno-boundary"
+
+        def part(filename: str) -> bytes:
+            return (
+                f"--{boundary}\r\n"
+                f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
+                "Content-Type: application/octet-stream\r\n\r\n"
+                "payload\r\n"
+            ).encode()
+
+        headers = {
+            **self.write_headers(),
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        }
+        for body in (
+            part("one.inno-drafts") + part("two.inno-drafts") + f"--{boundary}--\r\n".encode(),
+            part("../secret.inno-drafts") + f"--{boundary}--\r\n".encode(),
+        ):
+            with self.subTest(size=len(body)):
+                status, _, response = self.request(
+                    "POST", "/api/drafts/preview", body=body, headers=headers
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(json.loads(response)["error"]["code"], "invalid_multipart")
+
     def test_unknown_route_internal_error_and_large_response_are_sanitized(self) -> None:
         status, _, body = self.request("GET", "/unknown")
         self.assertEqual(status, 404)
@@ -148,6 +224,22 @@ class LocalWebServerTests(unittest.TestCase):
         status, _, body = self.request("GET", "/api/large")
         self.assertEqual(status, 500)
         self.assertLess(len(body), 1024)
+
+    def test_registered_file_response_has_verified_download_headers(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        path = Path(temporary.name) / "update.inno-update"
+        path.write_bytes(b"verified-package")
+        self.application.download_path = path
+
+        status, headers, body = self.request("GET", "/api/download")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, b"verified-package")
+        self.assertEqual(headers["Content-Type"], "application/octet-stream")
+        self.assertIn("filename*=UTF-8", headers["Content-Disposition"])
+        self.assertEqual(headers["X-Content-SHA256"], hashlib.sha256(body).hexdigest())
+        self.assertEqual(self.application.download_completed, [True])
 
     def test_all_responses_have_security_headers_and_no_cors(self) -> None:
         _, headers, _ = self.request("GET", "/health")

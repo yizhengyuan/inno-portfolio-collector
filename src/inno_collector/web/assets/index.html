@@ -71,12 +71,20 @@
         <article id="delivery" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">03</p><h2>交付</h2></div><span>未开放</span></div>
           <p>验证 Obsidian Vault、离线 HTML 看板和安全 ZIP。</p>
-          <button type="button" data-write-action disabled>生成交付包</button>
+          <div class="button-row">
+            <button id="delivery-baseline" type="button" data-write-action="delivery" disabled>生成基线包</button>
+            <label class="file-button">选择旧版生成增量<input id="delivery-base-file" type="file" accept=".inno-update" hidden></label>
+          </div>
+          <p id="delivery-message" class="inline-message">尚未生成交付包</p>
+          <a id="delivery-download" class="download-link" hidden>下载 .inno-update</a>
         </article>
         <article id="drafts" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">04</p><h2>稿件收件箱</h2></div><span>只读</span></div>
           <p>集中查看朋友返回的编辑稿，不共享任何登录凭据。</p>
-          <button type="button" data-write-action disabled>导入稿件包</button>
+          <label class="file-button">选择稿件包<input id="draft-file" type="file" accept=".inno-drafts" hidden></label>
+          <div id="draft-preview" class="inline-message">尚未选择稿件包</div>
+          <label class="confirm-row"><input id="draft-confirm" type="checkbox" disabled> 我已核对预览，确认收录</label>
+          <button id="draft-accept" type="button" data-write-action="drafts" disabled>确认收录稿件</button>
         </article>
       </section>
 

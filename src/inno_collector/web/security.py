@@ -6,8 +6,10 @@ import hmac
 LOOPBACK_HOST = "127.0.0.1"
 SESSION_HEADER = "X-Inno-Session"
 MAX_REQUEST_BODY_BYTES = 4 << 20
-MAX_UPLOAD_BYTES = MAX_REQUEST_BODY_BYTES
+MAX_UPLOAD_BYTES = 512 << 20
+MAX_UPLOAD_FILE_BYTES = 500 << 20
 MAX_RESPONSE_BYTES = 8 << 20
+MAX_DOWNLOAD_BYTES = 512 << 20
 
 
 class SecurityError(RuntimeError):
@@ -48,6 +50,21 @@ def validate_write_headers(
             "unsupported_media_type",
             "Writes require application/json.",
         )
+    validate_write_identity(
+        origin=origin,
+        token=token,
+        expected_origin=expected_origin,
+        expected_token=expected_token,
+    )
+
+
+def validate_write_identity(
+    *,
+    origin: str,
+    token: str,
+    expected_origin: str,
+    expected_token: str,
+) -> None:
     if not origin or not hmac.compare_digest(origin, expected_origin):
         raise SecurityError(403, "invalid_origin", "Request origin was rejected.")
     if not token or not hmac.compare_digest(token, expected_token):

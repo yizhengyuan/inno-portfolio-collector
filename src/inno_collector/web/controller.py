@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import re
 import hashlib
+import os
+import re
+import secrets
+import stat
+import zipfile
 from collections.abc import Callable
 from pathlib import Path
 
@@ -11,6 +15,7 @@ from ..diagnostics import sanitize_diagnostic
 from ..exporter import ExporterCommandError
 from ..models import PipelineRunResult, ProjectAccount
 from ..package import lint_vault
+from ..update_package import build_update_package
 from ..pipeline import (
     CollectionPipeline,
     PipelineAuthenticationError,
@@ -18,7 +23,11 @@ from ..pipeline import (
     PipelineConfigurationError,
 )
 from .jobs import JobBusyError, JobCancelled, JobGoneError, JobManager, JobOutcome
-from .responses import WebResponse
+from .downloads import DownloadGoneError, DownloadRegistry
+from .requests import UploadedFile
+from .responses import FileResponse, WebResponse
+from .security import MAX_DOWNLOAD_BYTES
+from .uploads import DraftUploadError
 
 
 Linter = Callable[[Path], dict[str, object]]
@@ -34,6 +43,7 @@ CollectionRunner = Callable[
     ],
     PipelineRunResult,
 ]
+DeliveryBuilder = Callable[..., dict[str, object]]
 _ASSET_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8", True),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8", False),
@@ -45,6 +55,12 @@ _LOGIN_ROUTE = re.compile(
 )
 _JOB_ROUTE = re.compile(
     r"^/api/jobs/([A-Za-z0-9_-]{24,64})(?:/(events|cancel))?$"
+)
+_DELIVERY_ROUTE = re.compile(
+    r"^/api/delivery/([A-Za-z0-9_-]{24,64})/download$"
+)
+_DRAFT_ACCEPT_ROUTE = re.compile(
+    r"^/api/drafts/([A-Za-z0-9_-]{32,64})/accept$"
 )
 _DEFAULT_MOORE_BASE_URL = "https://down.mptext.top"
 _LOGIN_MESSAGES = {
@@ -82,6 +98,10 @@ class WebController:
         preflight_runner: PreflightRunner | None = None,
         collection_runner: CollectionRunner | None = None,
         job_manager: JobManager | None = None,
+        delivery_root: Path | None = None,
+        download_registry: DownloadRegistry | None = None,
+        delivery_builder: DeliveryBuilder = build_update_package,
+        draft_upload_manager: object | None = None,
     ) -> None:
         self.vault = Path(vault)
         self.moore_runtime = moore_runtime
@@ -102,6 +122,10 @@ class WebController:
         self._collection_runner = collection_runner
         self.job_manager = job_manager or JobManager()
         self._successful_preflight_hash: str | None = None
+        self.delivery_root = Path(delivery_root) if delivery_root is not None else None
+        self.download_registry = download_registry
+        self._delivery_builder = delivery_builder
+        self.draft_upload_manager = draft_upload_manager
 
     def _runtime_authenticated(self) -> bool:
         if self.moore_runtime is None:
@@ -145,16 +169,22 @@ class WebController:
             "version": __version__,
             "authenticated": authenticated,
             "recent_job": self._safe_recent_job(),
-            "capabilities": (
-                ["read_library", "login", "preflight", "collection"]
-                if (
-                    self.moore_runtime is not None
-                    or self._preflight_runner is not None
-                    or self._collection_runner is not None
-                )
-                else ["read_library"]
-            ),
+            "capabilities": self._capabilities(),
         }
+
+    def _capabilities(self) -> list[str]:
+        capabilities = ["read_library"]
+        if (
+            self.moore_runtime is not None
+            or self._preflight_runner is not None
+            or self._collection_runner is not None
+        ):
+            capabilities.extend(["login", "preflight", "collection"])
+        if self.delivery_root is not None and self.download_registry is not None:
+            capabilities.append("delivery")
+        if self.draft_upload_manager is not None:
+            capabilities.append("drafts")
+        return capabilities
 
     def _login_error(self, *, unavailable: bool = False) -> tuple[int, dict]:
         return (503 if unavailable else 409), {
@@ -460,6 +490,232 @@ class WebController:
                 "error": {"code": "job_gone", "message": "该任务已结束并从本机记录中清理。"},
             }
 
+    def _stage_uploaded_base(self, uploaded: UploadedFile) -> Path:
+        if (
+            self.delivery_root is None
+            or not uploaded.filename.casefold().endswith(".inno-update")
+            or uploaded.size <= 0
+            or uploaded.path.is_symlink()
+        ):
+            raise ValueError("invalid incremental base")
+        root = self.delivery_root
+        if root.exists() and root.is_symlink():
+            raise ValueError("invalid delivery root")
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        destination = root / f".base-{secrets.token_urlsafe(18)}.inno-update"
+        source_descriptor = destination_descriptor = -1
+        try:
+            source_descriptor = os.open(
+                uploaded.path,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            source_stat = os.fstat(source_descriptor)
+            if (
+                not stat.S_ISREG(source_stat.st_mode)
+                or source_stat.st_nlink != 1
+                or source_stat.st_size != uploaded.size
+            ):
+                raise OSError
+            destination_descriptor = os.open(
+                destination,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+            )
+            copied = 0
+            while True:
+                chunk = os.read(source_descriptor, 1 << 20)
+                if not chunk:
+                    break
+                pending = memoryview(chunk)
+                while pending:
+                    written = os.write(destination_descriptor, pending)
+                    if written <= 0:
+                        raise OSError
+                    pending = pending[written:]
+                copied += len(chunk)
+            if copied != uploaded.size:
+                raise OSError
+            os.fsync(destination_descriptor)
+            with zipfile.ZipFile(destination) as archive:
+                infos = archive.infolist()
+                if (
+                    not 1 <= len(infos) <= 4096
+                    or sum(info.file_size for info in infos) > (1 << 30)
+                    or any(
+                        info.file_size > max(1, info.compress_size) * 1000
+                        for info in infos
+                    )
+                ):
+                    raise OSError
+            return destination
+        except (OSError, zipfile.BadZipFile, zipfile.LargeZipFile):
+            destination.unlink(missing_ok=True)
+            raise ValueError("invalid incremental base") from None
+        finally:
+            if source_descriptor >= 0:
+                os.close(source_descriptor)
+            if destination_descriptor >= 0:
+                os.close(destination_descriptor)
+
+    def _start_delivery(self, payload: object) -> tuple[int, dict]:
+        if self.delivery_root is None or self.download_registry is None:
+            return 503, {
+                "ok": False,
+                "error": {"code": "delivery_unavailable", "message": "交付服务暂时不可用。"},
+            }
+        base_package: Path | None = None
+        created_at: str | None = None
+        if isinstance(payload, UploadedFile):
+            try:
+                base_package = self._stage_uploaded_base(payload)
+            except ValueError:
+                return 400, {
+                    "ok": False,
+                    "error": {"code": "invalid_base_package", "message": "请选择有效的旧版 .inno-update。"},
+                }
+            kind = "incremental"
+        elif isinstance(payload, dict):
+            kind = payload.get("kind")
+            created_at_value = payload.get("created_at")
+            if created_at_value is not None:
+                if not isinstance(created_at_value, str) or len(created_at_value) > 80:
+                    return 400, {
+                        "ok": False,
+                        "error": {"code": "invalid_delivery", "message": "交付参数不正确。"},
+                    }
+                created_at = created_at_value
+            if kind != "baseline":
+                return 400, {
+                    "ok": False,
+                    "error": {"code": "base_upload_required", "message": "增量交付需要上传旧版 .inno-update。"},
+                }
+        else:
+            return 400, {
+                "ok": False,
+                "error": {"code": "invalid_delivery", "message": "交付参数不正确。"},
+            }
+
+        physical = self.delivery_root / f"delivery-{secrets.token_urlsafe(18)}.inno-update"
+
+        def operation(_context):
+            registered_id: str | None = None
+            try:
+                result = self._delivery_builder(
+                    self.vault,
+                    physical,
+                    base_package=base_package,
+                    created_at=created_at,
+                )
+                if not isinstance(result, dict):
+                    raise ValueError("invalid delivery result")
+                safe_kind = result.get("kind")
+                included = result.get("included")
+                deleted = result.get("deleted")
+                if (
+                    safe_kind not in {"baseline", "incremental"}
+                    or not isinstance(included, list)
+                    or not isinstance(deleted, list)
+                ):
+                    raise ValueError("invalid delivery result")
+                if physical.stat().st_size > MAX_DOWNLOAD_BYTES:
+                    raise ValueError("delivery exceeded safe limit")
+                filename = f"英诺资讯-{safe_kind}-{secrets.token_hex(4)}.inno-update"
+                record = self.download_registry.register(
+                    physical,
+                    filename=filename,
+                    content_type="application/zip",
+                )
+                registered_id = record.id
+                return {
+                    "kind": safe_kind,
+                    "base_version": result.get("base_version"),
+                    "target_version": result.get("target_version"),
+                    "included_count": len(included),
+                    "deleted_count": len(deleted),
+                    "package_sha256": record.sha256,
+                    "download_id": record.id,
+                    "filename": record.filename,
+                    "size": record.size,
+                }
+            finally:
+                if base_package is not None:
+                    base_package.unlink(missing_ok=True)
+                if registered_id is None:
+                    physical.unlink(missing_ok=True)
+
+        try:
+            job_id = self.job_manager.submit("delivery", operation)
+        except JobBusyError:
+            if base_package is not None:
+                base_package.unlink(missing_ok=True)
+            return 409, {
+                "ok": False,
+                "error": {"code": "job_busy", "message": "已有任务正在运行，请稍后再试。"},
+            }
+        return 202, {"ok": True, "job_id": job_id, "kind": kind}
+
+    def _download(self, download_id: str) -> tuple[int, object]:
+        if self.download_registry is None:
+            return 410, {
+                "ok": False,
+                "error": {"code": "download_gone", "message": "该下载已失效，请重新生成。"},
+            }
+        try:
+            claim = self.download_registry.claim(download_id)
+        except DownloadGoneError:
+            return 410, {
+                "ok": False,
+                "error": {"code": "download_gone", "message": "该下载已失效，请重新生成。"},
+            }
+        return 200, FileResponse(
+            path=claim.path,
+            filename=claim.filename,
+            content_type=claim.content_type,
+            size=claim.size,
+            sha256=claim.sha256,
+            on_complete=lambda success: self.download_registry.complete(
+                download_id, success
+            ),
+        )
+
+    def _draft_preview(self, payload: object) -> tuple[int, dict]:
+        if self.draft_upload_manager is None:
+            return 503, {
+                "ok": False,
+                "error": {"code": "drafts_unavailable", "message": "稿件收件箱暂时不可用。"},
+            }
+        if not isinstance(payload, UploadedFile):
+            return 400, {
+                "ok": False,
+                "error": {"code": "invalid_draft_upload", "message": "请选择一个 .inno-drafts 文件。"},
+            }
+        try:
+            return 200, self.draft_upload_manager.preview(payload.filename, payload.path)
+        except DraftUploadError as error:
+            return error.status, {
+                "ok": False,
+                "error": {"code": error.code, "message": error.message},
+            }
+
+    def _accept_draft(self, receipt_id: str, payload: object) -> tuple[int, dict]:
+        if self.draft_upload_manager is None:
+            return 503, {
+                "ok": False,
+                "error": {"code": "drafts_unavailable", "message": "稿件收件箱暂时不可用。"},
+            }
+        confirm = payload.get("confirm") if isinstance(payload, dict) else None
+        try:
+            return 200, self.draft_upload_manager.accept(
+                receipt_id,
+                self.vault,
+                confirm=confirm,
+            )
+        except DraftUploadError as error:
+            return error.status, {
+                "ok": False,
+                "error": {"code": error.code, "message": error.message},
+            }
+
     def _library_summary(self) -> tuple[int, dict]:
         if not self.vault.exists() or not self.vault.is_dir():
             return 200, {
@@ -535,6 +791,16 @@ class WebController:
             return self._preflight(_payload)
         if path == "/api/collection" and method == "POST":
             return self._start_collection(_payload)
+        if path == "/api/delivery" and method == "POST":
+            return self._start_delivery(_payload)
+        delivery_match = _DELIVERY_ROUTE.fullmatch(path)
+        if delivery_match is not None and method in {"GET", "HEAD"}:
+            return self._download(delivery_match.group(1))
+        if path == "/api/drafts/preview" and method == "POST":
+            return self._draft_preview(_payload)
+        draft_match = _DRAFT_ACCEPT_ROUTE.fullmatch(path)
+        if draft_match is not None and method == "POST":
+            return self._accept_draft(draft_match.group(1), _payload)
         job_match = _JOB_ROUTE.fullmatch(path)
         if job_match is not None:
             job_id, action = job_match.groups()

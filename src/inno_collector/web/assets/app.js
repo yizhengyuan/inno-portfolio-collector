@@ -5,6 +5,7 @@ const initialState = Object.freeze({
   capabilities: [],
   preflightPassed: false,
   activeJob: "",
+  draftReceipt: "",
   error: "",
 });
 
@@ -68,6 +69,11 @@ export const render = (state) => {
     state.capabilities.includes("collection") && state.preflightPassed && !state.activeJob
   );
   document.querySelector("#collection-cancel").disabled = !state.activeJob;
+  document.querySelector("#delivery-baseline").disabled = !state.capabilities.includes("delivery");
+  const draftConfirmed = document.querySelector("#draft-confirm").checked;
+  document.querySelector("#draft-accept").disabled = !(
+    state.capabilities.includes("drafts") && state.draftReceipt && draftConfirmed
+  );
 };
 
 const store = createStore(initialState);
@@ -188,6 +194,74 @@ const cancelCollection = async () => {
   }
 };
 
+const pollDelivery = async (jobId) => {
+  const message = document.querySelector("#delivery-message");
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    message.textContent = `交付任务：${job.status}`;
+    if (["queued", "running"].includes(job.status)) {
+      setTimeout(() => pollDelivery(jobId), 1000);
+      return;
+    }
+    if (["succeeded", "partial"].includes(job.status) && job.result?.download_id) {
+      const link = document.querySelector("#delivery-download");
+      link.href = `/api/delivery/${job.result.download_id}/download`;
+      link.download = job.result.filename || "英诺资讯.inno-update";
+      link.hidden = false;
+      message.textContent = `已生成 ${job.result.kind}，SHA-256：${job.result.package_sha256}`;
+    }
+  } catch (error) {
+    message.textContent = error.message || "交付任务不可用";
+  }
+};
+
+const submitDelivery = async (payload) => {
+  const submitted = payload instanceof File
+    ? await uploadFile("/api/delivery", payload)
+    : await writeJson("/api/delivery", payload);
+  document.querySelector("#delivery-download").hidden = true;
+  pollDelivery(submitted.job_id);
+};
+
+const uploadFile = (path, file) => {
+  const form = new FormData();
+  form.append("file", file, file.name);
+  return api(path, {
+    method: "POST",
+    headers: { "X-Inno-Session": sessionToken },
+    body: form,
+  });
+};
+
+const previewDraft = async (file) => {
+  const preview = document.querySelector("#draft-preview");
+  try {
+    const result = await uploadFile("/api/drafts/preview", file);
+    const titles = (result.drafts || []).map((draft) => draft.title).join("、");
+    preview.textContent = `共 ${result.draft_count} 篇：${titles || "已通过校验"}`;
+    document.querySelector("#draft-confirm").disabled = false;
+    document.querySelector("#draft-confirm").checked = false;
+    store.setState({ draftReceipt: result.receipt_id });
+  } catch (error) {
+    preview.textContent = error.message || "稿件包预览失败";
+    store.setState({ draftReceipt: "" });
+  }
+};
+
+const acceptDraft = async () => {
+  const receiptId = store.getState().draftReceipt;
+  if (!receiptId || !document.querySelector("#draft-confirm").checked) return;
+  const preview = document.querySelector("#draft-preview");
+  try {
+    const result = await writeJson(`/api/drafts/${receiptId}/accept`, { confirm: true });
+    preview.textContent = `已收录 ${result.created} 篇，冲突并列 ${result.conflicts} 篇。`;
+    document.querySelector("#draft-confirm").disabled = true;
+    store.setState({ draftReceipt: "" });
+  } catch (error) {
+    preview.textContent = error.message || "稿件收录失败";
+  }
+};
+
 const bootstrap = async () => {
   try {
     const payload = await api("/api/bootstrap");
@@ -209,4 +283,19 @@ document.querySelector("#login-start").addEventListener("click", startLogin);
 document.querySelector("#preflight-start").addEventListener("click", runPreflight);
 document.querySelector("#collection-start").addEventListener("click", startCollection);
 document.querySelector("#collection-cancel").addEventListener("click", cancelCollection);
+document.querySelector("#delivery-baseline").addEventListener("click", () => {
+  submitDelivery({ kind: "baseline" }).catch((error) => {
+    document.querySelector("#delivery-message").textContent = error.message || "无法生成交付包";
+  });
+});
+document.querySelector("#delivery-base-file").addEventListener("change", (event) => {
+  const file = event.target.files?.[0];
+  if (file) submitDelivery(file).catch(() => {});
+});
+document.querySelector("#draft-file").addEventListener("change", (event) => {
+  const file = event.target.files?.[0];
+  if (file) previewDraft(file);
+});
+document.querySelector("#draft-confirm").addEventListener("change", () => render(store.getState()));
+document.querySelector("#draft-accept").addEventListener("click", acceptDraft);
 bootstrap();

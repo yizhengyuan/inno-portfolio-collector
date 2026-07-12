@@ -41,6 +41,9 @@ button { padding: 11px 16px; border: 0; border-radius: 10px; color: #fff; backgr
 button:disabled { color: #929c97; background: #e4e8e5; cursor: not-allowed; }
 .button-row { display: flex; flex-wrap: wrap; gap: 8px; }
 .secondary-button { color: var(--green); background: var(--green-soft); }
+.file-button, .download-link { display: inline-flex; align-items: center; padding: 10px 14px; border-radius: 10px; color: var(--green); background: var(--green-soft); font-weight: 700; cursor: pointer; text-decoration: none; }
+.inline-message { margin: 12px 0 0; color: var(--muted); font-size: 13px; }
+.confirm-row { display: flex; align-items: center; gap: 8px; margin: 12px 0; color: var(--muted); font-size: 13px; }
 
 .metric-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin: 18px 0; }
 .metric-grid article, .panel { padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); }
