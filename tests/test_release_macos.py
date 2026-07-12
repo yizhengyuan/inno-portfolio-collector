@@ -87,6 +87,7 @@ class MacReleaseTests(unittest.TestCase):
             output = root / "release"
             events: list[str] = []
             commands: list[list[str]] = []
+            dmg_layouts: list[tuple[set[str], str]] = []
 
             def signed_helpers(identity: str, destination: Path, runner):
                 events.append("helpers-signed")
@@ -108,6 +109,11 @@ class MacReleaseTests(unittest.TestCase):
                 if command[0] == "codesign" and "--sign" in command:
                     events.append("outer-signed" if command[-1].endswith(".app") else "swift-signed")
                 if command[0] == "hdiutil":
+                    source = Path(command[command.index("-srcfolder") + 1])
+                    dmg_layouts.append((
+                        {item.name for item in source.iterdir()},
+                        (source / "Applications").readlink().as_posix(),
+                    ))
                     Path(command[-1]).write_bytes(("dmg:" + command[-1]).encode())
                 if command[:3] == ["xcrun", "notarytool", "submit"]:
                     return subprocess.CompletedProcess(command, 0, json.dumps({"status": "Accepted"}), "")
@@ -132,6 +138,12 @@ class MacReleaseTests(unittest.TestCase):
             self.assertLess(events.index("swift-signed"), events.index("outer-signed"))
             dmgs = sorted(output.glob("*.dmg"))
             self.assertEqual(len(dmgs), 2)
+            self.assertEqual(len(dmg_layouts), 2)
+            for names, applications_target in dmg_layouts:
+                self.assertEqual(len(names), 2)
+                self.assertIn("Applications", names)
+                self.assertEqual(applications_target, "/Applications")
+                self.assertTrue(any(name.endswith(".app") for name in names))
             submissions = [command for command in commands if command[:3] == ["xcrun", "notarytool", "submit"]]
             self.assertEqual(len(submissions), 2)
             self.assertTrue(all("--wait" in command for command in submissions))
