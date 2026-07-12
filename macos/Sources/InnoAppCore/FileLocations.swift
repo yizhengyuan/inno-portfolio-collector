@@ -30,6 +30,8 @@ public struct AppLocations: Equatable, Sendable {
     public let inbox: URL
     public let helper: URL
     public let projectsConfig: URL?
+    public let mooreHelper: URL?
+    public let exporterRuntime: URL?
 
     public static func resolve(
         role: AppRole,
@@ -44,6 +46,9 @@ public struct AppLocations: Equatable, Sendable {
             .standardizedFileURL
         let helper = plugins
             .appendingPathComponent(role.helperName, isDirectory: false)
+            .standardizedFileURL
+        let mooreHelper = plugins
+            .appendingPathComponent("MooreExporterHelper", isDirectory: false)
             .standardizedFileURL
         guard helper.deletingLastPathComponent() == plugins else {
             throw AppLocationsError.unsafeBundlePath
@@ -64,6 +69,10 @@ public struct AppLocations: Equatable, Sendable {
             helper: helper,
             projectsConfig: role == .collector
                 ? resources.appendingPathComponent("config/projects.json", isDirectory: false)
+                : nil,
+            mooreHelper: role == .collector ? mooreHelper : nil,
+            exporterRuntime: role == .collector
+                ? supportRoot.appendingPathComponent("ExporterRuntime", isDirectory: true)
                 : nil
         )
     }
