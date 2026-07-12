@@ -340,7 +340,10 @@ public final class LocalWebLauncher: LocalWebLaunching {
     private static let trustedHost = "127.0.0.1"
     private static let readyProtocol = 1
     private static let defaultMaximumReadyBytes = 1_024
-    private static let defaultReadyTimeout: TimeInterval = 20
+    // A first PyInstaller launch may need to unpack the embedded Python
+    // runtime on a slower Mac.  Keep the wait bounded, but comfortably above
+    // the 20–30 second cold starts observed during packaged-app verification.
+    static let defaultReadyTimeout: TimeInterval = 90
 
     private let executable: URL
     private let pluginsDirectory: URL

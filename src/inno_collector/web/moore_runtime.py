@@ -5,6 +5,8 @@ import re
 from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
+from threading import RLock
+from time import monotonic, sleep
 from types import ModuleType
 from typing import Protocol
 from urllib.parse import urlsplit
@@ -30,6 +32,8 @@ MAX_ACCOUNT_NAME_LENGTH = 200
 MAX_FAKEID_LENGTH = 512
 MAX_AVATAR_URL_LENGTH = 2048
 MAX_DESCRIPTION_LENGTH = 4096
+AUTH_CACHE_TTL_SECONDS = 5.0
+AUTH_RETRY_DELAY_SECONDS = 0.05
 _LOGIN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _QRCODE_TYPES = {
     b"\x89PNG\r\n\x1a\n": "image/png",
@@ -313,6 +317,12 @@ class MooreRuntime:
         self._runtime_input = candidate.absolute()
         self.runtime_dir = candidate.resolve(strict=True)
         self._functions = functions
+        # The local HTTP server handles independent browser requests on
+        # separate threads, while the bundled exporter shares one SQLite
+        # runtime and login profile.  Keep upstream calls single-file so a
+        # page bootstrap cannot race a preflight or login operation.
+        self._operation_lock = RLock()
+        self._auth_cache: dict[str, tuple[float, dict]] = {}
         self._login_sessions: dict[str, _LoginSession] = {}
         self._discovery_errors: dict[str, str] = {}
 
@@ -323,12 +333,13 @@ class MooreRuntime:
         return self._functions
 
     def _call(self, operation, *arguments):
-        try:
-            return operation(self.runtime_dir, *arguments)
-        except ExporterCommandError:
-            raise
-        except Exception:
-            raise ExporterCommandError("local exporter operation failed") from None
+        with self._operation_lock:
+            try:
+                return operation(self.runtime_dir, *arguments)
+            except ExporterCommandError:
+                raise
+            except Exception:
+                raise ExporterCommandError("local exporter operation failed") from None
 
     def _registered_session(self, login_id: str) -> _LoginSession:
         if not isinstance(login_id, str) or not _LOGIN_ID_RE.fullmatch(login_id):
@@ -442,7 +453,11 @@ class MooreRuntime:
 
     def complete_login(self, login_id: str, profile: str = "") -> dict:
         session = self._registered_session(login_id)
-        payload = self._call(self.functions.complete_qr_login, login_id, profile)
+        with self._operation_lock:
+            # Never let a previously cached valid result survive a completed
+            # (or malformed) login transition.
+            self._auth_cache.clear()
+            payload = self._call(self.functions.complete_qr_login, login_id, profile)
         if not isinstance(payload, dict):
             raise ExporterCommandError("exporter returned invalid login completion")
         safe: dict = {}
@@ -477,20 +492,43 @@ class MooreRuntime:
         return safe
 
     def auth_check(self, profile: str = "") -> dict:
-        payload = self._call(self.functions.auth_check, profile)
-        payload = validate_success_payload(payload)
-        safe: dict = {"ok": True}
-        for field in ("status", "profile", "expires_at"):
-            if field in payload:
-                if not isinstance(payload[field], str):
+        with self._operation_lock:
+            now = monotonic()
+            cached = self._auth_cache.get(profile)
+            if cached is not None and now < cached[0]:
+                return dict(cached[1])
+            self._auth_cache.pop(profile, None)
+
+            payload = self._call(self.functions.auth_check, profile)
+            if (
+                isinstance(payload, dict)
+                and payload.get("ok") is False
+                and payload.get("status") == "error"
+            ):
+                # The upstream adapter uses this exact status for temporary
+                # network/SQLite failures. Retry it once, but never retry an
+                # expired login or a malformed response.
+                sleep(AUTH_RETRY_DELAY_SECONDS)
+                payload = self._call(self.functions.auth_check, profile)
+
+            payload = validate_success_payload(payload)
+            safe: dict = {"ok": True}
+            for field in ("status", "profile", "expires_at"):
+                if field in payload:
+                    if not isinstance(payload[field], str):
+                        raise ExporterCommandError("exporter returned invalid auth status")
+                    safe[field] = payload[field]
+            if "code" in payload:
+                code = payload["code"]
+                if code is not None and type(code) not in {int, str}:
                     raise ExporterCommandError("exporter returned invalid auth status")
-                safe[field] = payload[field]
-        if "code" in payload:
-            code = payload["code"]
-            if code is not None and type(code) not in {int, str}:
-                raise ExporterCommandError("exporter returned invalid auth status")
-            safe["code"] = code
-        return safe
+                safe["code"] = code
+            if safe.get("status") == "valid":
+                self._auth_cache[profile] = (
+                    now + AUTH_CACHE_TTL_SECONDS,
+                    dict(safe),
+                )
+            return safe
 
     def _search_page(self, keyword: str, begin: int) -> list[dict]:
         payload = self._call(

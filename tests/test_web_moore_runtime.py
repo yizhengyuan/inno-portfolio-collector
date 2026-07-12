@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import ModuleType
@@ -44,6 +45,7 @@ class FakeMooreFunctions:
             "expires_at": "2026-07-16T00:00:00+00:00",
             "token": "must-not-leak",
         }
+        self.auth_calls = 0
         self.account_rows: list[dict] = [{"id": 11, "nickname": "Alpha"}]
         self.search_payloads: dict[object, object] = {}
         self.search_calls: list[tuple[str, int, int, str]] = []
@@ -75,6 +77,7 @@ class FakeMooreFunctions:
         return self.complete_payload
 
     def auth_check(self, base: Path, profile: str) -> dict:
+        self.auth_calls += 1
         return self.auth_payload
 
     def list_accounts(self, base: Path) -> list[dict]:
@@ -724,6 +727,132 @@ class MooreRuntimeTests(unittest.TestCase):
             self.runtime.auth_check()
 
         self.assertEqual(str(raised.exception), "local exporter operation failed")
+
+    def test_parallel_http_operations_are_serialized_for_shared_runtime(self) -> None:
+        first_entered = threading.Event()
+        second_attempted = threading.Event()
+        accounts_entered = threading.Event()
+        overlapping = threading.Event()
+        release = threading.Event()
+
+        def slow_auth(_base: Path, _profile: str) -> dict:
+            first_entered.set()
+            release.wait(2)
+            return {"ok": True, "status": "valid"}
+
+        def guarded_accounts(_base: Path) -> list[dict]:
+            accounts_entered.set()
+            if not release.is_set():
+                overlapping.set()
+            return []
+
+        def second_call() -> list[dict]:
+            second_attempted.set()
+            return self.runtime.accounts()
+
+        self.functions.auth_check = slow_auth  # type: ignore[method-assign]
+        self.functions.list_accounts = guarded_accounts  # type: ignore[method-assign]
+        first = threading.Thread(target=self.runtime.auth_check)
+        second = threading.Thread(target=second_call)
+        first.start()
+        self.assertTrue(first_entered.wait(1))
+        second.start()
+        self.assertTrue(second_attempted.wait(1))
+        self.assertFalse(accounts_entered.wait(0.2))
+        release.set()
+        first.join(2)
+        second.join(2)
+
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertTrue(accounts_entered.is_set())
+        self.assertFalse(overlapping.is_set())
+
+    def test_valid_auth_is_cached_briefly_and_returns_defensive_copies(self) -> None:
+        with patch(
+            "inno_collector.web.moore_runtime.monotonic",
+            side_effect=[100.0, 101.0, 106.0],
+        ):
+            first = self.runtime.auth_check()
+            first["status"] = "tampered"
+            second = self.runtime.auth_check()
+            third = self.runtime.auth_check()
+
+        self.assertEqual(second["status"], "valid")
+        self.assertEqual(third["status"], "valid")
+        self.assertEqual(self.functions.auth_calls, 2)
+
+    def test_temporary_auth_error_retries_once_without_leaking_details(self) -> None:
+        calls = 0
+
+        def temporary_then_valid(_base: Path, _profile: str) -> dict:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return {
+                    "ok": False,
+                    "status": "error",
+                    "error": "token=secret /Users/private/login.json",
+                }
+            return {"ok": True, "status": "valid", "code": 0}
+
+        self.functions.auth_check = temporary_then_valid  # type: ignore[method-assign]
+        with patch("inno_collector.web.moore_runtime.sleep") as wait:
+            result = self.runtime.auth_check()
+
+        self.assertEqual(result, {"ok": True, "status": "valid", "code": 0})
+        self.assertEqual(calls, 2)
+        wait.assert_called_once()
+        self.assertNotIn("secret", repr(result))
+        self.assertNotIn("/Users/", repr(result))
+
+    def test_expired_auth_is_not_retried(self) -> None:
+        calls = 0
+
+        def expired(_base: Path, _profile: str) -> dict:
+            nonlocal calls
+            calls += 1
+            return {"ok": False, "status": "expired", "code": 200013}
+
+        self.functions.auth_check = expired  # type: ignore[method-assign]
+        with patch("inno_collector.web.moore_runtime.sleep") as wait:
+            with self.assertRaises(ExporterCommandError):
+                self.runtime.auth_check()
+
+        self.assertEqual(calls, 1)
+        wait.assert_not_called()
+
+    def test_repeated_temporary_auth_error_stays_sanitized(self) -> None:
+        calls = 0
+
+        def unavailable(_base: Path, _profile: str) -> dict:
+            nonlocal calls
+            calls += 1
+            return {
+                "ok": False,
+                "status": "error",
+                "error": "token=secret /Users/private/login.json",
+            }
+
+        self.functions.auth_check = unavailable  # type: ignore[method-assign]
+        with patch("inno_collector.web.moore_runtime.sleep"):
+            with self.assertRaises(ExporterCommandError) as raised:
+                self.runtime.auth_check()
+
+        self.assertEqual(calls, 2)
+        self.assertNotIn("secret", str(raised.exception))
+        self.assertNotIn("/Users/", str(raised.exception))
+
+    def test_completed_login_invalidates_cached_auth(self) -> None:
+        self.runtime.start_login("http://127.0.0.1:3000")
+        self.runtime.auth_check()
+        self.runtime.auth_check()
+        self.assertEqual(self.functions.auth_calls, 1)
+
+        self.runtime.complete_login(LOGIN_ID, "collector")
+        self.runtime.auth_check()
+
+        self.assertEqual(self.functions.auth_calls, 2)
 
     def test_runtime_loader_requires_account_discovery_functions(self) -> None:
         module = ModuleType("wechat_exporter")

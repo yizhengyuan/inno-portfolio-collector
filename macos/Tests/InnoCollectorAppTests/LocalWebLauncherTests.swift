@@ -180,6 +180,12 @@ struct LocalWebLauncherTests {
         #expect(!LocalWebPreview.isEnabled(environment: ["INNO_COLLECTOR_WEB_PREVIEW": "1 "]))
     }
 
+    @Test("packaged cold start has a bounded slow-Mac allowance")
+    func packagedColdStartAllowance() {
+        #expect(LocalWebLauncher.defaultReadyTimeout >= 60)
+        #expect(LocalWebLauncher.defaultReadyTimeout <= 120)
+    }
+
     @Test("production child environment overwrites an inherited launcher PID")
     func controlledLauncherEnvironment() {
         let environment = FoundationWebProcess.controlledEnvironment(
