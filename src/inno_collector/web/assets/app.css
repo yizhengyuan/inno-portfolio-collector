@@ -49,6 +49,14 @@ button:disabled { color: #929c97; background: #e4e8e5; cursor: not-allowed; }
 .panel { min-height: 208px; }
 .panel button { margin-top: 12px; }
 .wide-panel { min-height: 0; margin-top: 14px; }
+.login-session { display: grid; grid-template-columns: 132px 1fr; align-items: center; gap: 18px; margin: 16px 0; padding: 14px; border-radius: 12px; background: var(--paper); }
+.login-session img { width: 132px; height: 132px; object-fit: contain; border-radius: 8px; background: #fff; }
+.login-session p { margin: 0; color: var(--ink); font-weight: 700; }
+.table-wrap { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; font-size: 13px; }
+th, td { padding: 11px 9px; border-bottom: 1px solid var(--line); text-align: left; white-space: nowrap; }
+th { color: var(--muted); font-size: 11px; letter-spacing: .06em; }
+td:last-child { min-width: 180px; white-space: normal; }
 .notice { padding: 12px 14px; border-radius: 10px; }
 .notice.error { color: #8a2f2f; background: #fbeaea; }
 

@@ -1,23 +1,48 @@
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from pathlib import Path
 
 from .. import __version__
+from ..config import load_projects
 from ..diagnostics import sanitize_diagnostic
+from ..exporter import ExporterCommandError
+from ..models import PipelineRunResult, ProjectAccount
 from ..package import lint_vault
+from ..pipeline import (
+    CollectionPipeline,
+    PipelineAuthenticationError,
+    PipelineConfigurationError,
+)
 from .responses import WebResponse
 
 
 Linter = Callable[[Path], dict[str, object]]
 BooleanProvider = Callable[[], bool]
 JobProvider = Callable[[], dict[str, object] | None]
+PreflightRunner = Callable[[tuple[ProjectAccount, ...], str], PipelineRunResult]
 _ASSET_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8", True),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8", False),
     "/assets/app.js": ("app.js", "text/javascript; charset=utf-8", False),
 }
 _MAX_ASSET_BYTES = 1 << 20
+_LOGIN_ROUTE = re.compile(
+    r"^/api/login/([0-9a-f]{32})/(qrcode|status|complete)$"
+)
+_DEFAULT_MOORE_BASE_URL = "https://down.mptext.top"
+_LOGIN_MESSAGES = {
+    "waiting_for_scan": "请使用微信扫描二维码。",
+    "scanned_waiting_confirm": "已扫码，请在微信中确认登录。",
+    "confirmed": "微信已确认，正在完成本机登录。",
+    "complete": "登录已完成，只在这台 Mac 上保存。",
+    "expired": "二维码已过期，请重新生成。",
+    "account_not_bound_email": "该微信账号未绑定可用的公众号后台账号。",
+    "cancelled": "登录已取消，请重新开始。",
+    "failed": "登录失败，请稍后重新尝试。",
+    "unknown": "暂时无法确认登录状态，请稍后重试。",
+}
 
 
 def _not_found() -> tuple[int, dict]:
@@ -36,12 +61,37 @@ class WebController:
         recent_job: JobProvider | None = None,
         linter: Linter = lint_vault,
         assets_root: Path | None = None,
+        moore_runtime: object | None = None,
+        projects_path: Path | None = None,
+        runtime_dir: Path | None = None,
+        preflight_runner: PreflightRunner | None = None,
     ) -> None:
         self.vault = Path(vault)
-        self._authenticated = authenticated or (lambda: False)
+        self.moore_runtime = moore_runtime
+        if authenticated is not None:
+            self._authenticated = authenticated
+        elif moore_runtime is not None:
+            self._authenticated = self._runtime_authenticated
+        else:
+            self._authenticated = lambda: False
         self._recent_job = recent_job or (lambda: None)
         self._linter = linter
         self.assets_root = assets_root or Path(__file__).with_name("assets")
+        self.projects_path = projects_path or (
+            Path(__file__).with_name("resources") / "projects.json"
+        )
+        self.runtime_dir = runtime_dir or self.vault.parents[1]
+        self._preflight_runner = preflight_runner
+
+    def _runtime_authenticated(self) -> bool:
+        if self.moore_runtime is None:
+            return False
+        payload = self.moore_runtime.auth_check()
+        return (
+            isinstance(payload, dict)
+            and payload.get("ok") is True
+            and payload.get("status") == "valid"
+        )
 
     def _safe_recent_job(self) -> dict | None:
         try:
@@ -75,7 +125,178 @@ class WebController:
             "version": __version__,
             "authenticated": authenticated,
             "recent_job": self._safe_recent_job(),
-            "capabilities": ["read_library"],
+            "capabilities": (
+                ["read_library", "login", "preflight"]
+                if self.moore_runtime is not None or self._preflight_runner is not None
+                else ["read_library"]
+            ),
+        }
+
+    def _login_error(self, *, unavailable: bool = False) -> tuple[int, dict]:
+        return (503 if unavailable else 409), {
+            "ok": False,
+            "error": {
+                "code": "login_service_unavailable" if unavailable else "login_unavailable",
+                "message": (
+                    "本机登录服务暂时不可用，请稍后重试。"
+                    if unavailable
+                    else "当前登录会话不可用，请重新开始登录。"
+                ),
+            },
+        }
+
+    def _start_login(self) -> tuple[int, dict]:
+        if self.moore_runtime is None:
+            return self._login_error(unavailable=True)
+        try:
+            payload = self.moore_runtime.start_login(_DEFAULT_MOORE_BASE_URL)
+        except (ExporterCommandError, OSError, RuntimeError):
+            return self._login_error(unavailable=True)
+        if not isinstance(payload, dict):
+            return self._login_error(unavailable=True)
+        safe = {
+            field: payload[field]
+            for field in ("login_id", "expires_at", "qrcode_content_type")
+            if field in payload
+        }
+        return 200, safe
+
+    def _login_action(
+        self,
+        login_id: str,
+        action: str,
+        payload: object,
+    ) -> tuple[int, object] | WebResponse:
+        if self.moore_runtime is None:
+            return self._login_error(unavailable=True)
+        try:
+            if action == "qrcode":
+                body, content_type = self.moore_runtime.read_qrcode(login_id)
+                if not isinstance(body, bytes) or content_type not in {
+                    "image/png",
+                    "image/jpeg",
+                    "image/gif",
+                    "image/webp",
+                }:
+                    return self._login_error()
+                return WebResponse(200, body, content_type)
+            if action == "status":
+                result = self.moore_runtime.login_status(login_id)
+                if not isinstance(result, dict):
+                    return self._login_error()
+                status = str(result.get("status") or "unknown")
+                return 200, {
+                    field: result[field]
+                    for field in (
+                        "login_id",
+                        "status",
+                        "status_code",
+                        "acct_size",
+                        "ready_to_complete",
+                    )
+                    if field in result
+                } | {"message_zh": _LOGIN_MESSAGES.get(status, _LOGIN_MESSAGES["unknown"])}
+            if action == "complete":
+                profile = ""
+                if isinstance(payload, dict) and isinstance(payload.get("profile"), str):
+                    profile = payload["profile"][:80]
+                result = self.moore_runtime.complete_login(login_id, profile)
+                if not isinstance(result, dict):
+                    return self._login_error()
+                allowed = {"profile_id", "display_name", "expires_at", "nickname", "avatar"}
+                return 200, {key: value for key, value in result.items() if key in allowed}
+        except (ExporterCommandError, OSError, RuntimeError):
+            return self._login_error()
+        return _not_found()
+
+    def _run_preflight(
+        self,
+        projects: tuple[ProjectAccount, ...],
+        since: str,
+    ) -> PipelineRunResult:
+        if self._preflight_runner is not None:
+            return self._preflight_runner(projects, since)
+        if self.moore_runtime is None:
+            raise PipelineAuthenticationError("local login is unavailable")
+        return CollectionPipeline(
+            self.moore_runtime,
+            runtime_dir=self.runtime_dir,
+        ).run(projects, since=since, dry_run=True)
+
+    def _preflight(self, payload: object) -> tuple[int, dict]:
+        if not isinstance(payload, dict):
+            return 400, {
+                "ok": False,
+                "error": {"code": "invalid_request", "message": "请求格式不正确。"},
+            }
+        since = payload.get("since", "2026-01-01")
+        if since != "2026-01-01":
+            return 400, {
+                "ok": False,
+                "error": {
+                    "code": "invalid_date_filter",
+                    "message": "当前采集范围固定从 2026-01-01 开始。",
+                },
+            }
+        try:
+            projects = load_projects(self.projects_path)
+        except (OSError, UnicodeError, ValueError):
+            return 500, {
+                "ok": False,
+                "error": {"code": "invalid_projects", "message": "项目映射资源不可用。"},
+            }
+        try:
+            result = self._run_preflight(projects, since)
+        except PipelineAuthenticationError:
+            rows = [
+                {
+                    "project": project.project,
+                    "account": project.account,
+                    "mapping": "not_checked",
+                    "login": "invalid",
+                    "catalog": 0,
+                    "date_filter": since,
+                    "status": "failed",
+                    "reason": "本机登录已失效，请重新扫码登录。",
+                }
+                for project in projects
+            ]
+            return 200, {"ok": False, "projects": rows, "failed_projects": len(rows)}
+        except (PipelineConfigurationError, OSError, RuntimeError):
+            rows = [
+                {
+                    "project": project.project,
+                    "account": project.account,
+                    "mapping": "not_checked",
+                    "login": "unknown",
+                    "catalog": 0,
+                    "date_filter": since,
+                    "status": "failed",
+                    "reason": "预检暂时无法完成，请稍后重试。",
+                }
+                for project in projects
+            ]
+            return 200, {"ok": False, "projects": rows, "failed_projects": len(rows)}
+
+        rows = []
+        for project_result in result.projects:
+            reason = sanitize_diagnostic(project_result.error, fallback="")
+            rows.append(
+                {
+                    "project": project_result.project,
+                    "account": project_result.account,
+                    "mapping": "failed" if reason.startswith("resolve:") else "matched",
+                    "login": "valid",
+                    "catalog": project_result.discovered,
+                    "date_filter": since,
+                    "status": project_result.status,
+                    "reason": reason,
+                }
+            )
+        return 200, {
+            "ok": result.failed_projects == 0,
+            "projects": rows,
+            "failed_projects": result.failed_projects,
         }
 
     def _library_summary(self) -> tuple[int, dict]:
@@ -138,15 +359,29 @@ class WebController:
         path: str,
         _payload: object,
     ) -> tuple[int, object] | WebResponse:
-        if method not in {"GET", "HEAD"}:
+        if method not in {"GET", "HEAD", "POST"}:
             return 405, {
                 "ok": False,
                 "error": {"code": "method_not_allowed", "message": "Method not allowed."},
             }
-        if path == "/api/bootstrap":
+        if path == "/api/bootstrap" and method in {"GET", "HEAD"}:
             return self._bootstrap()
-        if path == "/api/library/summary":
+        if path == "/api/library/summary" and method in {"GET", "HEAD"}:
             return self._library_summary()
-        if path in _ASSET_ROUTES:
+        if path == "/api/login/start" and method == "POST":
+            return self._start_login()
+        if path == "/api/preflight" and method == "POST":
+            return self._preflight(_payload)
+        login_match = _LOGIN_ROUTE.fullmatch(path)
+        if login_match is not None:
+            login_id, action = login_match.groups()
+            expected_method = "POST" if action == "complete" else "GET"
+            if method != expected_method:
+                return 405, {
+                    "ok": False,
+                    "error": {"code": "method_not_allowed", "message": "Method not allowed."},
+                }
+            return self._login_action(login_id, action, _payload)
+        if path in _ASSET_ROUTES and method in {"GET", "HEAD"}:
             return self._asset(path)
         return _not_found()

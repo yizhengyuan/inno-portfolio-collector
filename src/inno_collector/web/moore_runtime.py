@@ -12,6 +12,7 @@ from ..exporter import (
     ExporterCommandError,
     validate_download_payload,
     validate_object_rows,
+    resolve_exact_account,
     validate_success_payload,
     validate_sync_payload,
 )
@@ -106,8 +107,14 @@ class MooreRuntime:
         candidate.mkdir(parents=True, exist_ok=True)
         self._runtime_input = candidate.absolute()
         self.runtime_dir = candidate.resolve(strict=True)
-        self.functions = functions if functions is not None else load_moore_functions()
+        self._functions = functions
         self._login_sessions: dict[str, _LoginSession] = {}
+
+    @property
+    def functions(self) -> MooreFunctions:
+        if self._functions is None:
+            self._functions = load_moore_functions()
+        return self._functions
 
     def _call(self, operation, *arguments):
         try:
@@ -266,7 +273,7 @@ class MooreRuntime:
     def auth_check(self, profile: str = "") -> dict:
         payload = self._call(self.functions.auth_check, profile)
         payload = validate_success_payload(payload)
-        safe: dict = {}
+        safe: dict = {"ok": True}
         for field in ("status", "profile", "expires_at"):
             if field in payload:
                 if not isinstance(payload[field], str):
@@ -278,6 +285,9 @@ class MooreRuntime:
                 raise ExporterCommandError("exporter returned invalid auth status")
             safe["code"] = code
         return safe
+
+    def resolve_exact(self, project, rows: list[dict]) -> dict:
+        return resolve_exact_account(project, rows)
 
     def accounts(self) -> list[dict]:
         rows = self._call(self.functions.list_accounts)

@@ -1,0 +1,2 @@
+"""Packaged immutable application resources."""
+

@@ -161,6 +161,29 @@ def validate_download_payload(payload: object) -> dict:
     return payload
 
 
+def resolve_exact_account(project: ProjectAccount, rows: list[dict]) -> dict:
+    expected_nicknames = {
+        value.strip().casefold()
+        for value in (project.account, *project.aliases)
+        if value.strip()
+    }
+    expected_alias = project.wechat_id.strip().casefold()
+    matches = []
+    for row in rows:
+        nickname = str(row.get("nickname", "") or "").strip().casefold()
+        alias = str(row.get("alias", "") or "").strip().casefold()
+        if nickname in expected_nicknames or (
+            expected_alias and alias == expected_alias
+        ):
+            matches.append(row)
+
+    if len(matches) != 1:
+        raise ExporterCommandError(
+            f"expected one exact account match for {project.project}, got {len(matches)}"
+        )
+    return matches[0]
+
+
 class MooreExporterAdapter:
     def __init__(
         self,
@@ -266,23 +289,4 @@ class MooreExporterAdapter:
         )
 
     def resolve_exact(self, project: ProjectAccount, rows: list[dict]) -> dict:
-        expected_nicknames = {
-            value.strip().casefold()
-            for value in (project.account, *project.aliases)
-            if value.strip()
-        }
-        expected_alias = project.wechat_id.strip().casefold()
-        matches = []
-        for row in rows:
-            nickname = str(row.get("nickname", "") or "").strip().casefold()
-            alias = str(row.get("alias", "") or "").strip().casefold()
-            if nickname in expected_nicknames or (
-                expected_alias and alias == expected_alias
-            ):
-                matches.append(row)
-
-        if len(matches) != 1:
-            raise ExporterCommandError(
-                f"expected one exact account match for {project.project}, got {len(matches)}"
-            )
-        return matches[0]
+        return resolve_exact_account(project, rows)

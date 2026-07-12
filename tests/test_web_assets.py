@@ -29,7 +29,8 @@ class WebAssetContractTests(unittest.TestCase):
         javascript = (ASSETS / "app.js").read_text(encoding="utf-8")
 
         self.assertEqual(javascript.count("fetch("), 1)
-        self.assertIn('fetch("/api/bootstrap"', javascript)
+        self.assertIn('api("/api/bootstrap")', javascript)
+        self.assertIn("bootstrap();", javascript)
         self.assertNotIn("http://", javascript)
         self.assertNotIn("https://", javascript)
         self.assertNotIn("//cdn", javascript)
@@ -57,7 +58,7 @@ class WebAssetContractTests(unittest.TestCase):
     def test_package_data_declares_web_assets(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 
-        self.assertIn('"inno_collector.web" = ["assets/*"]', pyproject)
+        self.assertIn('"inno_collector.web" = ["assets/*", "resources/*"]', pyproject)
 
 
 if __name__ == "__main__":

@@ -213,6 +213,7 @@ class MooreRuntimeTests(unittest.TestCase):
 
     def test_direct_collection_calls_preserve_validation(self) -> None:
         self.assertEqual(self.runtime.auth_check()["status"], "valid")
+        self.assertIs(self.runtime.auth_check()["ok"], True)
         self.assertNotIn("token", self.runtime.auth_check())
         self.assertEqual(self.runtime.accounts()[0]["id"], 11)
         self.assertEqual(self.runtime.sync(11)["upserted_count"], 2)

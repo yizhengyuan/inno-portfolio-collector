@@ -322,11 +322,16 @@ def main(argv: list[str] | None = None) -> int:
     ).expanduser()
     vault = support_root / "Runtime" / "vault" / "英诺被投项目资讯库"
     from .controller import WebController
+    from .moore_runtime import MooreRuntime
 
     server = LocalWebServer(
         host=arguments.host,
         port=arguments.port,
-        application=WebController(vault),
+        application=WebController(
+            vault,
+            moore_runtime=MooreRuntime(support_root / "ExporterRuntime"),
+            runtime_dir=support_root / "Runtime",
+        ),
     )
     try:
         server.serve_forever()

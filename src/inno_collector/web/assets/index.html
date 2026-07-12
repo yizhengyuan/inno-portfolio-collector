@@ -41,7 +41,7 @@
           <h2 id="welcome-title">一个页面完成采集、核对与交付</h2>
           <p>当前版本先开放只读概览。登录、预检和采集会在安全检查完成后逐步启用。</p>
         </div>
-        <button type="button" data-write-action disabled>开始扫码登录</button>
+        <button id="login-start" type="button" data-write-action="login" disabled>开始扫码登录</button>
       </section>
 
       <section class="metric-grid" aria-label="状态摘要">
@@ -54,7 +54,11 @@
         <article id="login" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">01</p><h2>登录与预检</h2></div><span>未开放</span></div>
           <p>在这个页面扫码，并逐项确认 10 个公众号的精确映射。</p>
-          <button type="button" data-write-action disabled>运行预检</button>
+          <div id="login-session" class="login-session" hidden>
+            <img id="login-qrcode" alt="微信扫码登录二维码">
+            <p id="login-message">正在生成二维码</p>
+          </div>
+          <button id="preflight-start" type="button" data-write-action="preflight" disabled>运行预检</button>
         </article>
         <article id="collect" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">02</p><h2>采集</h2></div><span>未开放</span></div>
@@ -76,6 +80,15 @@
       <section id="library" class="panel wide-panel">
         <div class="panel-heading"><div><p class="eyebrow">LIBRARY</p><h2>资料库</h2></div><span>只读</span></div>
         <p>现有 Obsidian Vault 保持原样；此页面只读取文章、项目和校验摘要。</p>
+      </section>
+      <section class="panel wide-panel" aria-labelledby="preflight-title">
+        <div class="panel-heading"><div><p class="eyebrow">CHECK</p><h2 id="preflight-title">10 个项目预检结果</h2></div><span id="preflight-state">尚未运行</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>项目</th><th>公众号</th><th>映射</th><th>登录</th><th>目录</th><th>日期</th><th>状态</th><th>原因</th></tr></thead>
+            <tbody id="preflight-rows"><tr><td colspan="8">运行预检后，这里会逐项显示 10 个结果。</td></tr></tbody>
+          </table>
+        </div>
       </section>
       <section id="about" class="panel wide-panel">
         <div class="panel-heading"><div><p class="eyebrow">OPEN SOURCE</p><h2>关于与许可证</h2></div><span>MIT</span></div>

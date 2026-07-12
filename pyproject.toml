@@ -20,4 +20,4 @@ inno-reader-helper = "inno_collector.reader_helper:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-"inno_collector.web" = ["assets/*"]
+"inno_collector.web" = ["assets/*", "resources/*"]
