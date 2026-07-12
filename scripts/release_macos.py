@@ -80,6 +80,13 @@ def _copy_app(source: Path, destination: Path) -> None:
     shutil.copytree(source, destination, symlinks=False)
 
 
+def _stage_dmg_contents(app: Path, destination: Path) -> Path:
+    destination.mkdir()
+    _copy_app(app, destination / app.name)
+    (destination / "Applications").symlink_to("/Applications", target_is_directory=True)
+    return destination
+
+
 def _replace_helpers(apps: dict[str, Path], helpers: dict[str, Path]) -> None:
     rows = (
         (apps["collector"], "InnoCollectorHelper", helpers["collector"]),
@@ -231,10 +238,11 @@ def release(
         artifacts: list[dict[str, object]] = []
         for role, app in staged_apps.items():
             dmg = output / names[role]
+            dmg_source = _stage_dmg_contents(app, stage / f"{role}-dmg")
             _run(
                 [
                     "hdiutil", "create", "-volname", app.stem,
-                    "-srcfolder", str(app), "-format", "UDZO", str(dmg),
+                    "-srcfolder", str(dmg_source), "-format", "UDZO", str(dmg),
                 ],
                 runner=runner,
                 text=True,

@@ -25,6 +25,7 @@ public struct CollectorContentView: View {
         NavigationSplitView {
             List(Section.allCases, selection: $selection) { section in
                 Label(section.rawValue, systemImage: icon(for: section))
+                    .tag(section)
             }
             .navigationTitle("英诺资讯采集")
         } detail: {
