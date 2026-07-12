@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import secrets
@@ -7,6 +8,7 @@ import sys
 import threading
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import IO
 
 from .security import (
@@ -20,9 +22,10 @@ from .security import (
     validate_host_header,
     validate_write_headers,
 )
+from .responses import WebResponse
 
 
-Application = Callable[[str, str, object], tuple[int, object]]
+Application = Callable[[str, str, object], tuple[int, object] | WebResponse]
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
@@ -158,15 +161,6 @@ class _RequestHandler(BaseHTTPRequestHandler):
                 self._send_security_error(error)
                 return
 
-        if method in {"GET", "HEAD"} and self.path == "/":
-            token = self.local_server.session_token
-            body = (
-                "<!doctype html><html><head><meta charset=\"utf-8\">"
-                f"<meta name=\"inno-session-token\" content=\"{token}\">"
-                "<title>Inno Collector</title></head><body></body></html>"
-            ).encode("utf-8")
-            self._send_bytes(200, "text/html; charset=utf-8", body)
-            return
         if method in {"GET", "HEAD"} and self.path == "/health":
             self._send_json(200, {"ok": True, "status": "ready"})
             return
@@ -174,13 +168,36 @@ class _RequestHandler(BaseHTTPRequestHandler):
         try:
             if method in _WRITE_METHODS:
                 with self.local_server.write_lock:
-                    status, response = self.local_server.application(
+                    result = self.local_server.application(
                         method, self.path, payload
                     )
             else:
-                status, response = self.local_server.application(
+                result = self.local_server.application(
                     method, self.path, payload
                 )
+            if isinstance(result, WebResponse):
+                body = result.body
+                if result.inject_session_token:
+                    marker = b"__INNO_SESSION_TOKEN__"
+                    if marker not in body:
+                        raise ValueError("missing session token marker")
+                    body = body.replace(
+                        marker,
+                        self.local_server.session_token.encode("ascii"),
+                        1,
+                    )
+                self._send_bytes(result.status, result.content_type, body)
+                return
+            status, response = result
+            if method in {"GET", "HEAD"} and self.path == "/" and status == 404:
+                token = self.local_server.session_token
+                body = (
+                    "<!doctype html><html><head><meta charset=\"utf-8\">"
+                    f"<meta name=\"inno-session-token\" content=\"{token}\">"
+                    "<title>Inno Collector</title></head><body></body></html>"
+                ).encode("utf-8")
+                self._send_bytes(200, "text/html; charset=utf-8", body)
+                return
             if type(status) is not int or not 100 <= status <= 599:
                 raise ValueError("invalid application status")
             self._send_json(status, response)
@@ -288,8 +305,29 @@ class LocalWebServer:
             self._thread.join(timeout=2)
 
 
-def main() -> int:
-    server = LocalWebServer()
+def _argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Run the local Inno Collector Web server")
+    parser.add_argument("--host", default=LOOPBACK_HOST)
+    parser.add_argument("--port", type=int, default=0)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    arguments = _argument_parser().parse_args(argv)
+    support_root = Path(
+        os.environ.get(
+            "INNO_COLLECTOR_SUPPORT_ROOT",
+            "~/Library/Application Support/com.inno.news.collector",
+        )
+    ).expanduser()
+    vault = support_root / "Runtime" / "vault" / "英诺被投项目资讯库"
+    from .controller import WebController
+
+    server = LocalWebServer(
+        host=arguments.host,
+        port=arguments.port,
+        application=WebController(vault),
+    )
     try:
         server.serve_forever()
     except KeyboardInterrupt:

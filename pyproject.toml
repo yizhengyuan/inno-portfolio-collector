@@ -18,3 +18,6 @@ inno-reader-helper = "inno_collector.reader_helper:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+"inno_collector.web" = ["assets/*"]

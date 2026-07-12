@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="inno-session-token" content="__INNO_SESSION_TOKEN__">
+  <title>英诺资讯采集</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">IN</span>
+        <div><strong>英诺资讯采集</strong><small>Local Collector</small></div>
+      </div>
+      <nav>
+        <a class="active" href="#home">首页</a>
+        <a href="#login">登录与预检</a>
+        <a href="#collect">采集</a>
+        <a href="#library">资料库</a>
+        <a href="#delivery">交付</a>
+        <a href="#drafts">稿件收件箱</a>
+        <a href="#about">关于与许可证</a>
+      </nav>
+      <p class="privacy-note">登录与采集状态只保存在这台 Mac。</p>
+    </aside>
+
+    <main id="home">
+      <header class="page-header">
+        <div><p class="eyebrow">LOCAL WEB COLLECTOR</p><h1>今天的采集工作台</h1></div>
+        <span id="connection-status" class="status-pill">正在连接本机服务</span>
+      </header>
+
+      <noscript><p class="notice error">需要启用 JavaScript 才能读取本机采集状态。</p></noscript>
+      <p id="bootstrap-error" class="notice error" hidden></p>
+
+      <section class="hero-card" aria-labelledby="welcome-title">
+        <div>
+          <p class="eyebrow">安全的本机流程</p>
+          <h2 id="welcome-title">一个页面完成采集、核对与交付</h2>
+          <p>当前版本先开放只读概览。登录、预检和采集会在安全检查完成后逐步启用。</p>
+        </div>
+        <button type="button" data-write-action disabled>开始扫码登录</button>
+      </section>
+
+      <section class="metric-grid" aria-label="状态摘要">
+        <article><span>登录状态</span><strong id="login-state">读取中</strong><small>仅限本机</small></article>
+        <article><span>最近任务</span><strong id="job-state">暂无</strong><small>等待首次采集</small></article>
+        <article><span>资料库</span><strong id="library-state">未载入</strong><small>可在资料库查看详情</small></article>
+      </section>
+
+      <section class="workspace-grid">
+        <article id="login" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">01</p><h2>登录与预检</h2></div><span>未开放</span></div>
+          <p>在这个页面扫码，并逐项确认 10 个公众号的精确映射。</p>
+          <button type="button" data-write-action disabled>运行预检</button>
+        </article>
+        <article id="collect" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">02</p><h2>采集</h2></div><span>未开放</span></div>
+          <p>按项目隔离失败，持续显示文章、附件和校验进度。</p>
+          <button type="button" data-write-action disabled>开始采集</button>
+        </article>
+        <article id="delivery" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">03</p><h2>交付</h2></div><span>未开放</span></div>
+          <p>验证 Obsidian Vault、离线 HTML 看板和安全 ZIP。</p>
+          <button type="button" data-write-action disabled>生成交付包</button>
+        </article>
+        <article id="drafts" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">04</p><h2>稿件收件箱</h2></div><span>只读</span></div>
+          <p>集中查看朋友返回的编辑稿，不共享任何登录凭据。</p>
+          <button type="button" data-write-action disabled>导入稿件包</button>
+        </article>
+      </section>
+
+      <section id="library" class="panel wide-panel">
+        <div class="panel-heading"><div><p class="eyebrow">LIBRARY</p><h2>资料库</h2></div><span>只读</span></div>
+        <p>现有 Obsidian Vault 保持原样；此页面只读取文章、项目和校验摘要。</p>
+      </section>
+      <section id="about" class="panel wide-panel">
+        <div class="panel-heading"><div><p class="eyebrow">OPEN SOURCE</p><h2>关于与许可证</h2></div><span>MIT</span></div>
+        <p>项目保留两个上游 MIT 项目的许可证与署名；文章版权归原作者。</p>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>
