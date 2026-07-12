@@ -34,6 +34,24 @@ private actor RecordingHelper: HelperCalling {
     func recordedCalls() -> [Call] { calls }
 }
 
+@MainActor
+private final class RecordingLoginService: LocalLoginServing {
+    private(set) var openCount = 0
+    private(set) var stopCount = 0
+    var error: LocalLoginError?
+    var cancellation = false
+
+    func open() async throws {
+        openCount += 1
+        if cancellation { throw CancellationError() }
+        if let error { throw error }
+    }
+
+    func stop() {
+        stopCount += 1
+    }
+}
+
 @Suite("Collector view model")
 @MainActor
 struct CollectorViewModelTests {
@@ -42,6 +60,93 @@ struct CollectorViewModelTests {
         applicationSupport: URL(fileURLWithPath: "/tmp/Application Support", isDirectory: true),
         bundleURL: URL(fileURLWithPath: "/Applications/Collector.app", isDirectory: true)
     )
+
+    @Test("opens and stops the local login service")
+    func localLoginLifecycle() async {
+        let login = RecordingLoginService()
+        let model = CollectorViewModel(
+            helper: RecordingHelper(),
+            locations: locations,
+            localLogin: login
+        )
+
+        await model.openLocalLogin()
+        model.stopLocalLogin()
+
+        #expect(login.openCount == 1)
+        #expect(login.stopCount == 1)
+        #expect(model.errorMessage == nil)
+    }
+
+    @Test("maps local login failures to stable Chinese errors")
+    func localLoginErrors() async {
+        let login = RecordingLoginService()
+        login.error = .portInUse
+        let model = CollectorViewModel(
+            helper: RecordingHelper(),
+            locations: locations,
+            localLogin: login
+        )
+
+        await model.openLocalLogin()
+
+        #expect(model.errorMessage == "本地登录端口被占用，请关闭旧后台或重启后重试。")
+    }
+
+    @Test("reports an unavailable login service without starting work")
+    func unavailableLocalLogin() async {
+        let model = CollectorViewModel(
+            helper: RecordingHelper(),
+            locations: locations
+        )
+
+        await model.openLocalLogin()
+
+        #expect(model.errorMessage == "本地登录后台不可用。")
+        #expect(!model.isBusy)
+    }
+
+    @Test(
+        "maps remaining local login failures",
+        arguments: [
+            (LocalLoginError.unavailable, "本地登录后台不可用。"),
+            (LocalLoginError.browserUnavailable, "请在浏览器打开 http://127.0.0.1:18765/。"),
+            (LocalLoginError.launchFailed, "本地登录后台启动失败。"),
+            (LocalLoginError.notReady, "本地登录后台启动失败。"),
+        ]
+    )
+    func remainingLocalLoginErrors(error: LocalLoginError, message: String) async {
+        let login = RecordingLoginService()
+        login.error = error
+        let model = CollectorViewModel(
+            helper: RecordingHelper(),
+            locations: locations,
+            localLogin: login
+        )
+
+        await model.openLocalLogin()
+
+        #expect(model.errorMessage == message)
+        #expect(!model.isBusy)
+    }
+
+    @Test("cancelling local login stops its service without showing an error")
+    func cancelledLocalLogin() async {
+        let login = RecordingLoginService()
+        login.cancellation = true
+        let model = CollectorViewModel(
+            helper: RecordingHelper(),
+            locations: locations,
+            localLogin: login
+        )
+
+        await model.openLocalLogin()
+
+        #expect(login.openCount == 1)
+        #expect(login.stopCount == 1)
+        #expect(model.errorMessage == nil)
+        #expect(!model.isBusy)
+    }
 
     @Test("refresh maps stable summary fields")
     func refresh() async {
