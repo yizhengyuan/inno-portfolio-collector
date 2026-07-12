@@ -15,6 +15,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN_SERVER = os.environ.get("INNO_COLLECTOR_WEB_SERVER")
+FROZEN_READY_TIMEOUT_SECONDS = 90
 
 
 @unittest.skipUnless(
@@ -64,7 +65,15 @@ class FrozenWebServerTests(unittest.TestCase):
             port: int | None = None
             try:
                 assert process.stdout is not None
-                readable, _, _ = select.select([process.stdout], [], [], 20)
+                # Match the packaged launcher allowance: a first PyInstaller
+                # run may spend 20–30 seconds unpacking on a slower Mac, but
+                # the handshake must still arrive within a bounded window.
+                readable, _, _ = select.select(
+                    [process.stdout],
+                    [],
+                    [],
+                    FROZEN_READY_TIMEOUT_SECONDS,
+                )
                 self.assertTrue(readable, "frozen server ready handshake timed out")
                 ready_line = process.stdout.readline(4097)
                 self.assertLessEqual(len(ready_line), 4096)
