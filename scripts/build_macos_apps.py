@@ -185,8 +185,14 @@ def assemble_apps(
         layouts = {
             "collector": (
                 "InnoCollectorApp",
-                ((helpers / "collector/InnoCollectorHelper", "InnoCollectorHelper"),
-                 (helpers / "moore/MooreExporterHelper", "MooreExporterHelper")),
+                (
+                    (helpers / "collector/InnoCollectorHelper", "InnoCollectorHelper"),
+                    (helpers / "moore/MooreExporterHelper", "MooreExporterHelper"),
+                    (
+                        helpers / "collector-web/InnoCollectorWebServer",
+                        "InnoCollectorWebServer",
+                    ),
+                ),
                 ROOT / "packaging/Info-Collector.plist",
             ),
             "reader": (

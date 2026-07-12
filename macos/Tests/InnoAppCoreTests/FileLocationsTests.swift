@@ -32,6 +32,11 @@ struct FileLocationsTests {
             ) == true
         )
         #expect(
+            collector.collectorWebServer?.path.hasSuffix(
+                "Contents/PlugIns/InnoCollectorWebServer"
+            ) == true
+        )
+        #expect(
             collector.exporterRuntime
                 == collector.supportRoot.appendingPathComponent(
                     "ExporterRuntime",
@@ -39,6 +44,7 @@ struct FileLocationsTests {
                 )
         )
         #expect(reader.mooreHelper == nil)
+        #expect(reader.collectorWebServer == nil)
         #expect(reader.exporterRuntime == nil)
         #expect(
             collector.vault
@@ -85,5 +91,6 @@ struct FileLocationsTests {
 
         #expect(locations.helper.deletingLastPathComponent() == plugins)
         #expect(collector.mooreHelper?.deletingLastPathComponent() == plugins)
+        #expect(collector.collectorWebServer?.deletingLastPathComponent() == plugins)
     }
 }

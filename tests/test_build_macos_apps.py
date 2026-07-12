@@ -21,6 +21,7 @@ class MacAppBundleTests(unittest.TestCase):
             (swift / name).write_bytes((name + " safe").encode())
         for role, name in (
             ("collector", "InnoCollectorHelper"),
+            ("collector-web", "InnoCollectorWebServer"),
             ("reader", "InnoReaderHelper"),
             ("moore", "MooreExporterHelper"),
         ):
@@ -52,6 +53,7 @@ class MacAppBundleTests(unittest.TestCase):
             expected_collector = {
                 "Contents/MacOS/InnoCollectorApp",
                 "Contents/PlugIns/InnoCollectorHelper",
+                "Contents/PlugIns/InnoCollectorWebServer",
                 "Contents/PlugIns/MooreExporterHelper",
                 "Contents/Resources/config/projects.json",
                 "Contents/Resources/ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
@@ -69,8 +71,12 @@ class MacAppBundleTests(unittest.TestCase):
                 "Contents/Resources/ThirdPartyLicenses/THIRD_PARTY_NOTICES.md",
                 "Contents/Info.plist",
             }
-            self.assertTrue(expected_collector.issubset(self.files(collector)))
-            self.assertTrue(expected_reader.issubset(self.files(reader)))
+            self.assertEqual(self.files(collector), expected_collector)
+            self.assertEqual(self.files(reader), expected_reader)
+            web_server = collector / "Contents/PlugIns/InnoCollectorWebServer"
+            self.assertTrue(web_server.is_file())
+            self.assertFalse(web_server.is_symlink())
+            self.assertEqual(web_server.stat().st_mode & 0o777, 0o755)
             self.assertEqual(
                 (collector / "Contents/Resources/config/projects.json").read_bytes(),
                 (ROOT / "config/projects.json").read_bytes(),
@@ -89,7 +95,22 @@ class MacAppBundleTests(unittest.TestCase):
             self.assertFalse(any(value.endswith("projects.json") for value in reader_files))
             self.assertEqual(
                 sum(command[0] == "codesign" and "--verify" in command for command in commands),
-                5,
+                6,
+            )
+            self.assertEqual(
+                {
+                    Path(command[-1]).name
+                    for command in commands
+                    if command[0] == "codesign"
+                    and "--verify" in command
+                    and "/PlugIns/" in command[-1]
+                },
+                {
+                    "InnoCollectorHelper",
+                    "InnoCollectorWebServer",
+                    "InnoReaderHelper",
+                    "MooreExporterHelper",
+                },
             )
             helper_runtime_resigns = [
                 command
@@ -175,6 +196,33 @@ class MacAppBundleTests(unittest.TestCase):
 
             self.assertIn("local absolute path", str(caught.exception))
             self.assertNotIn(private_path.decode(), str(caught.exception))
+
+    def test_unsafe_web_server_is_rejected_and_both_apps_are_cleaned_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            swift, helpers = self.fixture(root)
+            web_server = helpers / "collector-web/InnoCollectorWebServer"
+            web_server.write_bytes(b"binary /Users/alice/private/source.py")
+            output = root / "apps"
+
+            def run(command, **kwargs):
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with self.assertRaisesRegex(
+                build_macos_apps.AppBuildError,
+                "local absolute path",
+            ):
+                build_macos_apps.assemble_apps(
+                    swift_bin=swift,
+                    helpers=helpers,
+                    output=output,
+                    runner=run,
+                )
+
+            self.assertFalse(output.exists())
+            self.assertFalse((root / "apps/InnoCollector.app").exists())
+            self.assertFalse((root / "apps/InnoReader.app").exists())
+            self.assertEqual(list(root.glob(".inno-apps-*")), [])
 
     @staticmethod
     def files(root: Path) -> set[str]:
