@@ -178,9 +178,39 @@ struct MooreLocalLoginServerTests {
         await #expect(throws: LocalLoginError.notReady) {
             try await server.open()
         }
-        #expect(probeCount == 30)
-        #expect(sleepCount == 29)
+        #expect(probeCount == 200)
+        #expect(sleepCount == 199)
         #expect(process.stopCount == 1)
+    }
+
+    @Test("allows a packaged helper ten seconds for its first cold start")
+    func coldStartReadiness() async throws {
+        let fixture = try fixture()
+        defer { fixture.remove() }
+        let process = RecordingLoginProcess()
+        var probeCount = 0
+        var sleepCount = 0
+        var opened = false
+        let server = server(
+            fixture: fixture,
+            process: process,
+            pageProbe: { _ in
+                probeCount += 1
+                return probeCount >= 101
+            },
+            sleeper: { duration in
+                #expect(duration == .milliseconds(100))
+                sleepCount += 1
+            },
+            browserOpener: { _ in opened = true; return true }
+        )
+
+        try await server.open()
+
+        #expect(probeCount == 101)
+        #expect(sleepCount == 100)
+        #expect(opened)
+        #expect(process.stopCount == 0)
     }
 
     @Test("rejects missing and non-executable helpers before probing")
