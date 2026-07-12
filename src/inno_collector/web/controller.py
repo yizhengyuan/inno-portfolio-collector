@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 from collections.abc import Callable
 from pathlib import Path
 
@@ -13,8 +14,10 @@ from ..package import lint_vault
 from ..pipeline import (
     CollectionPipeline,
     PipelineAuthenticationError,
+    PipelineCancelledError,
     PipelineConfigurationError,
 )
+from .jobs import JobBusyError, JobCancelled, JobGoneError, JobManager, JobOutcome
 from .responses import WebResponse
 
 
@@ -22,6 +25,15 @@ Linter = Callable[[Path], dict[str, object]]
 BooleanProvider = Callable[[], bool]
 JobProvider = Callable[[], dict[str, object] | None]
 PreflightRunner = Callable[[tuple[ProjectAccount, ...], str], PipelineRunResult]
+CollectionRunner = Callable[
+    [
+        tuple[ProjectAccount, ...],
+        str,
+        Callable[[dict[str, object]], None],
+        Callable[[], bool],
+    ],
+    PipelineRunResult,
+]
 _ASSET_ROUTES = {
     "/": ("index.html", "text/html; charset=utf-8", True),
     "/assets/app.css": ("app.css", "text/css; charset=utf-8", False),
@@ -30,6 +42,9 @@ _ASSET_ROUTES = {
 _MAX_ASSET_BYTES = 1 << 20
 _LOGIN_ROUTE = re.compile(
     r"^/api/login/([0-9a-f]{32})/(qrcode|status|complete)$"
+)
+_JOB_ROUTE = re.compile(
+    r"^/api/jobs/([A-Za-z0-9_-]{24,64})(?:/(events|cancel))?$"
 )
 _DEFAULT_MOORE_BASE_URL = "https://down.mptext.top"
 _LOGIN_MESSAGES = {
@@ -65,6 +80,8 @@ class WebController:
         projects_path: Path | None = None,
         runtime_dir: Path | None = None,
         preflight_runner: PreflightRunner | None = None,
+        collection_runner: CollectionRunner | None = None,
+        job_manager: JobManager | None = None,
     ) -> None:
         self.vault = Path(vault)
         self.moore_runtime = moore_runtime
@@ -82,6 +99,9 @@ class WebController:
         )
         self.runtime_dir = runtime_dir or self.vault.parents[1]
         self._preflight_runner = preflight_runner
+        self._collection_runner = collection_runner
+        self.job_manager = job_manager or JobManager()
+        self._successful_preflight_hash: str | None = None
 
     def _runtime_authenticated(self) -> bool:
         if self.moore_runtime is None:
@@ -126,8 +146,12 @@ class WebController:
             "authenticated": authenticated,
             "recent_job": self._safe_recent_job(),
             "capabilities": (
-                ["read_library", "login", "preflight"]
-                if self.moore_runtime is not None or self._preflight_runner is not None
+                ["read_library", "login", "preflight", "collection"]
+                if (
+                    self.moore_runtime is not None
+                    or self._preflight_runner is not None
+                    or self._collection_runner is not None
+                )
                 else ["read_library"]
             ),
         }
@@ -223,7 +247,7 @@ class WebController:
             runtime_dir=self.runtime_dir,
         ).run(projects, since=since, dry_run=True)
 
-    def _preflight(self, payload: object) -> tuple[int, dict]:
+    def _preflight_body(self, payload: object) -> tuple[int, dict]:
         if not isinstance(payload, dict):
             return 400, {
                 "ok": False,
@@ -299,6 +323,143 @@ class WebController:
             "failed_projects": result.failed_projects,
         }
 
+    def _config_digest(self) -> str:
+        if self.projects_path.is_symlink() or not self.projects_path.is_file():
+            raise OSError("projects resource is unavailable")
+        return "sha256:" + hashlib.sha256(self.projects_path.read_bytes()).hexdigest()
+
+    def _preflight(self, payload: object) -> tuple[int, dict]:
+        if not isinstance(payload, dict) or payload.get("since", "2026-01-01") != "2026-01-01":
+            return self._preflight_body(payload)
+
+        def operation(_context):
+            status, body = self._preflight_body(payload)
+            return {"http_status": status, "payload": body}
+
+        try:
+            job_id = self.job_manager.submit("preflight", operation)
+            snapshot = self.job_manager.wait(job_id)
+        except JobBusyError:
+            return 409, {
+                "ok": False,
+                "error": {"code": "job_busy", "message": "已有任务正在运行，请稍后再试。"},
+            }
+        result = snapshot.get("result")
+        if not isinstance(result, dict):
+            return 500, {
+                "ok": False,
+                "error": {"code": "preflight_failed", "message": "预检任务执行失败。"},
+            }
+        status = result.get("http_status")
+        body = result.get("payload")
+        if type(status) is not int or not isinstance(body, dict):
+            return 500, {
+                "ok": False,
+                "error": {"code": "preflight_failed", "message": "预检任务执行失败。"},
+            }
+        if status == 200 and body.get("ok") is True:
+            try:
+                self._successful_preflight_hash = self._config_digest()
+            except OSError:
+                self._successful_preflight_hash = None
+        return status, body
+
+    def _run_collection(
+        self,
+        projects: tuple[ProjectAccount, ...],
+        since: str,
+        progress: Callable[[dict[str, object]], None],
+        cancelled: Callable[[], bool],
+    ) -> PipelineRunResult:
+        if self._collection_runner is not None:
+            return self._collection_runner(projects, since, progress, cancelled)
+        if self.moore_runtime is None:
+            raise PipelineAuthenticationError("local login is unavailable")
+        return CollectionPipeline(
+            self.moore_runtime,
+            runtime_dir=self.runtime_dir,
+        ).run(
+            projects,
+            since=since,
+            dry_run=False,
+            progress=progress,
+            cancelled=cancelled,
+        )
+
+    def _start_collection(self, payload: object) -> tuple[int, dict]:
+        if not isinstance(payload, dict) or payload.get("since", "2026-01-01") != "2026-01-01":
+            return 400, {
+                "ok": False,
+                "error": {"code": "invalid_date_filter", "message": "当前采集范围固定从 2026-01-01 开始。"},
+            }
+        try:
+            current_hash = self._config_digest()
+        except OSError:
+            current_hash = ""
+        if not current_hash or current_hash != self._successful_preflight_hash:
+            return 409, {
+                "ok": False,
+                "error": {"code": "preflight_required", "message": "请先运行并通过当前项目配置的预检。"},
+            }
+        try:
+            projects = load_projects(self.projects_path)
+        except (OSError, UnicodeError, ValueError):
+            return 500, {
+                "ok": False,
+                "error": {"code": "invalid_projects", "message": "项目映射资源不可用。"},
+            }
+
+        def operation(context):
+            def on_progress(event: dict[str, object]) -> None:
+                context.emit(
+                    str(event.get("type") or ""),
+                    project=str(event.get("project") or ""),
+                    stage=str(event.get("stage") or ""),
+                    counts=(event.get("counts") if isinstance(event.get("counts"), dict) else {}),
+                )
+
+            try:
+                result = self._run_collection(
+                    projects,
+                    "2026-01-01",
+                    on_progress,
+                    context.is_cancelled,
+                )
+            except PipelineCancelledError:
+                raise JobCancelled from None
+            summary = {
+                "project_count": result.project_count,
+                "failed_projects": result.failed_projects,
+                "article_count": result.article_count,
+                "duplicate_count": result.duplicate_count,
+            }
+            return JobOutcome(
+                "partial" if result.failed_projects else "succeeded",
+                summary,
+            )
+
+        try:
+            job_id = self.job_manager.submit("collection", operation)
+        except JobBusyError:
+            return 409, {
+                "ok": False,
+                "error": {"code": "job_busy", "message": "已有任务正在运行，请稍后再试。"},
+            }
+        return 202, {"ok": True, "job_id": job_id}
+
+    def _job_action(self, job_id: str, action: str | None) -> tuple[int, dict]:
+        try:
+            if action == "events":
+                return 200, self.job_manager.events(job_id)
+            if action == "cancel":
+                return 200, self.job_manager.cancel(job_id)
+            return 200, self.job_manager.get(job_id)
+        except JobGoneError:
+            return 410, {
+                "ok": False,
+                "error": {"code": "job_gone", "message": "该任务已结束并从本机记录中清理。"},
+            }
+
     def _library_summary(self) -> tuple[int, dict]:
         if not self.vault.exists() or not self.vault.is_dir():
             return 200, {
@@ -372,6 +533,18 @@ class WebController:
             return self._start_login()
         if path == "/api/preflight" and method == "POST":
             return self._preflight(_payload)
+        if path == "/api/collection" and method == "POST":
+            return self._start_collection(_payload)
+        job_match = _JOB_ROUTE.fullmatch(path)
+        if job_match is not None:
+            job_id, action = job_match.groups()
+            expected_method = "POST" if action == "cancel" else "GET"
+            if method != expected_method:
+                return 405, {
+                    "ok": False,
+                    "error": {"code": "method_not_allowed", "message": "Method not allowed."},
+                }
+            return self._job_action(job_id, action)
         login_match = _LOGIN_ROUTE.fullmatch(path)
         if login_match is not None:
             login_id, action = login_match.groups()

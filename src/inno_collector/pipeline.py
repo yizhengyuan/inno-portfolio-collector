@@ -43,6 +43,10 @@ class PipelineDeliveryError(RuntimeError):
     pass
 
 
+class PipelineCancelledError(RuntimeError):
+    pass
+
+
 class _Backend(Protocol):
     def auth_check(self) -> object: ...
 
@@ -597,7 +601,30 @@ class CollectionPipeline:
         *,
         since: str,
         dry_run: bool = False,
+        progress: Callable[[dict[str, object]], None] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> PipelineRunResult:
+        def emit(
+            event_type: str,
+            *,
+            project: str = "",
+            stage: str = "",
+            counts: dict[str, int] | None = None,
+        ) -> None:
+            if progress is not None:
+                progress(
+                    {
+                        "type": event_type,
+                        "project": project,
+                        "stage": stage,
+                        "counts": counts or {},
+                    }
+                )
+
+        def checkpoint() -> None:
+            if cancelled is not None and cancelled():
+                raise PipelineCancelledError("collection was cancelled")
+
         project_list = list(projects)
         try:
             parsed_since = date.fromisoformat(since)
@@ -687,17 +714,24 @@ class CollectionPipeline:
             verification_time = verification_time.astimezone()
 
         for index, project in enumerate(project_list):
+            checkpoint()
+            emit("project_started", project=project.project, stage="mapping")
             if index in resolution_errors:
-                results.append(
-                    self._project_result(
-                        project,
-                        0,
-                        0,
-                        0,
-                        1,
-                        resolution_errors[index],
-                        "",
-                    )
+                result = self._project_result(
+                    project,
+                    0,
+                    0,
+                    0,
+                    1,
+                    resolution_errors[index],
+                    "",
+                )
+                results.append(result)
+                emit(
+                    "project_finished",
+                    project=project.project,
+                    stage="mapping",
+                    counts={"failed": result.failed},
                 )
                 continue
 
@@ -776,6 +810,12 @@ class CollectionPipeline:
                 selected, invalid_url_count = select_since_with_invalid_urls(
                     rows, since
                 )
+                emit(
+                    "catalog_synced",
+                    project=project.project,
+                    stage="catalog",
+                    counts={"discovered": len(rows)},
+                )
                 for row in selected:
                     key = article_key(str(row.get("url") or ""))
                     if key in seen_catalog_keys:
@@ -805,8 +845,19 @@ class CollectionPipeline:
                     issues.append(
                         f"catalog: {invalid_count} invalid or duplicate ids"
                     )
+                emit(
+                    "articles_selected",
+                    project=project.project,
+                    stage="catalog",
+                    counts={
+                        "selected": len(article_ids),
+                        "skipped": skipped,
+                        "failed": failed,
+                    },
+                )
 
                 if not dry_run and article_ids:
+                    checkpoint()
                     pending_failures = len(article_ids)
                     stage = "staging"
                     run_root = self._temporary_output_root(account_roots[index])
@@ -814,6 +865,7 @@ class CollectionPipeline:
                     payload = self._retry(
                         lambda: self.backend.download(article_ids, run_root)
                     )
+                    checkpoint()
                     (
                         output_dir,
                         payload_failed_keys,
@@ -823,6 +875,17 @@ class CollectionPipeline:
                         payload, run_root, requested_keys
                     )
                     skipped += len(payload_skipped_keys)
+                    emit(
+                        "download_progress",
+                        project=project.project,
+                        stage="download",
+                        counts={
+                            "selected": len(article_ids),
+                            "downloaded": len(success_keys),
+                            "skipped": len(payload_skipped_keys),
+                            "failed": len(payload_failed_keys),
+                        },
+                    )
                     stage = "ingest"
                     ingested = self.ingest(project, output_dir)
                     expected_keys = success_keys
@@ -935,6 +998,8 @@ class CollectionPipeline:
                                 "content_hash": article.content_hash
                             }
                 error = "; ".join(issues)
+            except PipelineCancelledError:
+                raise
             except Exception as exc:
                 if not vault_succeeded:
                     downloaded = 0
@@ -965,17 +1030,27 @@ class CollectionPipeline:
                     f"{error}; {cleanup_message}" if error else cleanup_message
                 )
 
-            results.append(
-                self._project_result(
-                    project,
-                    discovered,
-                    downloaded,
-                    skipped,
-                    failed,
-                    error,
-                    last_sync,
-                    force_partial=partial_sync_covered,
-                )
+            result = self._project_result(
+                project,
+                discovered,
+                downloaded,
+                skipped,
+                failed,
+                error,
+                last_sync,
+                force_partial=partial_sync_covered,
+            )
+            results.append(result)
+            emit(
+                "project_finished",
+                project=project.project,
+                stage="complete",
+                counts={
+                    "discovered": result.discovered,
+                    "downloaded": result.downloaded,
+                    "skipped": result.skipped,
+                    "failed": result.failed,
+                },
             )
 
         if not dry_run:
@@ -985,6 +1060,17 @@ class CollectionPipeline:
                 raise PipelineDeliveryError(
                     "report: failed to rebuild collection report"
                 ) from None
+            emit(
+                "validation_finished",
+                stage="validation",
+                counts={
+                    "project_count": len(results),
+                    "article_count": article_count,
+                    "failed_projects": sum(
+                        result.status != "success" for result in results
+                    ),
+                },
+            )
 
         failed_projects = sum(result.status != "success" for result in results)
         return PipelineRunResult(

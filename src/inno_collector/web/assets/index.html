@@ -63,7 +63,10 @@
         <article id="collect" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">02</p><h2>采集</h2></div><span>未开放</span></div>
           <p>按项目隔离失败，持续显示文章、附件和校验进度。</p>
-          <button type="button" data-write-action disabled>开始采集</button>
+          <div class="button-row">
+            <button id="collection-start" type="button" data-write-action="collection" disabled>开始采集</button>
+            <button id="collection-cancel" class="secondary-button" type="button" data-write-action="cancel" disabled>取消任务</button>
+          </div>
         </article>
         <article id="delivery" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">03</p><h2>交付</h2></div><span>未开放</span></div>

@@ -3,6 +3,8 @@ const initialState = Object.freeze({
   authenticated: false,
   recentJob: null,
   capabilities: [],
+  preflightPassed: false,
+  activeJob: "",
   error: "",
 });
 
@@ -62,6 +64,10 @@ export const render = (state) => {
   error.hidden = !view.error;
   document.querySelector("#login-start").disabled = !state.capabilities.includes("login");
   document.querySelector("#preflight-start").disabled = !state.capabilities.includes("preflight");
+  document.querySelector("#collection-start").disabled = !(
+    state.capabilities.includes("collection") && state.preflightPassed && !state.activeJob
+  );
+  document.querySelector("#collection-cancel").disabled = !state.activeJob;
 };
 
 const store = createStore(initialState);
@@ -140,8 +146,45 @@ const runPreflight = async () => {
     const result = await writeJson("/api/preflight", { since: "2026-01-01" });
     renderPreflight(result.projects || []);
     state.textContent = result.ok ? "全部通过" : "存在需处理项目";
+    store.setState({ preflightPassed: result.ok === true });
   } catch (error) {
     state.textContent = error.message || "预检失败";
+  }
+};
+
+const pollCollection = async (jobId) => {
+  try {
+    const job = await api(`/api/jobs/${jobId}`);
+    document.querySelector("#job-state").textContent = job.status;
+    if (["queued", "running"].includes(job.status)) {
+      setTimeout(() => pollCollection(jobId), 1000);
+      return;
+    }
+    store.setState({ activeJob: "" });
+  } catch (error) {
+    document.querySelector("#job-state").textContent = error.message || "任务状态不可用";
+    store.setState({ activeJob: "" });
+  }
+};
+
+const startCollection = async () => {
+  try {
+    const submitted = await writeJson("/api/collection", { since: "2026-01-01" });
+    store.setState({ activeJob: submitted.job_id });
+    pollCollection(submitted.job_id);
+  } catch (error) {
+    document.querySelector("#job-state").textContent = error.message || "无法开始采集";
+  }
+};
+
+const cancelCollection = async () => {
+  const jobId = store.getState().activeJob;
+  if (!jobId) return;
+  try {
+    await writeJson(`/api/jobs/${jobId}/cancel`);
+    document.querySelector("#job-state").textContent = "正在取消";
+  } catch (error) {
+    document.querySelector("#job-state").textContent = error.message || "无法取消任务";
   }
 };
 
@@ -164,4 +207,6 @@ const bootstrap = async () => {
 
 document.querySelector("#login-start").addEventListener("click", startLogin);
 document.querySelector("#preflight-start").addEventListener("click", runPreflight);
+document.querySelector("#collection-start").addEventListener("click", startCollection);
+document.querySelector("#collection-cancel").addEventListener("click", cancelCollection);
 bootstrap();
