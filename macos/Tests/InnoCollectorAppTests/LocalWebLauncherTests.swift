@@ -180,6 +180,20 @@ struct LocalWebLauncherTests {
         #expect(!LocalWebPreview.isEnabled(environment: ["INNO_COLLECTOR_WEB_PREVIEW": "1 "]))
     }
 
+    @Test("production child environment overwrites an inherited launcher PID")
+    func controlledLauncherEnvironment() {
+        let environment = FoundationWebProcess.controlledEnvironment(
+            inheriting: [
+                "INNO_COLLECTOR_LAUNCHER_PID": "9999",
+                "KEEP_ME": "yes",
+            ],
+            launcherPID: 4_321
+        )
+
+        #expect(environment["INNO_COLLECTOR_LAUNCHER_PID"] == "4321")
+        #expect(environment["KEEP_ME"] == "yes")
+    }
+
     @Test("starts once with fixed loopback arguments and reuses its verified endpoint")
     func startsAndReuses() async throws {
         let fixture = try fixture()

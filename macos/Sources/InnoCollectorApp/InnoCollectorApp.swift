@@ -3,8 +3,35 @@ import Foundation
 import InnoAppCore
 import InnoCollectorFeature
 
+@MainActor
+private final class CollectorApplicationDelegate: NSObject, NSApplicationDelegate {
+    private var webLauncher: (any LocalWebLaunching)?
+    private var stopsAfterLastWindowCloses = false
+
+    func configure(
+        webLauncher: (any LocalWebLaunching)?,
+        stopsAfterLastWindowCloses: Bool
+    ) {
+        self.webLauncher = webLauncher
+        self.stopsAfterLastWindowCloses = stopsAfterLastWindowCloses
+    }
+
+    func applicationShouldTerminateAfterLastWindowClosed(
+        _ sender: NSApplication
+    ) -> Bool {
+        stopsAfterLastWindowCloses
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        webLauncher?.stop()
+    }
+}
+
 @main
 struct InnoCollectorApp: App {
+    @NSApplicationDelegateAdaptor(CollectorApplicationDelegate.self)
+    private var applicationDelegate
+
     private let locations: AppLocations?
     private let webPreviewEnabled: Bool
     private let webLauncher: LocalWebLauncher?
@@ -17,6 +44,7 @@ struct InnoCollectorApp: App {
 
         self.locations = locations
         self.webPreviewEnabled = webPreviewEnabled
+        let webLauncher: LocalWebLauncher?
         if webPreviewEnabled,
            let locations,
            let executable = locations.collectorWebServer,
@@ -30,6 +58,11 @@ struct InnoCollectorApp: App {
         } else {
             webLauncher = nil
         }
+        self.webLauncher = webLauncher
+        applicationDelegate.configure(
+            webLauncher: webLauncher,
+            stopsAfterLastWindowCloses: webPreviewEnabled
+        )
     }
 
     var body: some Scene {

@@ -10,7 +10,7 @@ import stat
 import sys
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import IO
@@ -37,6 +37,33 @@ from .responses import FileResponse, WebResponse
 
 Application = Callable[[str, str, object], tuple[int, object] | WebResponse]
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
+_LAUNCHER_PID_ENVIRONMENT_KEY = "INNO_COLLECTOR_LAUNCHER_PID"
+_MAX_PROCESS_ID = 2_147_483_647
+
+
+def _launcher_pid_from_environment(
+    environment: Mapping[str, str] | None = None,
+) -> int | None:
+    """Read the native launcher's PID without accepting ambiguous values."""
+    values = os.environ if environment is None else environment
+    raw = values.get(_LAUNCHER_PID_ENVIRONMENT_KEY)
+    if raw is None:
+        return None
+    if re.fullmatch(r"[1-9][0-9]{0,9}", raw) is None:
+        raise ValueError("launcher PID is invalid")
+    pid = int(raw, 10)
+    if not 2 <= pid <= _MAX_PROCESS_ID:
+        raise ValueError("launcher PID is invalid")
+    return pid
+
+
+def _process_is_alive(pid: int) -> bool:
+    """Probe one process without sending it a terminating signal."""
+    try:
+        os.kill(pid, 0)
+    except (ProcessLookupError, PermissionError, OSError):
+        return False
+    return True
 
 
 def _ready_process_id() -> int:
@@ -70,6 +97,12 @@ class _BoundHTTPServer(ThreadingHTTPServer):
     def __init__(self, address: tuple[str, int], owner: LocalWebServer) -> None:
         self.owner = owner
         super().__init__(address, _RequestHandler)
+
+    def service_actions(self) -> None:
+        # This hook runs from inside BaseServer's serving loop.  Arming the
+        # launcher watchdog here guarantees its shutdown request cannot race
+        # ahead of serve_forever() and deadlock.
+        self.owner._watchdog_armed.set()
 
 
 class _RequestHandler(BaseHTTPRequestHandler):
@@ -402,11 +435,34 @@ class LocalWebServer:
         port: int = 0,
         application: Application | None = None,
         upload_root: Path | None = None,
+        launcher_pid: int | None = None,
+        process_is_alive: Callable[[int], bool] = _process_is_alive,
+        launcher_watchdog_interval: float = 0.25,
     ) -> None:
         self.host = validate_bind_host(host)
         if type(port) is not int or not 0 <= port <= 65535:
             raise ValueError("port must be between 0 and 65535")
+        if (
+            launcher_pid is not None
+            and (
+                type(launcher_pid) is not int
+                or not 2 <= launcher_pid <= _MAX_PROCESS_ID
+                or launcher_pid == os.getpid()
+            )
+        ):
+            raise ValueError("launcher PID is invalid")
+        if (
+            not isinstance(launcher_watchdog_interval, (int, float))
+            or isinstance(launcher_watchdog_interval, bool)
+            or not 0 < launcher_watchdog_interval <= 60
+        ):
+            raise ValueError("launcher watchdog interval is invalid")
+        if launcher_pid is not None and not process_is_alive(launcher_pid):
+            raise ValueError("launcher process is not running")
         self.application = application or _not_found
+        self.launcher_pid = launcher_pid
+        self._process_is_alive = process_is_alive
+        self._launcher_watchdog_interval = float(launcher_watchdog_interval)
         self.session_token = secrets.token_urlsafe(32)
         self.write_lock = threading.Lock()
         self.upload_lock = threading.Lock()
@@ -420,7 +476,12 @@ class LocalWebServer:
         self.port = int(self._httpd.server_address[1])
         self.origin = f"http://{self.host}:{self.port}"
         self._thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
+        self._watchdog_armed = threading.Event()
+        self._watchdog_stop = threading.Event()
         self._serving = threading.Event()
+        self._stopped_event = threading.Event()
+        self._stop_lock = threading.Lock()
         self._stopped = False
 
     @property
@@ -444,13 +505,17 @@ class LocalWebServer:
         stream.flush()
 
     def serve_forever(self, ready_stream: IO[str] | None = sys.stdout) -> None:
+        if self._stopped:
+            raise RuntimeError("server has already stopped")
         if ready_stream is not None:
             self.write_ready(ready_stream)
         self._serving.set()
+        self._start_launcher_watchdog()
         try:
             self._httpd.serve_forever(poll_interval=0.1)
         finally:
             self._serving.clear()
+            self._watchdog_stop.set()
 
     def start_background(self) -> None:
         if self._stopped:
@@ -468,14 +533,63 @@ class LocalWebServer:
             raise RuntimeError("server failed to start")
 
     def stop(self) -> None:
-        if self._stopped:
+        with self._stop_lock:
+            if self._stopped:
+                owns_stop = False
+            else:
+                self._stopped = True
+                owns_stop = True
+        if not owns_stop:
+            if threading.current_thread() not in {
+                self._thread,
+                self._watchdog_thread,
+            }:
+                self._stopped_event.wait(timeout=2)
             return
-        self._stopped = True
+        self._watchdog_stop.set()
         if self._serving.is_set():
             self._httpd.shutdown()
         self._httpd.server_close()
         if self._thread is not None and self._thread is not threading.current_thread():
             self._thread.join(timeout=2)
+        if (
+            self._watchdog_thread is not None
+            and self._watchdog_thread is not threading.current_thread()
+        ):
+            self._watchdog_thread.join(timeout=2)
+        self._stopped_event.set()
+
+    def wait_stopped(self, timeout: float | None = None) -> bool:
+        return self._stopped_event.wait(timeout=timeout)
+
+    def _start_launcher_watchdog(self) -> None:
+        if self.launcher_pid is None or self._watchdog_thread is not None:
+            return
+        self._watchdog_thread = threading.Thread(
+            target=self._watch_launcher,
+            name="inno-web-launcher-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
+
+    def _watch_launcher(self) -> None:
+        while not self._watchdog_stop.is_set():
+            if not self._watchdog_armed.wait(
+                timeout=self._launcher_watchdog_interval
+            ):
+                continue
+            if self._watchdog_stop.wait(self._launcher_watchdog_interval):
+                return
+            try:
+                alive = self._process_is_alive(self.launcher_pid)  # type: ignore[arg-type]
+            except Exception:
+                alive = False
+            if not alive:
+                # Stop this server object only.  The launcher PID is never a
+                # signal target, which prevents a stale or forged value from
+                # killing an unrelated process.
+                self.stop()
+                return
 
 
 def _argument_parser() -> argparse.ArgumentParser:
@@ -525,6 +639,7 @@ def main(argv: list[str] | None = None) -> int:
             draft_upload_manager=DraftUploadManager(support_root / "DraftInbox"),
         ),
         upload_root=support_root / "UploadTemp",
+        launcher_pid=_launcher_pid_from_environment(),
     )
     try:
         server.serve_forever()

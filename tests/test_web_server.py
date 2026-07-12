@@ -18,6 +18,8 @@ from inno_collector.web.responses import FileResponse
 from inno_collector.web.server import (
     LocalWebServer,
     _argument_parser,
+    _launcher_pid_from_environment,
+    _process_is_alive,
     _ready_process_id,
 )
 
@@ -30,6 +32,11 @@ class TestApplication:
         self.release = threading.Event()
         self.download_path = None
         self.download_completed: list[bool] = []
+        self.download_complete_event = threading.Event()
+
+    def record_download_completed(self, success: bool) -> None:
+        self.download_completed.append(success)
+        self.download_complete_event.set()
 
     def __call__(self, method: str, path: str, payload: object) -> tuple[int, object]:
         if path == "/api/echo" and method == "POST":
@@ -65,7 +72,7 @@ class TestApplication:
                 content_type="application/octet-stream",
                 size=len(data),
                 sha256=hashlib.sha256(data).hexdigest(),
-                on_complete=self.download_completed.append,
+                on_complete=self.record_download_completed,
             )
         return 404, {"ok": False, "error": {"code": "not_found", "message": "Not found"}}
 
@@ -126,6 +133,37 @@ class LocalWebServerTests(unittest.TestCase):
             patch("inno_collector.web.server.os.getppid", return_value=4321),
         ):
             self.assertEqual(_ready_process_id(), 4321)
+
+    def test_launcher_pid_environment_accepts_only_one_canonical_pid(self) -> None:
+        self.assertEqual(
+            _launcher_pid_from_environment({"INNO_COLLECTOR_LAUNCHER_PID": "4321"}),
+            4321,
+        )
+        self.assertIsNone(_launcher_pid_from_environment({}))
+
+        for value in (
+            "",
+            "0",
+            "1",
+            "01",
+            "+4321",
+            " 4321",
+            "4321 ",
+            "-1",
+            "2147483648",
+            "not-a-pid",
+        ):
+            with self.subTest(value=value):
+                with self.assertRaises(ValueError):
+                    _launcher_pid_from_environment(
+                        {"INNO_COLLECTOR_LAUNCHER_PID": value}
+                    )
+
+    def test_process_liveness_probe_never_sends_a_terminating_signal(self) -> None:
+        with patch("inno_collector.web.server.os.kill") as kill:
+            self.assertTrue(_process_is_alive(4321))
+
+        kill.assert_called_once_with(4321, 0)
 
     def test_command_line_accepts_only_explicit_local_runtime_inputs(self) -> None:
         arguments = _argument_parser().parse_args(
@@ -275,6 +313,7 @@ class LocalWebServerTests(unittest.TestCase):
         self.assertEqual(headers["Content-Type"], "application/octet-stream")
         self.assertIn("filename*=UTF-8", headers["Content-Disposition"])
         self.assertEqual(headers["X-Content-SHA256"], hashlib.sha256(body).hexdigest())
+        self.assertTrue(self.application.download_complete_event.wait(timeout=1))
         self.assertEqual(self.application.download_completed, [True])
 
     def test_all_responses_have_security_headers_and_no_cors(self) -> None:
@@ -320,6 +359,70 @@ class LocalWebServerTests(unittest.TestCase):
         response.read()
         connection.close()
         self.assertEqual(response.status, 200)
+
+    def test_launcher_watchdog_stops_only_its_server_and_closes_the_port(self) -> None:
+        launcher_pid = os.getpid() + 1
+        launcher_alive = threading.Event()
+        launcher_alive.set()
+        launcher_checked = threading.Event()
+
+        def process_is_alive(pid: int) -> bool:
+            self.assertEqual(pid, launcher_pid)
+            alive = launcher_alive.is_set()
+            if not alive:
+                launcher_checked.set()
+            return alive
+
+        watched = LocalWebServer(
+            application=self.application,
+            launcher_pid=launcher_pid,
+            process_is_alive=process_is_alive,
+            launcher_watchdog_interval=0.01,
+        )
+        watched.start_background()
+        other = LocalWebServer(application=self.application)
+        other.start_background()
+        self.addCleanup(watched.stop)
+        self.addCleanup(other.stop)
+
+        watched_port = watched.port
+        launcher_alive.clear()
+
+        self.assertTrue(launcher_checked.wait(timeout=1))
+        self.assertTrue(watched.wait_stopped(timeout=1))
+        with self.assertRaises(OSError):
+            connection = http.client.HTTPConnection(
+                "127.0.0.1", watched_port, timeout=0.2
+            )
+            try:
+                connection.request("GET", "/health")
+                connection.getresponse()
+            finally:
+                connection.close()
+
+        connection = http.client.HTTPConnection("127.0.0.1", other.port, timeout=2)
+        connection.request("GET", "/health")
+        response = connection.getresponse()
+        response.read()
+        connection.close()
+        self.assertEqual(response.status, 200)
+
+    def test_launcher_watchdog_rejects_invalid_or_dead_pid_before_binding(self) -> None:
+        for pid in (1, os.getpid(), 2_147_483_648):
+            with self.subTest(pid=pid):
+                with self.assertRaises(ValueError):
+                    LocalWebServer(
+                        application=self.application,
+                        launcher_pid=pid,
+                        process_is_alive=lambda _pid: True,
+                    )
+
+        with self.assertRaises(ValueError):
+            LocalWebServer(
+                application=self.application,
+                launcher_pid=os.getpid() + 1,
+                process_is_alive=lambda _pid: False,
+            )
 
     def test_stop_is_safe_before_server_starts(self) -> None:
         dormant = LocalWebServer(application=self.application)

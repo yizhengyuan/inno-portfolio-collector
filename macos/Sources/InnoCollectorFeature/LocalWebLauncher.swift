@@ -198,6 +198,7 @@ private final class ReadyLineReadOperation: @unchecked Sendable {
 
 @MainActor
 final class FoundationWebProcess: LocalWebProcessControlling {
+    private static let launcherPIDEnvironmentKey = "INNO_COLLECTOR_LAUNCHER_PID"
     private nonisolated static let gracefulWait = 0.5
     private nonisolated static let forcedWait = 0.5
 
@@ -221,6 +222,10 @@ final class FoundationWebProcess: LocalWebProcessControlling {
         let next = Process()
         next.executableURL = executable
         next.arguments = arguments
+        next.environment = Self.controlledEnvironment(
+            inheriting: ProcessInfo.processInfo.environment,
+            launcherPID: Darwin.getpid()
+        )
         next.standardInput = FileHandle.nullDevice
         next.standardOutput = pipe
         next.standardError = FileHandle.nullDevice
@@ -234,6 +239,16 @@ final class FoundationWebProcess: LocalWebProcessControlling {
             try? pipe.fileHandleForWriting.close()
             throw error
         }
+    }
+
+    static func controlledEnvironment(
+        inheriting environment: [String: String],
+        launcherPID: Int32
+    ) -> [String: String] {
+        precondition(launcherPID > 1)
+        var controlled = environment
+        controlled[launcherPIDEnvironmentKey] = String(launcherPID)
+        return controlled
     }
 
     func readReadyLine(maximumBytes: Int, timeout: TimeInterval) async throws -> Data {
