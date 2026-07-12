@@ -272,6 +272,22 @@ class WebController:
             return self._preflight_runner(projects, since)
         if self.moore_runtime is None:
             raise PipelineAuthenticationError("local login is unavailable")
+        discover_accounts = getattr(
+            self.moore_runtime,
+            "ensure_exact_accounts",
+            None,
+        )
+        if callable(discover_accounts):
+            auth = self.moore_runtime.auth_check()
+            if (
+                not isinstance(auth, dict)
+                or auth.get("ok") is not True
+                or auth.get("status") != "valid"
+            ):
+                raise PipelineAuthenticationError(
+                    "exporter authentication is not valid"
+                )
+            discover_accounts(projects)
         return CollectionPipeline(
             self.moore_runtime,
             runtime_dir=self.runtime_dir,

@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import importlib
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from types import ModuleType
 from typing import Protocol
+from urllib.parse import urlsplit
 
 from ..diagnostics import sanitize_diagnostic
 from ..exporter import (
@@ -16,9 +18,18 @@ from ..exporter import (
     validate_success_payload,
     validate_sync_payload,
 )
+from ..models import ProjectAccount
 
 
 MAX_QRCODE_BYTES = 2 << 20
+DISCOVERY_PAGE_SIZE = 10
+MAX_DISCOVERY_PAGES = 5
+MAX_DISCOVERY_CANDIDATES = DISCOVERY_PAGE_SIZE * MAX_DISCOVERY_PAGES
+MAX_DISCOVERY_QUERIES = 8
+MAX_ACCOUNT_NAME_LENGTH = 200
+MAX_FAKEID_LENGTH = 512
+MAX_AVATAR_URL_LENGTH = 2048
+MAX_DESCRIPTION_LENGTH = 4096
 _LOGIN_ID_RE = re.compile(r"^[0-9a-f]{32}$")
 _QRCODE_TYPES = {
     b"\x89PNG\r\n\x1a\n": "image/png",
@@ -36,6 +47,15 @@ class MooreFunctions(Protocol):
     ) -> dict: ...
     def auth_check(self, base: Path, profile: str = "") -> dict: ...
     def list_accounts(self, base: Path) -> list[dict]: ...
+    def search_accounts(
+        self,
+        base: Path,
+        keyword: str,
+        begin: int = 0,
+        size: int = DISCOVERY_PAGE_SIZE,
+        profile: str = "",
+    ) -> dict: ...
+    def upsert_account(self, base: Path, account: dict) -> dict: ...
     def sync_account_articles(
         self,
         base: Path,
@@ -76,6 +96,8 @@ def load_moore_functions() -> ModuleType:
         "complete_qr_login",
         "auth_check",
         "list_accounts",
+        "search_accounts",
+        "upsert_account",
         "sync_account_articles",
         "list_articles",
         "download_articles",
@@ -90,6 +112,189 @@ class _LoginSession:
     qrcode_path: Path
     content_type: str
     expires_at: str
+
+
+def _has_unsafe_control(value: str, *, allow_newlines: bool = False) -> bool:
+    allowed = {"\t", "\n", "\r"} if allow_newlines else set()
+    return any(
+        character not in allowed
+        and (ord(character) < 32 or 127 <= ord(character) < 160)
+        for character in value
+    )
+
+
+def _safe_text(
+    value: object,
+    *,
+    maximum: int,
+    allow_empty: bool,
+    allow_newlines: bool = False,
+) -> str:
+    if not isinstance(value, str):
+        raise ExporterCommandError("exporter returned invalid account search")
+    result = value.strip()
+    try:
+        encoded_length = len(result.encode("utf-8"))
+    except UnicodeEncodeError:
+        raise ExporterCommandError("exporter returned invalid account search") from None
+    if (not result and not allow_empty) or encoded_length > maximum:
+        raise ExporterCommandError("exporter returned invalid account search")
+    if _has_unsafe_control(result, allow_newlines=allow_newlines):
+        raise ExporterCommandError("exporter returned invalid account search")
+    return result
+
+
+def _safe_account_name(value: object) -> str:
+    result = _safe_text(
+        value,
+        maximum=MAX_ACCOUNT_NAME_LENGTH,
+        allow_empty=False,
+    )
+    if result in {".", ".."} or "/" in result or "\\" in result:
+        raise ExporterCommandError("exporter returned unsafe account name")
+    return result
+
+
+def _safe_avatar_url(value: object) -> str:
+    result = _safe_text(
+        value,
+        maximum=MAX_AVATAR_URL_LENGTH,
+        allow_empty=True,
+    )
+    if not result:
+        return ""
+    parsed = urlsplit(result)
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+    ):
+        raise ExporterCommandError("exporter returned invalid account search")
+    return result
+
+
+def _safe_remote_account(row: dict) -> dict:
+    fakeid = _safe_text(
+        row.get("fakeid"),
+        maximum=MAX_FAKEID_LENGTH,
+        allow_empty=False,
+    )
+    nickname = _safe_account_name(row.get("nickname"))
+    alias = _safe_text(
+        row.get("alias", ""),
+        maximum=MAX_ACCOUNT_NAME_LENGTH,
+        allow_empty=True,
+    )
+    if "/" in alias or "\\" in alias:
+        raise ExporterCommandError("exporter returned invalid account search")
+    avatar_url = _safe_avatar_url(row.get("avatar_url", ""))
+    description = _safe_text(
+        row.get("description", ""),
+        maximum=MAX_DESCRIPTION_LENGTH,
+        allow_empty=True,
+        allow_newlines=True,
+    )
+    article_count = row.get("article_count", 0)
+    if type(article_count) is not int or not 0 <= article_count <= 1_000_000_000:
+        raise ExporterCommandError("exporter returned invalid account search")
+    return {
+        "fakeid": fakeid,
+        "nickname": nickname,
+        "alias": alias,
+        "avatar_url": avatar_url,
+        "description": description,
+        "article_count": article_count,
+    }
+
+
+def _merge_candidate(target: dict[str, dict], candidate: dict) -> bool:
+    fakeid = candidate["fakeid"]
+    current = target.get(fakeid)
+    if current is None:
+        target[fakeid] = candidate
+        return True
+    if (
+        current.get("nickname") != candidate.get("nickname")
+        or current.get("alias") != candidate.get("alias")
+    ):
+        raise ExporterCommandError("exporter returned conflicting account search")
+    return False
+
+
+def _unique_identifiers(values: Iterable[str]) -> tuple[str, ...]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        normalized = value.strip()
+        key = normalized.casefold()
+        if normalized and key not in seen:
+            result.append(normalized)
+            seen.add(key)
+    return tuple(result)
+
+
+def _resolution_tiers(
+    project: ProjectAccount,
+) -> tuple[tuple[ProjectAccount, tuple[str, ...]], ...]:
+    tiers: list[tuple[ProjectAccount, tuple[str, ...]]] = []
+    # The primary account name in the immutable project mapping is the
+    # authoritative lookup.  A configured WeChat ID is a strict fallback for
+    # renamed/missing primary results; aliases are historical fallbacks only.
+    # Each tier still fails closed if it resolves to more than one fakeid.
+    account = project.account.strip()
+    if account:
+        tiers.append(
+            (
+                ProjectAccount(project=project.project, account=account),
+                (account,),
+            )
+        )
+    wechat_id = project.wechat_id.strip()
+    if wechat_id:
+        tiers.append(
+            (
+                ProjectAccount(
+                    project=project.project,
+                    account="",
+                    wechat_id=wechat_id,
+                ),
+                (wechat_id,),
+            )
+        )
+    aliases = _unique_identifiers(project.aliases)
+    if aliases:
+        tiers.append(
+            (
+                ProjectAccount(
+                    project=project.project,
+                    account="",
+                    aliases=aliases,
+                ),
+                aliases,
+            )
+        )
+    return tuple(tiers)
+
+
+def _resolve_tier(project: ProjectAccount, rows: list[dict]) -> dict | None:
+    matches: list[dict] = []
+    for row in rows:
+        try:
+            matches.append(resolve_exact_account(project, [row]))
+        except ExporterCommandError:
+            continue
+    if not matches:
+        return None
+    return resolve_exact_account(project, rows)
+
+
+def _resolve_priority(project: ProjectAccount, rows: list[dict]) -> dict | None:
+    for tier, _queries in _resolution_tiers(project):
+        match = _resolve_tier(tier, rows)
+        if match is not None:
+            return match
+    return None
 
 
 class MooreRuntime:
@@ -109,6 +314,7 @@ class MooreRuntime:
         self.runtime_dir = candidate.resolve(strict=True)
         self._functions = functions
         self._login_sessions: dict[str, _LoginSession] = {}
+        self._discovery_errors: dict[str, str] = {}
 
     @property
     def functions(self) -> MooreFunctions:
@@ -286,8 +492,161 @@ class MooreRuntime:
             safe["code"] = code
         return safe
 
-    def resolve_exact(self, project, rows: list[dict]) -> dict:
-        return resolve_exact_account(project, rows)
+    def _search_page(self, keyword: str, begin: int) -> list[dict]:
+        payload = self._call(
+            self.functions.search_accounts,
+            keyword,
+            begin,
+            DISCOVERY_PAGE_SIZE,
+            "",
+        )
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise ExporterCommandError("exporter returned invalid account search")
+        raw_code = payload.get("raw_code")
+        if raw_code is not None and not (
+            (type(raw_code) is int and raw_code == 0)
+            or (isinstance(raw_code, str) and raw_code == "0")
+        ):
+            raise ExporterCommandError("exporter returned invalid account search")
+        rows = payload.get("accounts")
+        count = payload.get("count")
+        if (
+            payload.get("keyword") != keyword
+            or type(payload.get("begin")) is not int
+            or payload["begin"] != begin
+            or type(payload.get("size")) is not int
+            or payload["size"] != DISCOVERY_PAGE_SIZE
+            or type(count) is not int
+            or count < 0
+            or not isinstance(rows, list)
+            or len(rows) > DISCOVERY_PAGE_SIZE
+            or count != len(rows)
+            or any(not isinstance(row, dict) for row in rows)
+        ):
+            raise ExporterCommandError("exporter returned invalid account search")
+        return [_safe_remote_account(row) for row in rows]
+
+    def _search_query(self, keyword: str) -> list[dict]:
+        safe_keyword = _safe_text(
+            keyword,
+            maximum=MAX_ACCOUNT_NAME_LENGTH,
+            allow_empty=False,
+        )
+        candidates: dict[str, dict] = {}
+        for page in range(MAX_DISCOVERY_PAGES + 1):
+            begin = page * DISCOVERY_PAGE_SIZE
+            rows = self._search_page(safe_keyword, begin)
+            if not rows:
+                return list(candidates.values())
+            if page == MAX_DISCOVERY_PAGES:
+                raise ExporterCommandError("exporter account search exceeded safe limit")
+            added = 0
+            for row in rows:
+                if _merge_candidate(candidates, row):
+                    added += 1
+            if not added or len(candidates) > MAX_DISCOVERY_CANDIDATES:
+                raise ExporterCommandError("exporter returned invalid account pagination")
+        raise ExporterCommandError("exporter account search exceeded safe limit")
+
+    def _discover_exact(self, project: ProjectAccount) -> dict | None:
+        candidates: dict[str, dict] = {}
+        searched: set[str] = set()
+        for tier, queries in _resolution_tiers(project):
+            for query in queries:
+                query_key = query.casefold()
+                if query_key in searched:
+                    continue
+                if len(searched) >= MAX_DISCOVERY_QUERIES:
+                    raise ExporterCommandError(
+                        "exporter account search exceeded safe limit"
+                    )
+                searched.add(query_key)
+                for candidate in self._search_query(query):
+                    _merge_candidate(candidates, candidate)
+                    if len(candidates) > MAX_DISCOVERY_CANDIDATES:
+                        raise ExporterCommandError(
+                            "exporter account search exceeded safe limit"
+                        )
+            match = _resolve_tier(tier, list(candidates.values()))
+            if match is not None:
+                return match
+        return None
+
+    def _upsert_remote_account(self, candidate: dict) -> dict:
+        payload = self._call(self.functions.upsert_account, candidate)
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise ExporterCommandError("exporter returned invalid account upsert")
+        account = payload.get("account")
+        if not isinstance(account, dict):
+            raise ExporterCommandError("exporter returned invalid account upsert")
+        account_id = account.get("id")
+        if (
+            type(account_id) is not int
+            or account_id <= 0
+            or account.get("fakeid") != candidate["fakeid"]
+        ):
+            raise ExporterCommandError("exporter returned invalid account upsert")
+        return {
+            "id": account_id,
+            "nickname": candidate["nickname"],
+            "alias": candidate["alias"],
+        }
+
+    def _validated_cached_account(self, row: dict) -> dict:
+        account_id = row.get("id")
+        if type(account_id) is not int or account_id <= 0:
+            raise ExporterCommandError("exporter returned invalid cached account")
+        _safe_account_name(row.get("nickname"))
+        alias = row.get("alias", "")
+        _safe_text(
+            alias,
+            maximum=MAX_ACCOUNT_NAME_LENGTH,
+            allow_empty=True,
+        )
+        if isinstance(alias, str) and ("/" in alias or "\\" in alias):
+            raise ExporterCommandError("exporter returned invalid cached account")
+        return row
+
+    def ensure_exact_accounts(
+        self,
+        projects: Iterable[ProjectAccount],
+    ) -> list[dict]:
+        """Explicitly discover missing exact accounts before a pure pipeline run."""
+        self._discovery_errors = {}
+        try:
+            cached = list(self.accounts())
+        except Exception:
+            raise ExporterCommandError("local account cache is unavailable") from None
+
+        for project in projects:
+            project_key = project.project
+            try:
+                existing = _resolve_priority(project, cached)
+                if existing is not None:
+                    self._validated_cached_account(existing)
+                    continue
+            except Exception:
+                self._discovery_errors[project_key] = "account discovery failed"
+                continue
+
+            try:
+                candidate = self._discover_exact(project)
+                if candidate is None:
+                    raise ExporterCommandError("account discovery found no exact match")
+                cached.append(self._upsert_remote_account(candidate))
+            except Exception:
+                self._discovery_errors[project_key] = "account discovery failed"
+        return cached
+
+    def resolve_exact(self, project: ProjectAccount, rows: list[dict]) -> dict:
+        safe_rows = validate_object_rows(rows, "accounts")
+        match = _resolve_priority(project, safe_rows)
+        if match is not None:
+            return self._validated_cached_account(match)
+        discovery_error = self._discovery_errors.get(project.project)
+        if discovery_error:
+            raise ExporterCommandError(discovery_error)
+        return resolve_exact_account(project, safe_rows)
 
     def accounts(self) -> list[dict]:
         rows = self._call(self.functions.list_accounts)

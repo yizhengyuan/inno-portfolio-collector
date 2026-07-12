@@ -146,6 +146,80 @@ class WebPreflightTests(unittest.TestCase):
         self.assertEqual(len(payload["projects"]), 10)
         self.assertTrue(all(row["mapping"] == "matched" for row in payload["projects"]))
 
+    def test_real_runtime_explicitly_discovers_missing_exact_accounts_before_dry_run(
+        self,
+    ) -> None:
+        projects = load_projects(PACKAGED_PROJECTS)
+
+        class DiscoveringBackend:
+            def __init__(self) -> None:
+                self.cached: list[dict] = []
+                self.discovered: tuple = ()
+                self.auth_checks = 0
+
+            def auth_check(self) -> dict:
+                self.auth_checks += 1
+                return {"ok": True, "status": "valid"}
+
+            def ensure_exact_accounts(self, requested) -> list[dict]:
+                self.discovered = tuple(requested)
+                self.cached = [
+                    {
+                        "id": index,
+                        "nickname": project.account,
+                        "alias": project.wechat_id,
+                    }
+                    for index, project in enumerate(self.discovered, start=1)
+                ]
+                return list(self.cached)
+
+            def accounts(self) -> list[dict]:
+                return list(self.cached)
+
+            def resolve_exact(self, project, rows: list[dict]) -> dict:
+                return resolve_exact_account(project, rows)
+
+            def articles(self, account_id: int, limit: int = 5000) -> list[dict]:
+                return []
+
+        backend = DiscoveringBackend()
+        controller = WebController(
+            self.vault,
+            moore_runtime=backend,
+            projects_path=PACKAGED_PROJECTS,
+            runtime_dir=Path(self.temp.name) / "runtime",
+        )
+
+        status, payload = controller("POST", "/api/preflight", {})
+
+        self.assertEqual(status, 200)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(backend.discovered, projects)
+        self.assertEqual(backend.auth_checks, 2)
+        self.assertTrue(all(row["mapping"] == "matched" for row in payload["projects"]))
+
+    def test_account_discovery_failure_is_sanitized_for_every_project(self) -> None:
+        class FailingDiscoveryBackend:
+            def auth_check(self) -> dict:
+                return {"ok": True, "status": "valid"}
+
+            def ensure_exact_accounts(self, _projects) -> list[dict]:
+                raise RuntimeError("token=secret /Users/private/account-cache.json")
+
+        controller = WebController(
+            self.vault,
+            moore_runtime=FailingDiscoveryBackend(),
+            projects_path=PACKAGED_PROJECTS,
+        )
+
+        status, payload = controller("POST", "/api/preflight", {})
+
+        self.assertEqual(status, 200)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(len(payload["projects"]), 10)
+        self.assertNotIn("secret", repr(payload))
+        self.assertNotIn("/Users/", repr(payload))
+
 
 if __name__ == "__main__":
     unittest.main()
