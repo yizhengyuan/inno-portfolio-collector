@@ -5,15 +5,21 @@ import io
 import json
 import os
 import hashlib
+import sys
 import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from inno_collector.web.security import MAX_REQUEST_BODY_BYTES, MAX_RESPONSE_BYTES
 from inno_collector.web.requests import UploadedFile
 from inno_collector.web.responses import FileResponse
-from inno_collector.web.server import LocalWebServer
+from inno_collector.web.server import (
+    LocalWebServer,
+    _argument_parser,
+    _ready_process_id,
+)
 
 
 class TestApplication:
@@ -112,6 +118,36 @@ class LocalWebServerTests(unittest.TestCase):
         )
         self.assertNotIn(self.server.session_token, raw)
         self.assertNotIn("/Users/", raw)
+
+    def test_onefile_ready_identifies_the_launcher_owned_process(self) -> None:
+        with (
+            patch.object(sys, "frozen", True, create=True),
+            patch.dict(os.environ, {"_PYI_PARENT_PROCESS_LEVEL": "1"}),
+            patch("inno_collector.web.server.os.getppid", return_value=4321),
+        ):
+            self.assertEqual(_ready_process_id(), 4321)
+
+    def test_command_line_accepts_only_explicit_local_runtime_inputs(self) -> None:
+        arguments = _argument_parser().parse_args(
+            [
+                "--support-root",
+                "/tmp/inno-support",
+                "--projects",
+                "/tmp/InnoCollector.app/Contents/Resources/config/projects.json",
+                "--host",
+                "127.0.0.1",
+                "--port",
+                "0",
+            ]
+        )
+
+        self.assertEqual(arguments.support_root, Path("/tmp/inno-support"))
+        self.assertEqual(
+            arguments.projects,
+            Path("/tmp/InnoCollector.app/Contents/Resources/config/projects.json"),
+        )
+        self.assertEqual(arguments.host, "127.0.0.1")
+        self.assertEqual(arguments.port, 0)
 
     def test_root_injects_token_only_into_same_origin_html(self) -> None:
         status, headers, body = self.request("GET", "/")

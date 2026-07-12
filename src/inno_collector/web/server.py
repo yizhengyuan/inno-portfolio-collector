@@ -39,6 +39,22 @@ Application = Callable[[str, str, object], tuple[int, object] | WebResponse]
 _WRITE_METHODS = {"POST", "PUT", "PATCH", "DELETE"}
 
 
+def _ready_process_id() -> int:
+    """Return the process identifier owned by the native launcher.
+
+    PyInstaller's POSIX one-file bootloader keeps a parent process alive while
+    the extracted Python child serves requests.  The launcher owns and stops
+    that parent, so the ready handshake identifies it.  Development and
+    one-directory processes continue to identify themselves normally.
+    """
+    if (
+        getattr(sys, "frozen", False)
+        and os.environ.get("_PYI_PARENT_PROCESS_LEVEL") == "1"
+    ):
+        return os.getppid()
+    return os.getpid()
+
+
 def _not_found(_method: str, _path: str, _payload: object) -> tuple[int, object]:
     return 404, _error_payload("not_found", "Not found.")
 
@@ -413,7 +429,7 @@ class LocalWebServer:
             "protocol": 1,
             "host": self.host,
             "port": self.port,
-            "pid": os.getpid(),
+            "pid": _ready_process_id(),
         }
 
     def write_ready(self, stream: IO[str] = sys.stdout) -> None:
@@ -464,6 +480,8 @@ class LocalWebServer:
 
 def _argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the local Inno Collector Web server")
+    parser.add_argument("--support-root", type=Path)
+    parser.add_argument("--projects", type=Path)
     parser.add_argument("--host", default=LOOPBACK_HOST)
     parser.add_argument("--port", type=int, default=0)
     return parser
@@ -471,10 +489,13 @@ def _argument_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     arguments = _argument_parser().parse_args(argv)
-    support_root = Path(
-        os.environ.get(
-            "INNO_COLLECTOR_SUPPORT_ROOT",
-            "~/Library/Application Support/com.inno.news.collector",
+    support_root = (
+        arguments.support_root
+        or Path(
+            os.environ.get(
+                "INNO_COLLECTOR_SUPPORT_ROOT",
+                "~/Library/Application Support/com.inno.news.collector",
+            )
         )
     ).expanduser()
     vault = support_root / "Runtime" / "vault" / "英诺被投项目资讯库"
@@ -497,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
         application=WebController(
             vault,
             moore_runtime=MooreRuntime(exporter_runtime),
+            projects_path=arguments.projects,
             runtime_dir=support_root / "Runtime",
             delivery_root=delivery_root,
             download_registry=download_registry,
