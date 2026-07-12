@@ -107,7 +107,10 @@ public final class MooreLocalLoginServer: LocalLoginServing {
 
     private static let helperName = "MooreExporterHelper"
     private static let runtimeName = "ExporterRuntime"
-    private static let readinessAttempts = 30
+    // The PyInstaller helper can need roughly ten seconds on its first launch
+    // from /Applications. Keep the wait bounded, but leave enough cold-start
+    // headroom before treating a healthy helper as failed.
+    private static let readinessAttempts = 200
     private static let readinessDelay = Duration.milliseconds(100)
     private static let serverPort: UInt16 = 18_765
 
