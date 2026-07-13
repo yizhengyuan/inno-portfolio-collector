@@ -14,8 +14,8 @@
 
 - 项目：https://github.com/Moore-developers/moore-wechat-article-downloader
 - 许可证：MIT，`third_party/licenses/moore-wechat-article-downloader-LICENSE.txt`
-- 使用方式：采集端的 `MooreExporterHelper` 打包该项目的本地导出脚本能力；`MooreExporterAdapter` 负责进程隔离与结果接入。阅读端不包含这些采集组件。
-- 本地组件：采集端账号同步、目录缓存、文章下载与 Markdown/图片输出侧车。
+- 使用方式：采集端的 `InnoCollectorWebServer` 在同一冻结进程中打包并调用该项目的本地运行模块；`MooreRuntime` 与 `exporter.py` 的共享校验逻辑负责受控执行、结果校验和接入，不再分发独立 Moore Helper。阅读端不包含这些采集组件。
+- 本地组件：采集端账号同步、目录缓存、文章下载与 Markdown/图片输出运行模块。
 
 未来如复制或修改第三方源文件，必须在本文件中补充文件级来源、修改说明和适用许可证。
 

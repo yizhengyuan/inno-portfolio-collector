@@ -17,7 +17,7 @@ class MacReleaseTests(unittest.TestCase):
         for role, executable, bundle_id, plugins in (
             (
                 "Collector", "InnoCollectorApp", "com.inno.news.collector",
-                ("InnoCollectorHelper", "MooreExporterHelper"),
+                ("InnoCollectorWebServer",),
             ),
             ("Reader", "InnoReaderApp", "com.inno.news.reader", ("InnoReaderHelper",)),
         ):
@@ -25,12 +25,14 @@ class MacReleaseTests(unittest.TestCase):
             binary = app / f"Contents/MacOS/{executable}"
             binary.parent.mkdir(parents=True)
             binary.write_bytes(b"swift")
+            binary.chmod(0o755)
             for name in plugins:
                 path = app / f"Contents/PlugIns/{name}"
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_bytes(b"adhoc")
             plist = {
                 "CFBundleIdentifier": bundle_id,
+                "CFBundleExecutable": executable,
                 "CFBundleVersion": "1",
                 "CFBundleShortVersionString": "0.1.0",
             }
@@ -93,9 +95,8 @@ class MacReleaseTests(unittest.TestCase):
                 events.append("helpers-signed")
                 result = {}
                 for role, name in (
-                    ("collector", "InnoCollectorHelper"),
+                    ("collector-web", "InnoCollectorWebServer"),
                     ("reader", "InnoReaderHelper"),
-                    ("moore", "MooreExporterHelper"),
                 ):
                     path = destination / role / name
                     path.parent.mkdir(parents=True)
@@ -160,6 +161,108 @@ class MacReleaseTests(unittest.TestCase):
             for item in manifest["artifacts"]:
                 path = output / item["dmg"]
                 self.assertEqual(item["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+
+    def test_release_rejects_a_legacy_collector_helper_layout(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            apps = self.fake_apps(root)
+            legacy = apps / "InnoCollector.app/Contents/PlugIns/InnoCollectorHelper"
+            legacy.write_bytes(b"legacy")
+
+            with self.assertRaisesRegex(
+                release_macos.ReleaseError,
+                "signed helper layout is incomplete",
+            ):
+                release_macos._replace_helpers(
+                    {
+                        "collector": apps / "InnoCollector.app",
+                        "reader": apps / "InnoReader.app",
+                    },
+                    {},
+                )
+
+    def test_release_rejects_version_or_bundle_metadata_before_helper_build(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            apps = self.fake_apps(root)
+            helper_builds = 0
+
+            def helpers_should_not_run(_identity, _destination, _runner):
+                nonlocal helper_builds
+                helper_builds += 1
+                return {}
+
+            with self.assertRaisesRegex(
+                release_macos.ReleaseError,
+                "metadata",
+            ):
+                release_macos.release(
+                    apps=apps,
+                    output=root / "version-mismatch",
+                    version="0.2.0",
+                    notarize=False,
+                    environment={
+                        "MACOS_SIGNING_IDENTITY": (
+                            "Developer ID Application: Example (TEAM123)"
+                        ),
+                    },
+                    helper_builder=helpers_should_not_run,
+                )
+
+            collector_info = apps / "InnoCollector.app/Contents/Info.plist"
+            info = plistlib.loads(collector_info.read_bytes())
+            info["CFBundleExecutable"] = "UnexpectedExecutable"
+            collector_info.write_bytes(plistlib.dumps(info))
+            with self.assertRaisesRegex(
+                release_macos.ReleaseError,
+                "metadata",
+            ):
+                release_macos.release(
+                    apps=apps,
+                    output=root / "metadata-mismatch",
+                    version="0.1.0",
+                    notarize=False,
+                    environment={
+                        "MACOS_SIGNING_IDENTITY": (
+                            "Developer ID Application: Example (TEAM123)"
+                        ),
+                    },
+                    helper_builder=helpers_should_not_run,
+                )
+
+            info["CFBundleExecutable"] = "InnoCollectorApp"
+            collector_info.write_bytes(plistlib.dumps(info))
+            (apps / "InnoCollector.app/Contents/MacOS/InnoCollectorApp").chmod(0o644)
+            with self.assertRaisesRegex(
+                release_macos.ReleaseError,
+                "metadata",
+            ):
+                release_macos.release(
+                    apps=apps,
+                    output=root / "non-executable",
+                    version="0.1.0",
+                    notarize=False,
+                    environment={
+                        "MACOS_SIGNING_IDENTITY": (
+                            "Developer ID Application: Example (TEAM123)"
+                        ),
+                    },
+                    helper_builder=helpers_should_not_run,
+                )
+            self.assertEqual(helper_builds, 0)
+
+    def test_copy_app_rejects_a_symlinked_bundle_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            apps = self.fake_apps(root)
+            link = root / "CollectorLink.app"
+            link.symlink_to(apps / "InnoCollector.app", target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                release_macos.ReleaseError,
+                "invalid app input",
+            ):
+                release_macos._copy_app(link, root / "copied.app")
 
 
 if __name__ == "__main__":

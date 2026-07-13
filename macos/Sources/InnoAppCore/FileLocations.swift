@@ -13,7 +13,7 @@ public enum AppRole: String, Sendable {
 
     var helperName: String {
         switch self {
-        case .collector: "InnoCollectorHelper"
+        case .collector: "InnoCollectorWebServer"
         case .reader: "InnoReaderHelper"
         }
     }
@@ -30,9 +30,6 @@ public struct AppLocations: Equatable, Sendable {
     public let inbox: URL
     public let helper: URL
     public let projectsConfig: URL?
-    public let mooreHelper: URL?
-    public let collectorWebServer: URL?
-    public let exporterRuntime: URL?
 
     public static func resolve(
         role: AppRole,
@@ -48,14 +45,7 @@ public struct AppLocations: Equatable, Sendable {
         let helper = plugins
             .appendingPathComponent(role.helperName, isDirectory: false)
             .standardizedFileURL
-        let mooreHelper = plugins
-            .appendingPathComponent("MooreExporterHelper", isDirectory: false)
-            .standardizedFileURL
-        let collectorWebServer = plugins
-            .appendingPathComponent("InnoCollectorWebServer", isDirectory: false)
-            .standardizedFileURL
-        guard helper.deletingLastPathComponent() == plugins,
-              collectorWebServer.deletingLastPathComponent() == plugins else {
+        guard helper.deletingLastPathComponent() == plugins else {
             throw AppLocationsError.unsafeBundlePath
         }
         let resources = bundleURL
@@ -74,11 +64,6 @@ public struct AppLocations: Equatable, Sendable {
             helper: helper,
             projectsConfig: role == .collector
                 ? resources.appendingPathComponent("config/projects.json", isDirectory: false)
-                : nil,
-            mooreHelper: role == .collector ? mooreHelper : nil,
-            collectorWebServer: role == .collector ? collectorWebServer : nil,
-            exporterRuntime: role == .collector
-                ? supportRoot.appendingPathComponent("ExporterRuntime", isDirectory: true)
                 : nil
         )
     }

@@ -16,12 +16,6 @@ public enum LocalWebLauncherError: Error, Equatable, Sendable {
     case browserUnavailable
 }
 
-public enum LocalWebPreview {
-    public static func isEnabled(environment: [String: String]) -> Bool {
-        environment["INNO_COLLECTOR_WEB_PREVIEW"] == "1"
-    }
-}
-
 enum LocalWebProcessReadError: Error, Equatable, Sendable {
     case timedOut
     case tooLong

@@ -312,6 +312,24 @@ class RepositoryPolicyTests(unittest.TestCase):
             ),
         )
 
+    def test_cutover_rejects_legacy_collector_entries(self) -> None:
+        legacy = {
+            "macos/Sources/InnoCollectorFeature/CollectorContentView.swift": b"legacy",
+            "macos/Sources/InnoCollectorFeature/CollectorViewModel.swift": b"legacy",
+            "macos/Sources/InnoCollectorFeature/MooreLocalLoginServer.swift": b"legacy",
+            "packaging/collector_helper_entry.py": b"legacy",
+            "packaging/moore_exporter_entry.py": b"legacy",
+            "src/inno_collector/collector_helper.py": b"legacy",
+        }
+
+        self.assertEqual(
+            audit({**REQUIRED, **legacy}),
+            sorted(
+                PolicyViolation(path, "legacy-collector-entry")
+                for path in legacy
+            ),
+        )
+
     def test_credential_words_inside_ordinary_filenames_are_allowed(self) -> None:
         files = {
             **REQUIRED,

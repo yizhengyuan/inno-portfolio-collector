@@ -32,26 +32,16 @@ struct InnoCollectorApp: App {
     @NSApplicationDelegateAdaptor(CollectorApplicationDelegate.self)
     private var applicationDelegate
 
-    private let locations: AppLocations?
-    private let webPreviewEnabled: Bool
     private let webLauncher: LocalWebLauncher?
 
     init() {
         let locations = try? AppLocations.collector()
-        let webPreviewEnabled = LocalWebPreview.isEnabled(
-            environment: ProcessInfo.processInfo.environment
-        )
-
-        self.locations = locations
-        self.webPreviewEnabled = webPreviewEnabled
         let webLauncher: LocalWebLauncher?
-        if webPreviewEnabled,
-           let locations,
-           let executable = locations.collectorWebServer,
+        if let locations,
            let projectsConfig = locations.projectsConfig {
             webLauncher = LocalWebLauncher(
-                executable: executable,
-                pluginsDirectory: executable.deletingLastPathComponent(),
+                executable: locations.helper,
+                pluginsDirectory: locations.helper.deletingLastPathComponent(),
                 supportRoot: locations.supportRoot,
                 projectsConfig: projectsConfig
             )
@@ -61,26 +51,22 @@ struct InnoCollectorApp: App {
         self.webLauncher = webLauncher
         applicationDelegate.configure(
             webLauncher: webLauncher,
-            stopsAfterLastWindowCloses: webPreviewEnabled
+            stopsAfterLastWindowCloses: true
         )
     }
 
     var body: some Scene {
-        WindowGroup {
-            if webPreviewEnabled, let webLauncher {
-                CollectorWebPreviewView(launcher: webLauncher)
-            } else if webPreviewEnabled {
-                CollectorUnavailableView(message: "无法初始化本地 Web 预览。")
-            } else if let locations {
-                CollectorRootView(locations: locations)
+        Window("英诺资讯采集", id: "collector") {
+            if let webLauncher {
+                CollectorWebLauncherView(launcher: webLauncher)
             } else {
-                CollectorUnavailableView(message: "无法初始化本地应用目录。")
+                CollectorUnavailableView(message: "无法初始化本地 Web 采集端。")
             }
         }
     }
 }
 
-private struct CollectorWebPreviewView: View {
+private struct CollectorWebLauncherView: View {
     private enum Status: Equatable {
         case starting
         case opened
@@ -104,9 +90,6 @@ private struct CollectorWebPreviewView: View {
         .frame(minWidth: 520, minHeight: 260)
         .task {
             await openWebCollector()
-        }
-        .onDisappear {
-            launcher.stop()
         }
     }
 
@@ -134,7 +117,7 @@ private struct CollectorWebPreviewView: View {
         case .opened:
             "已在默认浏览器中打开"
         case .failed:
-            "本地 Web 预览暂不可用"
+            "本地 Web 采集端暂不可用"
         }
     }
 
@@ -176,32 +159,6 @@ private struct CollectorWebPreviewView: View {
         case .browserUnavailable:
             "无法打开默认浏览器，请检查 macOS 的默认浏览器设置。"
         }
-    }
-}
-
-private struct CollectorRootView: View {
-    @StateObject private var model: CollectorViewModel
-
-    init(locations: AppLocations) {
-        let localLogin = locations.mooreHelper.flatMap { helper in
-            locations.exporterRuntime.map { runtime in
-                MooreLocalLoginServer(
-                    executable: helper,
-                    pluginsDirectory: locations.helper.deletingLastPathComponent(),
-                    runtimeDirectory: runtime,
-                    supportRoot: locations.supportRoot
-                )
-            }
-        }
-        _model = StateObject(wrappedValue: CollectorViewModel(
-            helper: HelperClient(executable: locations.helper),
-            locations: locations,
-            localLogin: localLogin
-        ))
-    }
-
-    var body: some View {
-        CollectorContentView(model: model)
     }
 }
 

@@ -186,8 +186,6 @@ def assemble_apps(
             "collector": (
                 "InnoCollectorApp",
                 (
-                    (helpers / "collector/InnoCollectorHelper", "InnoCollectorHelper"),
-                    (helpers / "moore/MooreExporterHelper", "MooreExporterHelper"),
                     (
                         helpers / "collector-web/InnoCollectorWebServer",
                         "InnoCollectorWebServer",

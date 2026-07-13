@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import subprocess
 import sys
 import tempfile
@@ -30,7 +29,7 @@ WEB_ARCHIVE_CONTENTS = "\n".join(
 
 
 class BuildHelperTests(unittest.TestCase):
-    def test_four_independent_pyinstaller_commands_and_smokes(self) -> None:
+    def test_only_web_server_and_reader_are_built_and_smoked(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary) / "helpers"
             moore = Path(temporary) / "moore"
@@ -38,10 +37,8 @@ class BuildHelperTests(unittest.TestCase):
             for name in ("wechat_exporter.py", "wechat_downloader.py"):
                 (moore / name).write_text("", encoding="utf-8")
             binaries = {
-                "InnoCollectorHelper": output / "collector/InnoCollectorHelper",
                 "InnoCollectorWebServer": output / "collector-web/InnoCollectorWebServer",
                 "InnoReaderHelper": output / "reader/InnoReaderHelper",
-                "MooreExporterHelper": output / "moore/MooreExporterHelper",
             }
             for path in binaries.values():
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,15 +49,12 @@ class BuildHelperTests(unittest.TestCase):
             def run(command, **kwargs):
                 calls.append([str(value) for value in command])
                 executable = Path(command[0]).name
-                if executable == "InnoCollectorHelper":
-                    request = json.loads(kwargs["input"])
-                    return subprocess.CompletedProcess(
-                        command, 0, json.dumps({"id": request["id"], "ok": True, "result": {"role": "collector"}}), ""
-                    )
                 if executable == "InnoReaderHelper":
-                    request = json.loads(kwargs["input"])
                     return subprocess.CompletedProcess(
-                        command, 0, json.dumps({"id": request["id"], "ok": True, "result": {"role": "reader"}}), ""
+                        command,
+                        0,
+                        '{"id":"build-smoke","ok":true,"result":{"role":"reader"}}',
+                        "",
                     )
                 if executable == "InnoCollectorWebServer":
                     self.assertEqual(command[1:], ["--smoke"])
@@ -76,35 +70,25 @@ class BuildHelperTests(unittest.TestCase):
             build_helpers.build(output=output, moore_source=moore, clean=False, runner=run)
 
             pyinstaller = [call for call in calls if "PyInstaller" in call]
-            self.assertEqual(len(pyinstaller), 4)
+            self.assertEqual(len(pyinstaller), 2)
             names = {call[call.index("--name") + 1] for call in pyinstaller}
             self.assertEqual(names, set(binaries))
             self.assertTrue(all("--onefile" in call for call in pyinstaller))
             self.assertTrue(all("--collect-all" not in call for call in pyinstaller))
             self.assertEqual(
-                len({call[call.index("--distpath") + 1] for call in pyinstaller}), 4
+                len({call[call.index("--distpath") + 1] for call in pyinstaller}), 2
             )
             self.assertEqual(
-                len({call[call.index("--workpath") + 1] for call in pyinstaller}), 4
+                len({call[call.index("--workpath") + 1] for call in pyinstaller}), 2
             )
             self.assertEqual(
-                len({call[call.index("--specpath") + 1] for call in pyinstaller}), 4
+                len({call[call.index("--specpath") + 1] for call in pyinstaller}), 2
             )
-            moore_command = next(call for call in pyinstaller if "MooreExporterHelper" in call)
-            self.assertEqual(moore_command[moore_command.index("--paths") + 1], str(moore))
-            self.assertTrue(moore_command[-1].endswith("packaging/moore_exporter_entry.py"))
-            joined = " ".join(moore_command)
-            self.assertNotIn("inspect_context.py", joined)
-            self.assertNotIn("wechat_wizard.py", joined)
 
             source_path = str(ROOT / "src")
-            collector_command = next(
-                call for call in pyinstaller if "InnoCollectorHelper" in call
-            )
             reader_command = next(
                 call for call in pyinstaller if "InnoReaderHelper" in call
             )
-            self.assertIn(source_path, collector_command)
             self.assertIn(source_path, reader_command)
 
             web_command = next(
@@ -146,6 +130,13 @@ class BuildHelperTests(unittest.TestCase):
             self.assertTrue(
                 all("--add-data" not in call for call in pyinstaller if call is not web_command)
             )
+            joined_commands = " ".join(" ".join(call) for call in pyinstaller)
+            self.assertNotIn("InnoCollectorHelper", joined_commands)
+            self.assertNotIn("MooreExporterHelper", joined_commands)
+            self.assertNotIn("collector_helper_entry.py", joined_commands)
+            self.assertNotIn("moore_exporter_entry.py", joined_commands)
+            self.assertFalse((ROOT / "packaging/collector_helper_entry.py").exists())
+            self.assertFalse((ROOT / "packaging/moore_exporter_entry.py").exists())
 
     def test_web_entry_smoke_is_stable_and_does_not_start_the_server(self) -> None:
         result = subprocess.run(

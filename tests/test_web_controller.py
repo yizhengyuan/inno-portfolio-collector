@@ -32,7 +32,7 @@ class WebControllerTests(unittest.TestCase):
         status, payload = controller("GET", "/api/bootstrap", None)
 
         self.assertEqual(status, 200)
-        self.assertEqual(payload["version"], "0.1.0")
+        self.assertEqual(payload["version"], "0.2.0")
         self.assertIs(payload["authenticated"], True)
         self.assertEqual(payload["capabilities"], ["read_library"])
         self.assertEqual(payload["recent_job"]["id"], "job-1")

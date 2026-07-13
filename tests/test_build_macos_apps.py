@@ -20,10 +20,8 @@ class MacAppBundleTests(unittest.TestCase):
         for name in ("InnoCollectorApp", "InnoReaderApp"):
             (swift / name).write_bytes((name + " safe").encode())
         for role, name in (
-            ("collector", "InnoCollectorHelper"),
             ("collector-web", "InnoCollectorWebServer"),
             ("reader", "InnoReaderHelper"),
-            ("moore", "MooreExporterHelper"),
         ):
             path = helpers / role / name
             path.parent.mkdir(parents=True)
@@ -52,9 +50,7 @@ class MacAppBundleTests(unittest.TestCase):
             reader = apps["reader"]
             expected_collector = {
                 "Contents/MacOS/InnoCollectorApp",
-                "Contents/PlugIns/InnoCollectorHelper",
                 "Contents/PlugIns/InnoCollectorWebServer",
-                "Contents/PlugIns/MooreExporterHelper",
                 "Contents/Resources/config/projects.json",
                 "Contents/Resources/ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
                 "Contents/Resources/ThirdPartyLicenses/moore-wechat-article-downloader-LICENSE.txt",
@@ -95,7 +91,7 @@ class MacAppBundleTests(unittest.TestCase):
             self.assertFalse(any(value.endswith("projects.json") for value in reader_files))
             self.assertEqual(
                 sum(command[0] == "codesign" and "--verify" in command for command in commands),
-                6,
+                4,
             )
             self.assertEqual(
                 {
@@ -106,10 +102,8 @@ class MacAppBundleTests(unittest.TestCase):
                     and "/PlugIns/" in command[-1]
                 },
                 {
-                    "InnoCollectorHelper",
                     "InnoCollectorWebServer",
                     "InnoReaderHelper",
-                    "MooreExporterHelper",
                 },
             )
             helper_runtime_resigns = [

@@ -96,26 +96,10 @@ def pyinstaller_commands(
     source_root = ROOT / "src"
     entries = (
         (
-            "collector",
-            "InnoCollectorHelper",
-            ROOT / "packaging/collector_helper_entry.py",
-            (source_root,),
-            (),
-            (),
-        ),
-        (
             "reader",
             "InnoReaderHelper",
             ROOT / "packaging/reader_helper_entry.py",
             (source_root,),
-            (),
-            (),
-        ),
-        (
-            "moore",
-            "MooreExporterHelper",
-            ROOT / "packaging/moore_exporter_entry.py",
-            (moore_source,),
             (),
             (),
         ),
@@ -297,24 +281,14 @@ def build(
         _run(command, runner=runner, text=True, capture_output=True, timeout=900)
 
     binaries = {
-        "collector": output / "collector/InnoCollectorHelper",
         "collector-web": output / "collector-web/InnoCollectorWebServer",
         "reader": output / "reader/InnoReaderHelper",
-        "moore": output / "moore/MooreExporterHelper",
     }
     missing = [path.name for path in binaries.values() if not path.is_file()]
     if missing:
         raise HelperBuildError("missing helper output: " + ", ".join(missing))
-    _smoke_role(binaries["collector"], "collector", runner=runner)
     _smoke_role(binaries["reader"], "reader", runner=runner)
     _smoke_web_server(binaries["collector-web"], runner=runner)
-    _run(
-        [str(binaries["moore"]), "--help"],
-        runner=runner,
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
     audit_reader_binary(binaries["reader"], runner=runner)
     audit_collector_web_binary(binaries["collector-web"], runner=runner)
     for path in binaries.values():

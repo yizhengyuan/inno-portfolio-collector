@@ -171,15 +171,6 @@ struct LocalWebLauncherTests {
         )
     }
 
-    @Test("preview mode accepts only the exact environment value one")
-    func previewEnvironmentGate() {
-        #expect(LocalWebPreview.isEnabled(environment: ["INNO_COLLECTOR_WEB_PREVIEW": "1"]))
-        #expect(!LocalWebPreview.isEnabled(environment: [:]))
-        #expect(!LocalWebPreview.isEnabled(environment: ["INNO_COLLECTOR_WEB_PREVIEW": "true"]))
-        #expect(!LocalWebPreview.isEnabled(environment: ["INNO_COLLECTOR_WEB_PREVIEW": "01"]))
-        #expect(!LocalWebPreview.isEnabled(environment: ["INNO_COLLECTOR_WEB_PREVIEW": "1 "]))
-    }
-
     @Test("packaged cold start has a bounded slow-Mac allowance")
     func packagedColdStartAllowance() {
         #expect(LocalWebLauncher.defaultReadyTimeout >= 60)

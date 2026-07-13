@@ -6,7 +6,9 @@
 
 ### 英诺资讯采集
 
-只安装在负责采集的 Mac 上。它保管本机公众号登录状态，执行预检、增量采集、资料校验、离线看板生成和更新包导出，并接收朋友回传的编辑稿包。
+只安装在负责采集的 Mac 上。App 是一个很薄的 macOS 启动器：双击后，它会在随机的 `127.0.0.1` 本机端口启动 Collector，并在默认浏览器打开本地 Web 界面。这不是云服务，浏览器不会连接远程 Collector；退出“英诺资讯采集”App 才会停止本地服务。
+
+本地 Web 界面保管本机公众号登录状态，执行扫码登录、预检、增量采集、资料校验、离线看板生成和更新包导出，并接收朋友回传的编辑稿包。请在使用期间保持 App 开启；只关闭浏览器标签页不会结束 App。
 
 采集必须先通过最近一次预检。项目配置来自原始 `config/projects.json`，打包时逐字节复制，不会重新生成或修改。公众号登录凭据、Cookie 和 Token 不进入更新包，也不得发送给朋友。
 
@@ -33,13 +35,14 @@
 
 ## 安装与发布状态
 
-正式给朋友分发时，应分别提供经过 Developer ID 签名、公证和 Gatekeeper 验证的 Collector/Reader DMG。当前仓库可以生成 ad-hoc 签名 App 用于本机 QA；在 `docs/macos-release-checklist.md` 全部通过前，不应把它标记为正式可分发版本。
+正式给朋友分发时，应分别提供经过 Developer ID 签名、公证和 Gatekeeper 验证的 Collector/Reader DMG。当前仓库可以生成 ad-hoc 签名 App 用于本机 QA；在 `docs/macos-release-checklist.md` 全部通过前，不应把它标记为正式可分发版本。Collector App 最终只携带一个 `InnoCollectorWebServer` 本地组件；Reader 仍只携带 `InnoReaderHelper`。
 
 开发构建：
 
 ```bash
 python3 -m venv .venv
 ./.venv/bin/python -m pip install -e '.[build]'
+# 另将 moore-wechat-article-downloader clone 到本仓库的同级目录
 ./.venv/bin/python scripts/build_macos_apps.py \
   --configuration release --output .build-macos/apps
 ./scripts/test_swift.sh
@@ -55,8 +58,8 @@ python3 -m venv .venv
 
 本项目的自有代码以 [MIT License](LICENSE) 开源。进度、缺陷和功能建议在 [GitHub Issues](https://github.com/yizhengyuan/inno-portfolio-collector/issues) 中统一管理；贡献前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 和 [SECURITY.md](SECURITY.md)。
 
-最新的仓库、双 App、隐私与许可证技术复核见 [2026-07-12 开源与分发技术合规复核](docs/compliance/2026-07-12-open-source-and-distribution-review.md)。该复核不替代内容授权、Apple 正式签名、公证和干净账户安装验收。
+最新的 Web Collector 切换证据见 [Local Web Collector 切换门槛审核](docs/compliance/2026-07-12-local-web-collector-cutover-review.md)。此前的 [2026-07-12 开源与分发技术合规复核](docs/compliance/2026-07-12-open-source-and-distribution-review.md) 保留为旧双 Helper 架构的历史记录。技术复核不替代内容授权、Apple 正式签名、公证和干净账户安装验收。
 
 ## 兼容命令行测试
 
-底层 Python 模块仍保留 `unittest`、内容包和 Helper 协议入口，供开发、自动化验收与故障排查使用；它们不是朋友日常使用的前置条件。
+底层 Python 模块仍保留 `unittest`、内容包命令和 Reader Helper 协议，供开发、自动化验收与故障排查使用。旧 Collector Helper 与独立 Moore Helper 已从产品和构建入口删除；它们都不是日常使用的前置条件。

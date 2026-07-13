@@ -13,7 +13,7 @@ let package = Package(
     ],
     targets: [
         .target(name: "InnoAppCore"),
-        .target(name: "InnoCollectorFeature", dependencies: ["InnoAppCore"]),
+        .target(name: "InnoCollectorFeature"),
         .executableTarget(
             name: "InnoCollectorApp",
             dependencies: ["InnoCollectorFeature", "InnoAppCore"]
@@ -26,7 +26,7 @@ let package = Package(
         .testTarget(name: "InnoAppCoreTests", dependencies: ["InnoAppCore"]),
         .testTarget(
             name: "InnoCollectorAppTests",
-            dependencies: ["InnoCollectorFeature", "InnoAppCore"]
+            dependencies: ["InnoCollectorFeature"]
         ),
         .testTarget(
             name: "InnoReaderAppTests",

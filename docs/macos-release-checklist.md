@@ -21,7 +21,9 @@
 
 ## 采集者流程
 
+- [ ] 双击 Collector 后，默认浏览器打开随机 `127.0.0.1` 端口；页面明确这是本地 Web 界面而非云服务。
 - [ ] Collector 明确显示本机负责登录与采集，Reader 不接收任何公众号登录凭据。
+- [ ] 正常退出和强制结束 Collector 后，`InnoCollectorWebServer` 及其监听端口都被清理；仅关闭浏览器标签页不会被误写为“已退出 App”。
 - [ ] 完成一次登录状态与 10 个精确公众号映射预检。
 - [ ] 只对受控样本执行一次采集，预检未成功时“开始采集”保持禁用。
 - [ ] 生成基线 `.inno-update`，确认包内无 Cookie、Token、auth-key、绝对用户路径或 `.moore` 数据。
@@ -46,8 +48,9 @@
 - [ ] `codesign --verify --deep --strict --verbose=2` 对两个 App 均通过。
 - [ ] `spctl --assess --type execute --verbose=2` 对两个 App 均通过。
 - [ ] `xcrun stapler validate` 对两个公证 DMG 均通过。
-- [ ] Reader 包内没有 Collector Helper、MooreExporterHelper、`projects.json`、导出脚本或凭据文件。
-- [ ] Reader Helper 实际拒绝 `collect`；Collector Helper 和 Reader Helper 的 `status` 角色正确。
+- [ ] Collector 的 `Contents/PlugIns` 精确只包含 `InnoCollectorWebServer`，没有旧 Collector Helper 或独立 Moore Helper。
+- [ ] Reader 的 `Contents/PlugIns` 精确只包含 `InnoReaderHelper`，且包内没有 `projects.json`、导出脚本或凭据文件。
+- [ ] Reader Helper 实际拒绝 `collect`；Collector Web Server 的 `--smoke` 与动态 ready 握手通过。
 - [ ] 两个 App 均包含 wechat-article-exporter 与 Moore 下载器的完整第三方许可证和署名。
 - [ ] 文章版权提示在 README 与第三方说明中可见。
 

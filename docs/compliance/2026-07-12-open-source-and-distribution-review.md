@@ -1,5 +1,7 @@
 # 2026-07-12 开源与分发技术合规复核
 
+> 历史记录：本报告验证的是 0.1.0 双 Helper 架构。2026-07-13 获批的默认 Web Collector 已删除旧 Collector Helper 和独立 Moore Helper；当前架构、真实采集和切换证据以 [Local Web Collector 切换门槛审核](2026-07-12-local-web-collector-cutover-review.md) 为准。下文保留当时事实，不代表当前包布局。
+
 ## 结论
 
 本次复核从提交 `31bf0baeaa9683cefdfc91a81c82c6d01c9c4939` 开始，并在本报告所在提交完成。仓库源码与重新构建的 Collector/Reader App 通过本报告列出的隐私、开源许可证、角色隔离和内容边界检查；相关 CI 通过并合并后，可以关闭 GitHub Issue #3。

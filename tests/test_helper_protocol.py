@@ -7,7 +7,6 @@ import sys
 import unittest
 from pathlib import Path
 
-from inno_collector.collector_helper import HANDLERS as COLLECTOR_HANDLERS
 from inno_collector.helper_protocol import run_helper
 from inno_collector.reader_helper import HANDLERS as READER_HANDLERS
 
@@ -58,14 +57,7 @@ class HelperProtocolTests(unittest.TestCase):
         self.assertNotIn("/Users/alice", raw)
         self.assertIn("[REDACTED]", str(response["error"]))
 
-    def test_role_command_sets_are_exact(self) -> None:
-        self.assertEqual(
-            set(COLLECTOR_HANDLERS),
-            {
-                "status", "collect", "build_update", "receive_drafts",
-                "list_received_drafts", "accept_draft",
-            },
-        )
+    def test_reader_command_set_is_exact(self) -> None:
         self.assertEqual(
             set(READER_HANDLERS),
             {"status", "preview_update", "apply_update", "create_draft", "build_drafts", "rebuild_dashboard"},
@@ -95,19 +87,14 @@ class HelperProtocolTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertEqual(response["error"], "unsupported helper command")
 
-    def test_role_status_accepts_empty_arguments_for_launch_smoke(self) -> None:
-        for role, handlers in (
-            ("collector", COLLECTOR_HANDLERS),
-            ("reader", READER_HANDLERS),
-        ):
-            with self.subTest(role=role):
-                code, response, _raw = self.call(
-                    handlers,
-                    {"id": "smoke", "command": "status", "arguments": {}},
-                )
-                self.assertEqual(code, 0)
-                self.assertEqual(response["result"]["role"], role)
-                self.assertFalse(response["result"]["vault_exists"])
+    def test_reader_status_accepts_empty_arguments_for_launch_smoke(self) -> None:
+        code, response, _raw = self.call(
+            READER_HANDLERS,
+            {"id": "smoke", "command": "status", "arguments": {}},
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(response["result"]["role"], "reader")
+        self.assertFalse(response["result"]["vault_exists"])
 
 
 if __name__ == "__main__":

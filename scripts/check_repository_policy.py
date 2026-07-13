@@ -96,6 +96,14 @@ READER_CONTENT_RULES = (
         (b"config/projects.json", b"projects.json"),
     ),
 )
+LEGACY_COLLECTOR_PATHS = {
+    "macos/Sources/InnoCollectorFeature/CollectorContentView.swift",
+    "macos/Sources/InnoCollectorFeature/CollectorViewModel.swift",
+    "macos/Sources/InnoCollectorFeature/MooreLocalLoginServer.swift",
+    "packaging/collector_helper_entry.py",
+    "packaging/moore_exporter_entry.py",
+    "src/inno_collector/collector_helper.py",
+}
 LOCAL_BUILD_PATH = re.compile(rb"/(?:Users|Volumes)/[^/\x00]+/")
 EMBEDDED_CREDENTIAL = re.compile(
     rb"(?i)\b(?:auth[-_]?key|cookie|token|password|secret)\b"
@@ -175,6 +183,8 @@ def audit_repository(
             )
 
     for path in sorted(paths):
+        if path in LEGACY_COLLECTOR_PATHS:
+            violations.add(PolicyViolation(path, "legacy-collector-entry"))
         if path.startswith(USER_MATERIAL_PREFIXES):
             violations.add(PolicyViolation(path, "user-material"))
         if _is_credential_path(path):

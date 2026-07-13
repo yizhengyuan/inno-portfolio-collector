@@ -2,20 +2,20 @@
 
 日期：2026-07-12  
 功能分支：`feat/local-web-collector`  
-审核状态：**技术门槛通过，等待用户明确批准切换默认 Collector**
+审核状态：**技术门槛通过；2026-07-13 已获用户批准，默认 Web Collector 与自用 pilot DMG 已完成本地切换验收**
 
 ## 审核范围
 
-本审核覆盖本地 Web Collector 的冻结 App、真实本机登录、10 个项目预检、真实采集、Vault 校验、基线交付、Reader 导入、稿件往返和退出清理。审核期间未修改原始项目清单，未输出登录凭据，也未切换默认 Collector。
+本审核覆盖本地 Web Collector 的冻结 App、真实本机登录、10 个项目预检、真实采集、Vault 校验、基线交付、Reader 导入、稿件往返和退出清理。Task 9 审核期间未修改原始项目清单、未输出登录凭据，也未提前切换默认 Collector；用户于 2026-07-13 明确批准后，Task 10/11 才执行默认入口切换、旧实现删除和新 pilot DMG 制作。
 
 ## 回退与配置保护
 
 - 当前 `main` 回退点保持为 `58f9c23`。
 - 旧 r3 自用 DMG 仍保留在 `dist/自用试用-r3/`，SHA-256 为 `bc5e74ba938bfafa74ae45dca600caca9f24b166ac2947f119d18d98abbb361f`。
 - 原始配置、功能分支配置和冻结 App 内配置三者 SHA-256 均为 `8be2a6a98481dd1155071387cd39b40672799c1fbdff0534f1febe3eb84ae691`。
-- 本审核没有合并功能分支，没有删除旧 Collector，也没有改写用户的配置文件。
+- Task 9 审核阶段未合并功能分支、未删除旧 Collector；获批后的 Task 10 已删除旧实现。全过程未改写用户的配置文件。
 
-## 自动化与构建证据
+## Task 9 自动化与构建证据
 
 - Python：440 项通过，默认运行有 2 项环境门控跳过。
 - Swift：72 项通过，默认运行有 3 项真实 Helper 环境门控跳过。
@@ -53,10 +53,22 @@
 
 ## 已知限制
 
-- 当前候选 App 仍是 ad-hoc 签名、未公证的自用预览，不得作为正式客户安装包转发。
-- 将 3 个独立 PyInstaller Helper 同时冷启动的非产品测试曾触发 60 秒资源争抢超时；相同测试串行运行全部通过。普通用户路径不会同时启动这 3 个旧 Helper，且切换后旧 Collector Helper 将被删除。
-- 当前默认界面仍是旧 r3 SwiftUI；只有设置预览环境开关时才打开 Web Collector。
+- 当前候选 App 仍是 ad-hoc 签名、未公证的自用预览，只供本人试用，不得作为正式客户安装包转发。
+- Task 9 切换前，将 3 个独立 PyInstaller Helper 同时冷启动的非产品测试曾触发 60 秒资源争抢超时；相同测试串行运行全部通过。该记录只描述历史环境，当前构建已经删除旧 Collector Helper 和独立 Moore Helper。
+
+## 2026-07-13 默认切换与 pilot 复核
+
+- Collector 默认使用唯一 macOS 窗口启动 `InnoCollectorWebServer`，无需预览环境开关，并在默认浏览器打开随机 `127.0.0.1` 端口。
+- 旧原生 Collector UI、旧本地扫码服务、旧 Collector Helper、独立 Moore Helper 及其构建入口和测试已删除；Collector `Contents/PlugIns` 精确只含 `InnoCollectorWebServer`。
+- 产品版本统一为 0.2.0；Collector/Reader Info.plist、Python 包版本与 Web bootstrap 一致。
+- 最终 Python 总套件运行 447 项：446 项通过，默认环境门控跳过冻结二进制测试 1 项；该门控测试随后传入真实 Web Server，另行 1/1 通过。Swift 41 项通过；传入真实 App/Helper 后，Swift 真实角色隔离与 Reader Helper 测试也全部通过。
+- 最终真实 App bootstrap 返回 0.2.0、登录有效与六项已批准能力；正常退出和强制结束 App 后，Web Server 进程与动态端口均被清理。
+- 最终 App 内 `projects.json` SHA-256 仍为 `8be2a6a98481dd1155071387cd39b40672799c1fbdff0534f1febe3eb84ae691`，与仓库配置逐字节一致。
+- 新自用包为 `dist/自用试用-web/InnoCollector-Web-0.2.0-pilot-20260713.dmg`，SHA-256 为 `0465f697f5ec33e00fd417349a034db8949a2f34aae7bf8dfe0786a6da39db75`。
+- DMG 通过 `hdiutil verify` 与只读反向挂载审计：顶层精确为中文 App、`Applications` 快捷方式和安装说明；App 深度签名有效；版本 0.2.0；配置与四份许可证/声明一致；无 Reader、运行数据、文章、附件、本机路径或高置信秘密。
+- 旧 r3 DMG 保持原位，SHA-256 仍为 `bc5e74ba938bfafa74ae45dca600caca9f24b166ac2947f119d18d98abbb361f`，没有被新包覆盖。
+- pilot DMG 是本地忽略文件，没有上传到 GitHub；Developer ID、公证、干净账户与正式客户分发门槛仍未完成。
 
 ## 审核结论
 
-除“用户明确批准切换默认 Collector”外，Task 9 的技术门槛均已满足。在收到明确批准前，保持预览模式，不执行旧 Collector 删除、默认入口切换或新 pilot DMG 制作。
+Task 9 技术门槛已满足，且用户已明确批准切换。Task 10 的默认入口切换与旧实现删除、Task 11 的本地自用 pilot DMG 及反向审计均已完成；正式客户分发仍受 Developer ID、公证和干净账户验收门槛约束。
