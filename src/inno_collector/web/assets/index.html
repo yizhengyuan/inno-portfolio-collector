@@ -39,7 +39,7 @@
         <div>
           <p class="eyebrow">安全的本机流程</p>
           <h2 id="welcome-title">一个页面完成采集、核对与交付</h2>
-          <p>当前版本先开放只读概览。登录、预检和采集会在安全检查完成后逐步启用。</p>
+          <p>登录只保存在本机；预检通过后即可采集，并为唯一客户生成完整资料包。</p>
         </div>
         <button id="login-start" type="button" data-write-action="login" disabled>开始扫码登录</button>
       </section>
@@ -69,18 +69,17 @@
           </div>
         </article>
         <article id="delivery" class="panel">
-          <div class="panel-heading"><div><p class="eyebrow">03</p><h2>交付</h2></div><span>未开放</span></div>
-          <p>验证 Obsidian Vault、离线 HTML 看板和安全 ZIP。</p>
+          <div class="panel-heading"><div><p class="eyebrow">03</p><h2>交付</h2></div><span>安全 ZIP</span></div>
+          <p>为唯一客户生成一个安全 ZIP，内含 Obsidian Vault、离线 HTML 看板和客户使用说明。</p>
           <div class="button-row">
-            <button id="delivery-baseline" type="button" data-write-action="delivery" disabled>生成基线包</button>
-            <label class="file-button">选择旧版生成增量<input id="delivery-base-file" type="file" accept=".inno-update" hidden></label>
+            <button id="delivery-customer" type="button" data-write-action="delivery" disabled>生成客户资料包 ZIP</button>
           </div>
-          <p id="delivery-message" class="inline-message">尚未生成交付包</p>
-          <a id="delivery-download" class="download-link" hidden>下载 .inno-update</a>
+          <p id="delivery-message" class="inline-message">尚未生成客户资料包</p>
+          <a id="delivery-download" class="download-link" hidden>下载客户资料包 ZIP</a>
         </article>
         <article id="drafts" class="panel">
           <div class="panel-heading"><div><p class="eyebrow">04</p><h2>稿件收件箱</h2></div><span>只读</span></div>
-          <p>集中查看朋友返回的编辑稿，不共享任何登录凭据。</p>
+          <p>集中查看客户返回的编辑稿，不共享任何登录凭据。</p>
           <label class="file-button">选择稿件包<input id="draft-file" type="file" accept=".inno-drafts" hidden></label>
           <div id="draft-preview" class="inline-message">尚未选择稿件包</div>
           <label class="confirm-row"><input id="draft-confirm" type="checkbox" disabled> 我已核对预览，确认收录</label>

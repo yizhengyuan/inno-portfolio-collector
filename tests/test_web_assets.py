@@ -55,6 +55,11 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertNotIn("@import", combined)
         self.assertNotIn("url(", combined)
 
+    def test_hidden_dynamic_regions_are_not_overridden_by_layout_css(self) -> None:
+        css = (ASSETS / "app.css").read_text(encoding="utf-8")
+
+        self.assertIn("[hidden] { display: none !important; }", css)
+
     def test_package_data_declares_web_assets(self) -> None:
         pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
 

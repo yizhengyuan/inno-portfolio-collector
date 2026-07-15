@@ -25,12 +25,13 @@ class DistributionLicenseTests(unittest.TestCase):
 
 
 class DistributionDocumentationTests(unittest.TestCase):
-    def test_readme_and_manual_gate_cover_two_user_distribution(self) -> None:
+    def test_readme_and_manual_gate_cover_single_customer_distribution(self) -> None:
         readme = (ROOT / "README.md").read_text(encoding="utf-8")
         checklist = (ROOT / "docs/macos-release-checklist.md").read_text(encoding="utf-8")
         for phrase in (
-            "英诺资讯采集", "英诺资讯阅读", "Obsidian", "离线看板",
-            "公众号登录凭据", "文章版权", "默认浏览器", "本地 Web",
+            "英诺资讯采集", "客户无需安装英诺专用 App", "Obsidian", "离线看板",
+            "客户资料包 ZIP", "公众号登录凭据", "文章版权", "默认浏览器", "本地 Web",
+            "未来多人模式",
         ):
             self.assertIn(phrase, readme)
         for phrase in (

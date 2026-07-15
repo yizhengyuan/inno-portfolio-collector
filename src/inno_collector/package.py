@@ -40,6 +40,30 @@ _REQUIRED_FILES = (
     "90-系统/collection-report.md",
     "90-系统/README.md",
 )
+_CUSTOMER_GUIDE_PATH = "客户使用说明.md"
+_CUSTOMER_GUIDE = """# 客户使用说明
+
+这个资料包可以完全离线使用，客户无需安装英诺专用 App，也不需要任何公众号登录信息。
+
+## 推荐：用 Obsidian 打开
+
+1. 先解压整个 ZIP，不要直接在压缩包里编辑。
+2. 安装并打开 Obsidian。
+3. 选择“打开本地仓库”或“打开文件夹作为仓库”。
+4. 选择解压后的“英诺被投项目资讯库”文件夹。
+
+文章原文在 `03-文章`，项目入口在 `02-项目`。需要修改或新写内容时，请放在 `10-编辑稿`；个人笔记可放在 `11-个人笔记`。
+
+## 不安装 Obsidian 也能阅读
+
+双击 `80-离线看板/index.html`，即可在浏览器中打开离线看板。看板不需要联网，但浏览器中的页面主要用于阅读和搜索。
+
+## 使用边界
+
+- 资料包不包含公众号 Cookie、Token 或其他登录凭据。
+- 文章、图片和附件版权归原作者或其他权利人所有。
+- 请只在获得授权或法律允许的范围内阅读、编辑和分享，不要转发给无关人员。
+"""
 _RECORD_FIELDS = {
     "key", "project", "account", "title", "published", "source_url",
     "collected_at", "content_hash", "read_status", "path", "attachments",
@@ -187,6 +211,8 @@ def _allowed_delivery_path(path: PurePosixPath, *, directory: bool) -> bool:
         return path.parts[0] == "10-编辑稿" and path.parts[1] == "附件"
     if text in _REQUIRED_FILES:
         return True
+    if text == _CUSTOMER_GUIDE_PATH:
+        return not directory
     if text == "80-离线看板/index.html":
         return True
     if path.parts[0] in {"10-编辑稿", "11-个人笔记"}:
@@ -732,6 +758,10 @@ def build_delivery_zip(
                 if hashlib.sha256(payload).hexdigest() != snapshot_hashes[relative]:
                     raise DeliveryValidationError({"errors": ["snapshot changed after validation"]})
                 archive.writestr(f"{top}/{relative.as_posix()}", payload)
+            archive.writestr(
+                f"{top}/{_CUSTOMER_GUIDE_PATH}",
+                _CUSTOMER_GUIDE.encode("utf-8"),
+            )
         digest = hashlib.sha256(zip_temp.read_bytes()).hexdigest()
         summary = (
             "# 交付摘要\n\n"

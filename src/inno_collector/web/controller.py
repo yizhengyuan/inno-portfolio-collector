@@ -7,6 +7,7 @@ import secrets
 import stat
 import zipfile
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 
 from .. import __version__
@@ -14,7 +15,7 @@ from ..config import load_projects
 from ..diagnostics import sanitize_diagnostic
 from ..exporter import ExporterCommandError
 from ..models import PipelineRunResult, ProjectAccount
-from ..package import lint_vault
+from ..package import build_delivery_zip, lint_vault
 from ..update_package import build_update_package
 from ..pipeline import (
     CollectionPipeline,
@@ -101,6 +102,7 @@ class WebController:
         delivery_root: Path | None = None,
         download_registry: DownloadRegistry | None = None,
         delivery_builder: DeliveryBuilder = build_update_package,
+        customer_delivery_builder: DeliveryBuilder = build_delivery_zip,
         draft_upload_manager: object | None = None,
     ) -> None:
         self.vault = Path(vault)
@@ -125,6 +127,7 @@ class WebController:
         self.delivery_root = Path(delivery_root) if delivery_root is not None else None
         self.download_registry = download_registry
         self._delivery_builder = delivery_builder
+        self._customer_delivery_builder = customer_delivery_builder
         self.draft_upload_manager = draft_upload_manager
 
     def _runtime_authenticated(self) -> bool:
@@ -600,7 +603,7 @@ class WebController:
                         "error": {"code": "invalid_delivery", "message": "交付参数不正确。"},
                     }
                 created_at = created_at_value
-            if kind != "baseline":
+            if kind not in {"baseline", "customer"}:
                 return 400, {
                     "ok": False,
                     "error": {"code": "base_upload_required", "message": "增量交付需要上传旧版 .inno-update。"},
@@ -611,19 +614,54 @@ class WebController:
                 "error": {"code": "invalid_delivery", "message": "交付参数不正确。"},
             }
 
-        physical = self.delivery_root / f"delivery-{secrets.token_urlsafe(18)}.inno-update"
+        suffix = ".zip" if kind == "customer" else ".inno-update"
+        physical = self.delivery_root / f"delivery-{secrets.token_urlsafe(18)}{suffix}"
+        customer_summary = physical.with_suffix(".summary.md")
 
         def operation(_context):
             registered_id: str | None = None
             try:
-                result = self._delivery_builder(
-                    self.vault,
-                    physical,
-                    base_package=base_package,
-                    created_at=created_at,
-                )
+                if kind == "customer":
+                    result = self._customer_delivery_builder(self.vault, physical)
+                else:
+                    result = self._delivery_builder(
+                        self.vault,
+                        physical,
+                        base_package=base_package,
+                        created_at=created_at,
+                    )
                 if not isinstance(result, dict):
                     raise ValueError("invalid delivery result")
+                if kind == "customer":
+                    counts = (
+                        result.get("article_count"),
+                        result.get("successful_projects"),
+                        result.get("failed_projects"),
+                    )
+                    if any(type(value) is not int or value < 0 for value in counts):
+                        raise ValueError("invalid delivery result")
+                    if physical.stat().st_size > MAX_DOWNLOAD_BYTES:
+                        raise ValueError("delivery exceeded safe limit")
+                    filename = (
+                        "英诺客户资料库-"
+                        f"{datetime.now().astimezone():%Y%m%d-%H%M}.zip"
+                    )
+                    record = self.download_registry.register(
+                        physical,
+                        filename=filename,
+                        content_type="application/zip",
+                    )
+                    registered_id = record.id
+                    return {
+                        "kind": "customer",
+                        "article_count": counts[0],
+                        "successful_projects": counts[1],
+                        "failed_projects": counts[2],
+                        "package_sha256": record.sha256,
+                        "download_id": record.id,
+                        "filename": record.filename,
+                        "size": record.size,
+                    }
                 safe_kind = result.get("kind")
                 included = result.get("included")
                 deleted = result.get("deleted")
@@ -656,6 +694,7 @@ class WebController:
             finally:
                 if base_package is not None:
                     base_package.unlink(missing_ok=True)
+                customer_summary.unlink(missing_ok=True)
                 if registered_id is None:
                     physical.unlink(missing_ok=True)
 

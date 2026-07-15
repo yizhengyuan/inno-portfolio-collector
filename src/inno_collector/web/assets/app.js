@@ -69,7 +69,7 @@ export const render = (state) => {
     state.capabilities.includes("collection") && state.preflightPassed && !state.activeJob
   );
   document.querySelector("#collection-cancel").disabled = !state.activeJob;
-  document.querySelector("#delivery-baseline").disabled = !state.capabilities.includes("delivery");
+  document.querySelector("#delivery-customer").disabled = !state.capabilities.includes("delivery");
   const draftConfirmed = document.querySelector("#draft-confirm").checked;
   document.querySelector("#draft-accept").disabled = !(
     state.capabilities.includes("drafts") && state.draftReceipt && draftConfirmed
@@ -206,9 +206,9 @@ const pollDelivery = async (jobId) => {
     if (["succeeded", "partial"].includes(job.status) && job.result?.download_id) {
       const link = document.querySelector("#delivery-download");
       link.href = `/api/delivery/${job.result.download_id}/download`;
-      link.download = job.result.filename || "英诺资讯.inno-update";
+      link.download = job.result.filename || "英诺客户资料库.zip";
       link.hidden = false;
-      message.textContent = `已生成 ${job.result.kind}，SHA-256：${job.result.package_sha256}`;
+      message.textContent = `客户资料包已生成：${job.result.article_count} 篇文章，SHA-256：${job.result.package_sha256}`;
     }
   } catch (error) {
     message.textContent = error.message || "交付任务不可用";
@@ -283,14 +283,10 @@ document.querySelector("#login-start").addEventListener("click", startLogin);
 document.querySelector("#preflight-start").addEventListener("click", runPreflight);
 document.querySelector("#collection-start").addEventListener("click", startCollection);
 document.querySelector("#collection-cancel").addEventListener("click", cancelCollection);
-document.querySelector("#delivery-baseline").addEventListener("click", () => {
-  submitDelivery({ kind: "baseline" }).catch((error) => {
-    document.querySelector("#delivery-message").textContent = error.message || "无法生成交付包";
+document.querySelector("#delivery-customer").addEventListener("click", () => {
+  submitDelivery({ kind: "customer" }).catch((error) => {
+    document.querySelector("#delivery-message").textContent = error.message || "无法生成客户资料包";
   });
-});
-document.querySelector("#delivery-base-file").addEventListener("change", (event) => {
-  const file = event.target.files?.[0];
-  if (file) submitDelivery(file).catch(() => {});
 });
 document.querySelector("#draft-file").addEventListener("change", (event) => {
   const file = event.target.files?.[0];

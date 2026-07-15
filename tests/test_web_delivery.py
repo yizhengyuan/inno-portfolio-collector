@@ -27,6 +27,7 @@ class WebDeliveryTests(unittest.TestCase):
             exporter_runtime_root=self.exporter_runtime,
         )
         self.calls: list[tuple[Path, Path, Path | None, str | None]] = []
+        self.customer_calls: list[tuple[Path, Path]] = []
 
         def builder(vault, output, *, base_package=None, created_at=None):
             self.calls.append((vault, output, base_package, created_at))
@@ -42,11 +43,24 @@ class WebDeliveryTests(unittest.TestCase):
                 "package_sha256": "ignored-by-controller",
             }
 
+        def customer_builder(vault, output):
+            self.customer_calls.append((vault, output))
+            output.write_bytes(b"customer-zip")
+            return {
+                "zip_path": output,
+                "summary_path": output.with_suffix(".summary.md"),
+                "article_count": 225,
+                "successful_projects": 2,
+                "failed_projects": 8,
+                "zip_sha256": "ignored-by-controller",
+            }
+
         self.controller = WebController(
             self.vault,
             delivery_root=self.delivery_root,
             download_registry=self.registry,
             delivery_builder=builder,
+            customer_delivery_builder=customer_builder,
         )
 
     def _completed(self, submitted: dict) -> dict:
@@ -110,6 +124,33 @@ class WebDeliveryTests(unittest.TestCase):
         self.assertFalse(str(output).startswith(str(self.vault)))
         self.assertFalse(str(output).startswith(str(self.exporter_runtime)))
 
+    def test_customer_package_job_registers_safe_one_time_zip_download(self) -> None:
+        status, submitted = self.controller(
+            "POST", "/api/delivery", {"kind": "customer"}
+        )
+
+        self.assertEqual(status, 202)
+        completed = self._completed(submitted)
+        self.assertEqual(completed["status"], "succeeded")
+        result = completed["result"]
+        self.assertEqual(result["kind"], "customer")
+        self.assertEqual(result["article_count"], 225)
+        self.assertEqual(result["successful_projects"], 2)
+        self.assertEqual(result["failed_projects"], 8)
+        self.assertTrue(result["filename"].startswith("英诺客户资料库-"))
+        self.assertTrue(result["filename"].endswith(".zip"))
+        self.assertNotIn(str(self.root), repr(result))
+        self.assertEqual(self.customer_calls[0][0], self.vault)
+
+        status, response = self.controller(
+            "GET", f"/api/delivery/{result['download_id']}/download", None
+        )
+        self.assertEqual(status, 200)
+        self.assertIsInstance(response, FileResponse)
+        self.assertEqual(response.path.read_bytes(), b"customer-zip")
+        response.on_complete(True)
+        self.assertFalse(response.path.exists())
+
     def test_invalid_delivery_parameters_are_rejected_without_paths(self) -> None:
         for payload in (
             {"kind": "incremental"},
@@ -126,7 +167,7 @@ class WebDeliveryTests(unittest.TestCase):
                 self.assertEqual(status, 400)
                 self.assertNotIn(str(self.root), repr(response))
 
-    def test_frontend_supports_baseline_incremental_and_one_time_download(self) -> None:
+    def test_frontend_presents_single_customer_zip_and_one_time_download(self) -> None:
         javascript = (
             Path(__file__).parents[1] / "src/inno_collector/web/assets/app.js"
         ).read_text(encoding="utf-8")
@@ -136,7 +177,9 @@ class WebDeliveryTests(unittest.TestCase):
 
         self.assertIn('writeJson("/api/delivery"', javascript)
         self.assertIn("/api/delivery/${job.result.download_id}/download", javascript)
-        self.assertIn('accept=".inno-update"', html)
+        self.assertIn("生成客户资料包 ZIP", html)
+        self.assertIn('submitDelivery({ kind: "customer" })', javascript)
+        self.assertNotIn('accept=".inno-update"', html)
 
 
 if __name__ == "__main__":
