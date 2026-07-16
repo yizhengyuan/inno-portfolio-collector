@@ -25,6 +25,13 @@ class WebAssetContractTests(unittest.TestCase):
         self.assertIn("<noscript>", html)
         self.assertIn("需要启用 JavaScript", html)
 
+    def test_available_workflows_are_not_labelled_unopened(self) -> None:
+        html = (ASSETS / "index.html").read_text(encoding="utf-8")
+
+        self.assertNotIn("<span>未开放</span>", html)
+        self.assertIn("<span>本机登录</span>", html)
+        self.assertIn("<span>预检后可用</span>", html)
+
     def test_first_load_uses_only_same_origin_bootstrap(self) -> None:
         javascript = (ASSETS / "app.js").read_text(encoding="utf-8")
 
