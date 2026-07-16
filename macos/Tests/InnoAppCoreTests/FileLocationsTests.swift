@@ -22,24 +22,10 @@ struct FileLocationsTests {
         #expect(collector.supportRoot != reader.supportRoot)
         #expect(collector.supportRoot.path.hasSuffix("com.inno.news.collector"))
         #expect(reader.supportRoot.path.hasSuffix("com.inno.news.reader"))
-        #expect(collector.helper.lastPathComponent == "InnoCollectorHelper")
+        #expect(collector.helper.lastPathComponent == "InnoCollectorWebServer")
         #expect(reader.helper.lastPathComponent == "InnoReaderHelper")
         #expect(collector.projectsConfig?.path.hasSuffix("Contents/Resources/config/projects.json") == true)
         #expect(reader.projectsConfig == nil)
-        #expect(
-            collector.mooreHelper?.path.hasSuffix(
-                "Contents/PlugIns/MooreExporterHelper"
-            ) == true
-        )
-        #expect(
-            collector.exporterRuntime
-                == collector.supportRoot.appendingPathComponent(
-                    "ExporterRuntime",
-                    isDirectory: true
-                )
-        )
-        #expect(reader.mooreHelper == nil)
-        #expect(reader.exporterRuntime == nil)
         #expect(
             collector.vault
                 == collector.supportRoot
@@ -84,6 +70,6 @@ struct FileLocationsTests {
         )
 
         #expect(locations.helper.deletingLastPathComponent() == plugins)
-        #expect(collector.mooreHelper?.deletingLastPathComponent() == plugins)
+        #expect(collector.helper.deletingLastPathComponent() == plugins)
     }
 }

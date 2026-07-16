@@ -22,7 +22,7 @@ body:
     id: version
     attributes:
       label: 版本与环境
-      placeholder: "0.1.0 / macOS 15.x / Apple Silicon"
+      placeholder: "0.2.0 / macOS 15.x / Apple Silicon"
     validations:
       required: true
   - type: textarea

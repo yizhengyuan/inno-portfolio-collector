@@ -22,6 +22,9 @@ REQUIRED = {
         b"MIT License\n"
     ),
     "third_party/licenses/wechat-article-exporter-LICENSE.txt": b"MIT License\n",
+    "packaging/collector_web_server_entry.py": (
+        b"from inno_collector.web.server import main\n"
+    ),
 }
 
 
@@ -50,6 +53,58 @@ class RepositoryPolicyTests(unittest.TestCase):
         self.assertEqual(
             audit(files),
             [PolicyViolation("LICENSE", "required-marker-missing")],
+        )
+
+    def test_unified_web_server_entry_is_required(self) -> None:
+        files = {
+            path: content
+            for path, content in REQUIRED.items()
+            if path != "packaging/collector_web_server_entry.py"
+        }
+
+        self.assertEqual(
+            audit(files),
+            [
+                PolicyViolation(
+                    "packaging/collector_web_server_entry.py",
+                    "required-file-missing",
+                )
+            ],
+        )
+
+    def test_unified_web_server_entry_must_target_the_local_server(self) -> None:
+        files = {
+            **REQUIRED,
+            "packaging/collector_web_server_entry.py": b"def main(): return 0\n",
+        }
+
+        self.assertEqual(
+            audit(files),
+            [
+                PolicyViolation(
+                    "packaging/collector_web_server_entry.py",
+                    "required-marker-missing",
+                )
+            ],
+        )
+
+    def test_unified_web_server_entry_must_not_launch_a_browser(self) -> None:
+        files = {
+            **REQUIRED,
+            "packaging/collector_web_server_entry.py": (
+                b"from inno_collector.web.server import main\n"
+                b"import webbrowser\n"
+            ),
+        }
+
+        self.assertEqual(
+            audit(files),
+            [
+                PolicyViolation(
+                    "packaging/collector_web_server_entry.py",
+                    "web-server-entry-launches-browser",
+                )
+            ],
         )
 
     def test_user_material_and_credential_paths_are_stably_sorted_and_unique(self) -> None:
@@ -85,6 +140,10 @@ class RepositoryPolicyTests(unittest.TestCase):
             "英诺项目清单-2026/source.xlsx",
             "runtime/cache.json",
             ".moore/account.json",
+            "ExporterRuntime/login/session.json",
+            "DraftInbox/draft.zip",
+            "DeliveryTemp/baseline.inno-update",
+            "UploadTemp/upload.bin",
         ]
         files = {**REQUIRED, **dict.fromkeys(paths, b"fixture")}
 
@@ -107,12 +166,168 @@ class RepositoryPolicyTests(unittest.TestCase):
             "keys/client.key",
             "keys/client.p12",
             "keys/client.pfx",
+            "state/cookies.sqlite",
+            "state/auth-key",
+            "state/auth_key",
         ]
         files = {**REQUIRED, **dict.fromkeys(paths, b"fixture")}
 
         self.assertEqual(
             audit(files),
             sorted(PolicyViolation(path, "credential-file") for path in paths),
+        )
+
+    def test_frozen_build_outputs_are_never_tracked(self) -> None:
+        paths = [
+            "build/collector-web/InnoCollectorWebServer",
+            "dist/InnoCollector-Web-pilot.dmg",
+            "macos/.build/release/InnoCollectorApp",
+            ".build-macos/InnoCollector.app/Contents/MacOS/InnoCollectorApp",
+            "packaging/InnoCollectorWebServer.spec",
+        ]
+        files = {**REQUIRED, **dict.fromkeys(paths, b"binary fixture")}
+
+        self.assertEqual(
+            audit(files),
+            sorted(PolicyViolation(path, "build-artifact") for path in paths),
+        )
+
+    def test_release_inputs_reject_build_machine_absolute_paths(self) -> None:
+        user_path = b"/Users/build-user/work/inno/config.json"
+        volume_path = b"/Volumes/Build Disk/output/InnoCollectorWebServer"
+        files = {
+            **REQUIRED,
+            "packaging/frozen-config.txt": user_path,
+            "src/inno_collector/web/resources/build-origin.txt": volume_path,
+        }
+
+        violations = audit(files)
+
+        self.assertEqual(
+            violations,
+            sorted(
+                [
+                    PolicyViolation(
+                        "packaging/frozen-config.txt",
+                        "build-machine-path",
+                    ),
+                    PolicyViolation(
+                        "src/inno_collector/web/resources/build-origin.txt",
+                        "build-machine-path",
+                    ),
+                ]
+            ),
+        )
+        rendered = repr(violations)
+        self.assertNotIn(user_path.decode("ascii"), rendered)
+        self.assertNotIn(volume_path.decode("ascii"), rendered)
+
+    def test_docs_and_tests_may_use_obviously_synthetic_absolute_paths(self) -> None:
+        files = {
+            **REQUIRED,
+            "docs/example.md": b"/Users/example/project/fixture",
+            "tests/test_path_fixture.py": b"ROOT = '/Volumes/Test/fixture'",
+        }
+
+        self.assertEqual(audit(files), [])
+
+    def test_release_inputs_reject_embedded_credential_values(self) -> None:
+        auth_key = b"A" * 32
+        cookie = b"B" * 32
+        files = {
+            **REQUIRED,
+            "packaging/frozen-settings.py": b'AUTH_KEY = "' + auth_key + b'"',
+            "src/inno_collector/web/resources/session.json": (
+                b'{"cookie":"' + cookie + b'"}'
+            ),
+        }
+
+        violations = audit(files)
+
+        self.assertEqual(
+            violations,
+            sorted(
+                [
+                    PolicyViolation(
+                        "packaging/frozen-settings.py",
+                        "embedded-credential",
+                    ),
+                    PolicyViolation(
+                        "src/inno_collector/web/resources/session.json",
+                        "embedded-credential",
+                    ),
+                ]
+            ),
+        )
+        rendered = repr(violations)
+        self.assertNotIn(auth_key.decode("ascii"), rendered)
+        self.assertNotIn(cookie.decode("ascii"), rendered)
+
+    def test_release_source_allows_credential_field_names_without_values(self) -> None:
+        files = {
+            **REQUIRED,
+            "src/inno_collector/web/security.py": (
+                b"# redact auth-key, cookie, and token fields before returning\n"
+            ),
+        }
+
+        self.assertEqual(audit(files), [])
+
+    def test_reader_components_reject_collector_only_capabilities(self) -> None:
+        files = {
+            **REQUIRED,
+            "macos/Sources/InnoReaderFeature/WebLeak.swift": (
+                b"let helper = \"InnoCollectorWebServer\""
+            ),
+            "src/inno_collector/reader_helper.py": (
+                b"from moore_runtime import MooreRuntime"
+            ),
+            "packaging/reader_helper_entry.py": b"HEADER = 'auth-key'",
+            "macos/Sources/InnoReaderApp/ProjectLeak.swift": (
+                b"let config = \"config/projects.json\""
+            ),
+        }
+
+        self.assertEqual(
+            audit(files),
+            sorted(
+                [
+                    PolicyViolation(
+                        "macos/Sources/InnoReaderFeature/WebLeak.swift",
+                        "reader-web-server",
+                    ),
+                    PolicyViolation(
+                        "src/inno_collector/reader_helper.py",
+                        "reader-moore-runtime",
+                    ),
+                    PolicyViolation(
+                        "packaging/reader_helper_entry.py",
+                        "reader-auth-key",
+                    ),
+                    PolicyViolation(
+                        "macos/Sources/InnoReaderApp/ProjectLeak.swift",
+                        "reader-project-config",
+                    ),
+                ]
+            ),
+        )
+
+    def test_cutover_rejects_legacy_collector_entries(self) -> None:
+        legacy = {
+            "macos/Sources/InnoCollectorFeature/CollectorContentView.swift": b"legacy",
+            "macos/Sources/InnoCollectorFeature/CollectorViewModel.swift": b"legacy",
+            "macos/Sources/InnoCollectorFeature/MooreLocalLoginServer.swift": b"legacy",
+            "packaging/collector_helper_entry.py": b"legacy",
+            "packaging/moore_exporter_entry.py": b"legacy",
+            "src/inno_collector/collector_helper.py": b"legacy",
+        }
+
+        self.assertEqual(
+            audit({**REQUIRED, **legacy}),
+            sorted(
+                PolicyViolation(path, "legacy-collector-entry")
+                for path in legacy
+            ),
         )
 
     def test_credential_words_inside_ordinary_filenames_are_allowed(self) -> None:

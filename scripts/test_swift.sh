@@ -2,8 +2,11 @@
 set -euo pipefail
 
 ROOT="${0:A:h:h}"
-if [[ -n "${INNO_COLLECTOR_HELPER:-}" ]]; then
-  export INNO_COLLECTOR_HELPER="${INNO_COLLECTOR_HELPER:A}"
+if [[ -n "${INNO_COLLECTOR_APP:-}" ]]; then
+  export INNO_COLLECTOR_APP="${INNO_COLLECTOR_APP:A}"
+fi
+if [[ -n "${INNO_READER_APP:-}" ]]; then
+  export INNO_READER_APP="${INNO_READER_APP:A}"
 fi
 if [[ -n "${INNO_READER_HELPER:-}" ]]; then
   export INNO_READER_HELPER="${INNO_READER_HELPER:A}"

@@ -76,9 +76,16 @@ class PackageTests(unittest.TestCase):
         self.assertIn(result["zip_sha256"], summary)
         with zipfile.ZipFile(output) as archive:
             names = archive.namelist()
+            guide = archive.read(
+                f"{self.vault.name}/客户使用说明.md"
+            ).decode("utf-8")
         self.assertTrue(names)
         self.assertTrue(all(name.startswith(self.vault.name + "/") for name in names))
         self.assertFalse(any(name.endswith(".lock") for name in names))
+        self.assertIn("用 Obsidian 打开", guide)
+        self.assertIn("80-离线看板/index.html", guide)
+        self.assertIn("10-编辑稿", guide)
+        self.assertNotIn(str(self.root), guide)
 
     def test_editable_and_dashboard_zones_have_narrow_whitelists(self) -> None:
         allowed = {

@@ -5,37 +5,70 @@ import Testing
 @Suite("Packaged role isolation")
 struct RoleIsolationTests {
     @Test(
-        "real helper roles are distinct and reader bundle excludes collector material",
+        "packaged apps contain only their final role-specific executables",
         .enabled(
-            if: ProcessInfo.processInfo.environment["INNO_COLLECTOR_HELPER"] != nil
-                && ProcessInfo.processInfo.environment["INNO_READER_HELPER"] != nil,
-            "requires INNO_COLLECTOR_HELPER and INNO_READER_HELPER"
+            if: ProcessInfo.processInfo.environment["INNO_COLLECTOR_APP"] != nil
+                && ProcessInfo.processInfo.environment["INNO_READER_APP"] != nil,
+            "requires INNO_COLLECTOR_APP and INNO_READER_APP"
         )
     )
-    func packagedHelpers() async throws {
+    func packagedApps() throws {
         let environment = ProcessInfo.processInfo.environment
-        let collectorPath = try #require(environment["INNO_COLLECTOR_HELPER"])
-        let readerPath = try #require(environment["INNO_READER_HELPER"])
-        let collectorURL = URL(fileURLWithPath: collectorPath).standardizedFileURL
-        let readerURL = URL(fileURLWithPath: readerPath).standardizedFileURL
-        let collector = HelperClient(executable: collectorURL, timeout: 60)
-        let reader = HelperClient(executable: readerURL, timeout: 60)
+        let collectorPath = try #require(environment["INNO_COLLECTOR_APP"])
+        let readerPath = try #require(environment["INNO_READER_APP"])
+        let collector = URL(fileURLWithPath: collectorPath, isDirectory: true)
+            .standardizedFileURL
+        let reader = URL(fileURLWithPath: readerPath, isDirectory: true)
+            .standardizedFileURL
 
-        async let collectorStatus = collector.call(command: "status", arguments: [:])
-        async let readerStatus = reader.call(command: "status", arguments: [:])
-        let (collectorResult, readerResult) = try await (collectorStatus, readerStatus)
-        #expect(collectorResult["role"] == .string("collector"))
-        #expect(readerResult["role"] == .string("reader"))
+        #expect(try entryNames(in: collector, at: "Contents/MacOS") == [
+            "InnoCollectorApp",
+        ])
+        #expect(try entryNames(in: collector, at: "Contents/PlugIns") == [
+            "InnoCollectorWebServer",
+        ])
+        #expect(try regularFileExists(in: collector, at: "Contents/Resources/config/projects.json"))
 
-        let root = bundleRoot(for: readerURL)
-        #expect(try forbiddenFiles(in: root).isEmpty)
+        #expect(try entryNames(in: reader, at: "Contents/MacOS") == [
+            "InnoReaderApp",
+        ])
+        #expect(try entryNames(in: reader, at: "Contents/PlugIns") == [
+            "InnoReaderHelper",
+        ])
+        #expect(!FileManager.default.fileExists(
+            atPath: reader.appendingPathComponent(
+                "Contents/Resources/config/projects.json",
+                isDirectory: false
+            ).path
+        ))
+
+        let forbidden = Set([
+            "innocollectorhelper",
+            "mooreexporterhelper",
+            "collectorcontentview",
+            "collectorviewmodel",
+            "moorelocalloginserver",
+        ])
+        #expect(try forbiddenFiles(in: collector, names: forbidden).isEmpty)
+        #expect(try forbiddenFiles(in: reader, names: forbidden).isEmpty)
     }
 
-    private func forbiddenFiles(in root: URL) throws -> [String] {
-        let forbidden = Set([
-            "wechat_exporter.py", "collector_helper", "innocollectorhelper",
-            "cookies.sqlite", "projects.json",
-        ])
+    private func entryNames(in bundle: URL, at relativePath: String) throws -> Set<String> {
+        let directory = bundle.appendingPathComponent(relativePath, isDirectory: true)
+        let values = try directory.resourceValues(forKeys: [.isDirectoryKey, .isSymbolicLinkKey])
+        guard values.isDirectory == true, values.isSymbolicLink != true else {
+            return []
+        }
+        return Set(try FileManager.default.contentsOfDirectory(atPath: directory.path))
+    }
+
+    private func regularFileExists(in bundle: URL, at relativePath: String) throws -> Bool {
+        let file = bundle.appendingPathComponent(relativePath, isDirectory: false)
+        let values = try file.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+        return values.isRegularFile == true && values.isSymbolicLink != true
+    }
+
+    private func forbiddenFiles(in root: URL, names: Set<String>) throws -> [String] {
         let enumerator = try #require(FileManager.default.enumerator(
             at: root,
             includingPropertiesForKeys: [.isRegularFileKey],
@@ -43,19 +76,11 @@ struct RoleIsolationTests {
         ))
         var found: [String] = []
         for case let url as URL in enumerator {
-            if forbidden.contains(url.lastPathComponent.lowercased()) {
+            let stem = url.deletingPathExtension().lastPathComponent.lowercased()
+            if names.contains(stem) {
                 found.append(url.lastPathComponent)
             }
         }
-        return found
-    }
-
-    private func bundleRoot(for helper: URL) -> URL {
-        let plugins = helper.deletingLastPathComponent()
-        if plugins.lastPathComponent == "PlugIns",
-           plugins.deletingLastPathComponent().lastPathComponent == "Contents" {
-            return plugins.deletingLastPathComponent().deletingLastPathComponent()
-        }
-        return plugins
+        return found.sorted()
     }
 }

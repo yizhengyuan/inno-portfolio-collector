@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -13,12 +14,41 @@ from typing import Callable, Sequence
 ROOT = Path(__file__).resolve().parents[1]
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 READER_FORBIDDEN_MARKERS = (
+    "innocollectorwebserver",
+    "collector_web_server",
+    "inno_collector.web",
     "wechat_exporter",
     "wechat_downloader",
     "mooreexporteradapter",
+    "mooreexporterhelper",
+    "moore_runtime",
     "collector_helper",
     "auth-key",
     ".moore",
+    "projects.json",
+)
+WEB_ARCHIVE_REQUIRED = (
+    "wechat_exporter",
+    "wechat_downloader",
+    "inno_collector/web/assets/index.html",
+    "inno_collector/web/assets/app.css",
+    "inno_collector/web/assets/app.js",
+    "inno_collector/web/resources/projects.json",
+    "ThirdPartyLicenses/LICENSE",
+    "ThirdPartyLicenses/NOTICE.md",
+    "ThirdPartyLicenses/THIRD_PARTY_NOTICES.md",
+    "ThirdPartyLicenses/wechat-article-exporter-LICENSE.txt",
+    "ThirdPartyLicenses/moore-wechat-article-downloader-LICENSE.txt",
+)
+_LOCAL_BUILD_PATH = re.compile(r"/(?:Users|Volumes)/[^/\x00]+/")
+_HIGH_CONFIDENCE_SECRETS = (
+    re.compile(r"-----BEGIN (?:ENCRYPTED |RSA |EC |OPENSSH )?PRIVATE KEY-----"),
+    re.compile(r"(?:gh[pousr]_[A-Za-z0-9_]{20,}|github_pat_[A-Za-z0-9_]{50,})"),
+    re.compile(r"AKIA[A-Z0-9]{16}"),
+    re.compile(
+        r"(?i)\b(?:auth[-_]?key|cookie|token|password|secret)\b"
+        r"[\"']?\s*[:=]\s*[\"'][A-Za-z0-9+/=_-]{24,}[\"']"
+    ),
 )
 
 
@@ -45,13 +75,52 @@ def pyinstaller_commands(
         if not (moore_source / name).is_file():
             raise HelperBuildError(f"Moore source is missing {name}")
 
+    web_assets = ROOT / "src/inno_collector/web/assets"
+    web_resources = ROOT / "src/inno_collector/web/resources"
+    third_party_licenses = ROOT / "third_party/licenses"
+    required_inputs = (
+        web_assets / "index.html",
+        web_assets / "app.css",
+        web_assets / "app.js",
+        web_resources / "projects.json",
+        ROOT / "LICENSE",
+        ROOT / "NOTICE.md",
+        ROOT / "THIRD_PARTY_NOTICES.md",
+        third_party_licenses / "wechat-article-exporter-LICENSE.txt",
+        third_party_licenses / "moore-wechat-article-downloader-LICENSE.txt",
+    )
+    missing_inputs = [path.name for path in required_inputs if not path.is_file()]
+    if missing_inputs:
+        raise HelperBuildError("missing Web build input: " + ", ".join(missing_inputs))
+
+    source_root = ROOT / "src"
     entries = (
-        ("collector", "InnoCollectorHelper", ROOT / "packaging/collector_helper_entry.py", None),
-        ("reader", "InnoReaderHelper", ROOT / "packaging/reader_helper_entry.py", None),
-        ("moore", "MooreExporterHelper", ROOT / "packaging/moore_exporter_entry.py", moore_source),
+        (
+            "reader",
+            "InnoReaderHelper",
+            ROOT / "packaging/reader_helper_entry.py",
+            (source_root,),
+            (),
+            (),
+        ),
+        (
+            "collector-web",
+            "InnoCollectorWebServer",
+            ROOT / "packaging/collector_web_server_entry.py",
+            (source_root, moore_source),
+            (
+                (web_assets, "inno_collector/web/assets"),
+                (web_resources, "inno_collector/web/resources"),
+                (third_party_licenses, "ThirdPartyLicenses"),
+                (ROOT / "LICENSE", "ThirdPartyLicenses"),
+                (ROOT / "NOTICE.md", "ThirdPartyLicenses"),
+                (ROOT / "THIRD_PARTY_NOTICES.md", "ThirdPartyLicenses"),
+            ),
+            ("wechat_exporter", "wechat_downloader"),
+        ),
     )
     commands: list[list[str]] = []
-    for role, name, entry, search_path in entries:
+    for role, name, entry, search_paths, data_files, hidden_imports in entries:
         command = [
             sys.executable,
             "-m",
@@ -68,8 +137,12 @@ def pyinstaller_commands(
             "--specpath",
             str(output / "spec" / role),
         ]
-        if search_path is not None:
+        for search_path in search_paths:
             command.extend(["--paths", str(search_path)])
+        for source, destination in data_files:
+            command.extend(["--add-data", f"{source}:{destination}"])
+        for hidden_import in hidden_imports:
+            command.extend(["--hidden-import", hidden_import])
         if codesign_identity is not None:
             command.extend(["--codesign-identity", codesign_identity])
         command.append(str(entry))
@@ -91,6 +164,48 @@ def audit_reader_binary(reader: Path, *, runner: Runner = subprocess.run) -> Non
     hits = [marker for marker in READER_FORBIDDEN_MARKERS if marker in lowered]
     if hits:
         raise HelperBuildError("reader helper contains collector-only markers")
+
+
+def audit_collector_web_binary(
+    web_server: Path,
+    *,
+    runner: Runner = subprocess.run,
+) -> None:
+    strings_result = runner(
+        ["strings", str(web_server)],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    if strings_result.returncode != 0 or not isinstance(strings_result.stdout, str):
+        raise HelperBuildError("unable to audit collector Web server")
+    content = strings_result.stdout
+    if _LOCAL_BUILD_PATH.search(content) or any(
+        pattern.search(content) for pattern in _HIGH_CONFIDENCE_SECRETS
+    ):
+        raise HelperBuildError("collector Web server contains unsafe build material")
+
+    archive_result = runner(
+        [
+            sys.executable,
+            "-m",
+            "PyInstaller.utils.cliutils.archive_viewer",
+            "--list",
+            "--recursive",
+            "--brief",
+            str(web_server),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+        timeout=60,
+    )
+    if archive_result.returncode != 0 or not isinstance(archive_result.stdout, str):
+        raise HelperBuildError("unable to inspect collector Web server archive")
+    listing = archive_result.stdout.replace("\\", "/")
+    if any(required not in listing for required in WEB_ARCHIVE_REQUIRED):
+        raise HelperBuildError("collector Web server archive is missing required resources")
 
 
 def _run(command: Sequence[str], *, runner: Runner, **kwargs) -> subprocess.CompletedProcess[str]:
@@ -124,6 +239,27 @@ def _smoke_role(path: Path, role: str, *, runner: Runner) -> None:
         raise HelperBuildError(f"{role} helper failed role smoke")
 
 
+def _smoke_web_server(path: Path, *, runner: Runner) -> None:
+    result = _run(
+        [str(path), "--smoke"],
+        runner=runner,
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    try:
+        response = json.loads(result.stdout)
+    except (TypeError, json.JSONDecodeError):
+        raise HelperBuildError("collector Web server returned invalid smoke output") from None
+    if (
+        not isinstance(response, dict)
+        or set(response) != {"role", "protocol"}
+        or response.get("role") != "collector-web"
+        or response.get("protocol") != 1
+    ):
+        raise HelperBuildError("collector Web server failed role smoke")
+
+
 def _report(path: Path) -> None:
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     print(f"{path.name} size={path.stat().st_size} sha256={digest}")
@@ -145,23 +281,16 @@ def build(
         _run(command, runner=runner, text=True, capture_output=True, timeout=900)
 
     binaries = {
-        "collector": output / "collector/InnoCollectorHelper",
+        "collector-web": output / "collector-web/InnoCollectorWebServer",
         "reader": output / "reader/InnoReaderHelper",
-        "moore": output / "moore/MooreExporterHelper",
     }
     missing = [path.name for path in binaries.values() if not path.is_file()]
     if missing:
         raise HelperBuildError("missing helper output: " + ", ".join(missing))
-    _smoke_role(binaries["collector"], "collector", runner=runner)
     _smoke_role(binaries["reader"], "reader", runner=runner)
-    _run(
-        [str(binaries["moore"]), "--help"],
-        runner=runner,
-        text=True,
-        capture_output=True,
-        timeout=30,
-    )
+    _smoke_web_server(binaries["collector-web"], runner=runner)
     audit_reader_binary(binaries["reader"], runner=runner)
+    audit_collector_web_binary(binaries["collector-web"], runner=runner)
     for path in binaries.values():
         _report(path)
     return binaries

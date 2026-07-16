@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="inno-session-token" content="__INNO_SESSION_TOKEN__">
+  <title>英诺资讯采集</title>
+  <link rel="stylesheet" href="/assets/app.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar" aria-label="主导航">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">IN</span>
+        <div><strong>英诺资讯采集</strong><small>Local Collector</small></div>
+      </div>
+      <nav>
+        <a class="active" href="#home">首页</a>
+        <a href="#login">登录与预检</a>
+        <a href="#collect">采集</a>
+        <a href="#library">资料库</a>
+        <a href="#delivery">交付</a>
+        <a href="#drafts">稿件收件箱</a>
+        <a href="#about">关于与许可证</a>
+      </nav>
+      <p class="privacy-note">登录与采集状态只保存在这台 Mac。</p>
+    </aside>
+
+    <main id="home">
+      <header class="page-header">
+        <div><p class="eyebrow">LOCAL WEB COLLECTOR</p><h1>今天的采集工作台</h1></div>
+        <span id="connection-status" class="status-pill">正在连接本机服务</span>
+      </header>
+
+      <noscript><p class="notice error">需要启用 JavaScript 才能读取本机采集状态。</p></noscript>
+      <p id="bootstrap-error" class="notice error" hidden></p>
+
+      <section class="hero-card" aria-labelledby="welcome-title">
+        <div>
+          <p class="eyebrow">安全的本机流程</p>
+          <h2 id="welcome-title">一个页面完成采集、核对与交付</h2>
+          <p>登录只保存在本机；预检通过后即可采集，并为唯一客户生成完整资料包。</p>
+        </div>
+        <button id="login-start" type="button" data-write-action="login" disabled>开始扫码登录</button>
+      </section>
+
+      <section class="metric-grid" aria-label="状态摘要">
+        <article><span>登录状态</span><strong id="login-state">读取中</strong><small>仅限本机</small></article>
+        <article><span>最近任务</span><strong id="job-state">暂无</strong><small>等待首次采集</small></article>
+        <article><span>资料库</span><strong id="library-state">未载入</strong><small>可在资料库查看详情</small></article>
+      </section>
+
+      <section class="workspace-grid">
+        <article id="login" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">01</p><h2>登录与预检</h2></div><span>本机登录</span></div>
+          <p>在这个页面扫码，并逐项确认 10 个公众号的精确映射。</p>
+          <div id="login-session" class="login-session" hidden>
+            <img id="login-qrcode" alt="微信扫码登录二维码">
+            <p id="login-message">正在生成二维码</p>
+          </div>
+          <button id="preflight-start" type="button" data-write-action="preflight" disabled>运行预检</button>
+        </article>
+        <article id="collect" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">02</p><h2>采集</h2></div><span>预检后可用</span></div>
+          <p>按项目隔离失败，持续显示文章、附件和校验进度。</p>
+          <div class="button-row">
+            <button id="collection-start" type="button" data-write-action="collection" disabled>开始采集</button>
+            <button id="collection-cancel" class="secondary-button" type="button" data-write-action="cancel" disabled>取消任务</button>
+          </div>
+        </article>
+        <article id="delivery" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">03</p><h2>交付</h2></div><span>安全 ZIP</span></div>
+          <p>为唯一客户生成一个安全 ZIP，内含 Obsidian Vault、离线 HTML 看板和客户使用说明。</p>
+          <div class="button-row">
+            <button id="delivery-customer" type="button" data-write-action="delivery" disabled>生成客户资料包 ZIP</button>
+          </div>
+          <p id="delivery-message" class="inline-message">尚未生成客户资料包</p>
+          <a id="delivery-download" class="download-link" hidden>下载客户资料包 ZIP</a>
+        </article>
+        <article id="drafts" class="panel">
+          <div class="panel-heading"><div><p class="eyebrow">04</p><h2>稿件收件箱</h2></div><span>只读</span></div>
+          <p>集中查看客户返回的编辑稿，不共享任何登录凭据。</p>
+          <label class="file-button">选择稿件包<input id="draft-file" type="file" accept=".inno-drafts" hidden></label>
+          <div id="draft-preview" class="inline-message">尚未选择稿件包</div>
+          <label class="confirm-row"><input id="draft-confirm" type="checkbox" disabled> 我已核对预览，确认收录</label>
+          <button id="draft-accept" type="button" data-write-action="drafts" disabled>确认收录稿件</button>
+        </article>
+      </section>
+
+      <section id="library" class="panel wide-panel">
+        <div class="panel-heading"><div><p class="eyebrow">LIBRARY</p><h2>资料库</h2></div><span>只读</span></div>
+        <p>现有 Obsidian Vault 保持原样；此页面只读取文章、项目和校验摘要。</p>
+      </section>
+      <section class="panel wide-panel" aria-labelledby="preflight-title">
+        <div class="panel-heading"><div><p class="eyebrow">CHECK</p><h2 id="preflight-title">10 个项目预检结果</h2></div><span id="preflight-state">尚未运行</span></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>项目</th><th>公众号</th><th>映射</th><th>登录</th><th>目录</th><th>日期</th><th>状态</th><th>原因</th></tr></thead>
+            <tbody id="preflight-rows"><tr><td colspan="8">运行预检后，这里会逐项显示 10 个结果。</td></tr></tbody>
+          </table>
+        </div>
+      </section>
+      <section id="about" class="panel wide-panel">
+        <div class="panel-heading"><div><p class="eyebrow">OPEN SOURCE</p><h2>关于与许可证</h2></div><span>MIT</span></div>
+        <p>项目保留两个上游 MIT 项目的许可证与署名；文章版权归原作者。</p>
+      </section>
+    </main>
+  </div>
+  <script type="module" src="/assets/app.js"></script>
+</body>
+</html>

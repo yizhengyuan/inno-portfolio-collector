@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import plistlib
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,11 @@ except ImportError:
 ROOT = Path(__file__).resolve().parents[1]
 Runner = Callable[..., subprocess.CompletedProcess[str]]
 HelperBuilder = Callable[[str, Path, Runner], dict[str, Path]]
+_VERSION = re.compile(r"[0-9]+(?:\.[0-9]+){2}\Z")
+_APP_METADATA = {
+    "collector": ("com.inno.news.collector", "InnoCollectorApp"),
+    "reader": ("com.inno.news.reader", "InnoReaderApp"),
+}
 
 
 class ReleaseError(RuntimeError):
@@ -75,7 +81,11 @@ def _validated_environment(
 
 
 def _copy_app(source: Path, destination: Path) -> None:
-    if not source.is_dir() or any(path.is_symlink() for path in source.rglob("*")):
+    if (
+        source.is_symlink()
+        or not source.is_dir()
+        or any(path.is_symlink() for path in source.rglob("*"))
+    ):
         raise ReleaseError(f"invalid app input: {source.name}")
     shutil.copytree(source, destination, symlinks=False)
 
@@ -87,15 +97,49 @@ def _stage_dmg_contents(app: Path, destination: Path) -> Path:
     return destination
 
 
+def _validate_app_metadata(apps: Mapping[str, Path], version: str) -> None:
+    if _VERSION.fullmatch(version) is None:
+        raise ReleaseError("invalid release version")
+    for role, (bundle_id, executable_name) in _APP_METADATA.items():
+        app = apps.get(role)
+        if app is None:
+            raise ReleaseError("app metadata does not match release")
+        try:
+            info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
+        except (OSError, plistlib.InvalidFileException):
+            raise ReleaseError("app metadata does not match release") from None
+        executable = app / f"Contents/MacOS/{executable_name}"
+        if (
+            not isinstance(info, dict)
+            or info.get("CFBundleIdentifier") != bundle_id
+            or info.get("CFBundleExecutable") != executable_name
+            or info.get("CFBundleShortVersionString") != version
+            or not isinstance(info.get("CFBundleVersion"), str)
+            or not info["CFBundleVersion"].strip()
+            or not executable.is_file()
+            or executable.is_symlink()
+            or executable.stat().st_mode & 0o111 == 0
+        ):
+            raise ReleaseError("app metadata does not match release")
+
+
 def _replace_helpers(apps: dict[str, Path], helpers: dict[str, Path]) -> None:
+    expected = {
+        "collector": {"InnoCollectorWebServer"},
+        "reader": {"InnoReaderHelper"},
+    }
+    for role, names in expected.items():
+        plugins = apps[role] / "Contents/PlugIns"
+        if not plugins.is_dir() or {path.name for path in plugins.iterdir()} != names:
+            raise ReleaseError("signed helper layout is incomplete")
+
     rows = (
-        (apps["collector"], "InnoCollectorHelper", helpers["collector"]),
-        (apps["collector"], "MooreExporterHelper", helpers["moore"]),
-        (apps["reader"], "InnoReaderHelper", helpers["reader"]),
+        (apps["collector"], "InnoCollectorWebServer", helpers.get("collector-web")),
+        (apps["reader"], "InnoReaderHelper", helpers.get("reader")),
     )
     for app, name, source in rows:
         destination = app / f"Contents/PlugIns/{name}"
-        if not source.is_file() or not destination.is_file():
+        if source is None or not source.is_file() or not destination.is_file():
             raise ReleaseError("signed helper layout is incomplete")
         shutil.copyfile(source, destination, follow_symlinks=False)
         destination.chmod(0o755)
@@ -212,6 +256,7 @@ def release(
     }
     if any(not path.is_dir() for path in sources.values()):
         raise ReleaseError("both app bundles are required")
+    _validate_app_metadata(sources, version)
     names = {
         "collector": f"InnoCollector-{version}.dmg",
         "reader": f"InnoReader-{version}.dmg",

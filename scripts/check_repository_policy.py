@@ -22,6 +22,9 @@ REQUIRED_MARKERS = {
         b"MIT License",
     ),
     "third_party/licenses/wechat-article-exporter-LICENSE.txt": (b"MIT License",),
+    "packaging/collector_web_server_entry.py": (
+        b"inno_collector.web.server",
+    ),
 }
 
 USER_MATERIAL_PREFIXES = (
@@ -29,9 +32,85 @@ USER_MATERIAL_PREFIXES = (
     "英诺项目清单-2026/",
     "runtime/",
     ".moore/",
+    "ExporterRuntime/",
+    "DraftInbox/",
+    "DeliveryTemp/",
+    "UploadTemp/",
 )
 CREDENTIAL_EXTENSIONS = {".pem", ".key", ".p12", ".pfx"}
-CREDENTIAL_NAMES = {"credential", "credentials", "secret", "secrets"}
+CREDENTIAL_NAMES = {
+    "auth-key",
+    "auth_key",
+    "cookie.sqlite",
+    "cookies.sqlite",
+    "credential",
+    "credentials",
+    "secret",
+    "secrets",
+}
+BUILD_ARTIFACT_PREFIXES = (
+    ".build-macos/",
+    "build/",
+    "dist/",
+    "macos/.build/",
+)
+BUILD_ARTIFACT_EXTENSIONS = {".app", ".dmg", ".pkg", ".spec"}
+BUILD_ARTIFACT_NAMES = {
+    "innocollectorhelper",
+    "innocollectorwebserver",
+    "innoreaderhelper",
+    "mooreexporterhelper",
+}
+RELEASE_INPUT_PREFIXES = (
+    "config/",
+    "macos/Sources/",
+    "packaging/",
+    "scripts/",
+    "src/inno_collector/",
+)
+RELEASE_INPUT_FILES = {"pyproject.toml"}
+READER_COMPONENT_PREFIXES = (
+    "macos/Sources/InnoReader",
+    "packaging/reader",
+    "src/inno_collector/reader",
+)
+READER_COMPONENT_FILES = {
+    "packaging/Info-Reader.plist",
+}
+READER_CONTENT_RULES = (
+    (
+        "reader-web-server",
+        (
+            b"innocollectorwebserver",
+            b"collector_web_server",
+            b"inno_collector.web",
+        ),
+    ),
+    (
+        "reader-moore-runtime",
+        (b"moore", b"wechat_exporter", b"wechat_downloader"),
+    ),
+    ("reader-auth-key", (b"auth-key", b"auth_key")),
+    (
+        "reader-project-config",
+        (b"config/projects.json", b"projects.json"),
+    ),
+)
+LEGACY_COLLECTOR_PATHS = {
+    "macos/Sources/InnoCollectorFeature/CollectorContentView.swift",
+    "macos/Sources/InnoCollectorFeature/CollectorViewModel.swift",
+    "macos/Sources/InnoCollectorFeature/MooreLocalLoginServer.swift",
+    "packaging/collector_helper_entry.py",
+    "packaging/moore_exporter_entry.py",
+    "src/inno_collector/collector_helper.py",
+}
+LOCAL_BUILD_PATH = re.compile(rb"/(?:Users|Volumes)/[^/\x00]+/")
+EMBEDDED_CREDENTIAL = re.compile(
+    rb"(?i)\b(?:auth[-_]?key|cookie|token|password|secret)\b"
+    rb"[\"']?\s*[:=]\s*[\"'][A-Za-z0-9+/=_-]{24,}[\"']"
+)
+WEB_SERVER_ENTRY = "packaging/collector_web_server_entry.py"
+WEB_SERVER_ENTRY_FORBIDDEN_MARKERS = (b"webbrowser",)
 CONTENT_RULES = (
     (
         "private-key",
@@ -62,6 +141,27 @@ def _is_credential_path(path: str) -> bool:
     )
 
 
+def _is_build_artifact(path: str) -> bool:
+    pure_path = PurePosixPath(path)
+    lowered = path.casefold()
+    return (
+        lowered.startswith(BUILD_ARTIFACT_PREFIXES)
+        or ".app/" in lowered
+        or pure_path.suffix.casefold() in BUILD_ARTIFACT_EXTENSIONS
+        or pure_path.name.casefold() in BUILD_ARTIFACT_NAMES
+    )
+
+
+def _is_release_input(path: str) -> bool:
+    return path in RELEASE_INPUT_FILES or path.startswith(RELEASE_INPUT_PREFIXES)
+
+
+def _is_reader_component(path: str) -> bool:
+    return path in READER_COMPONENT_FILES or path.startswith(
+        READER_COMPONENT_PREFIXES
+    )
+
+
 def _read_tracked_bytes(path: str) -> bytes:
     candidate = ROOT / path
     if candidate.is_symlink():
@@ -83,10 +183,14 @@ def audit_repository(
             )
 
     for path in sorted(paths):
+        if path in LEGACY_COLLECTOR_PATHS:
+            violations.add(PolicyViolation(path, "legacy-collector-entry"))
         if path.startswith(USER_MATERIAL_PREFIXES):
             violations.add(PolicyViolation(path, "user-material"))
         if _is_credential_path(path):
             violations.add(PolicyViolation(path, "credential-file"))
+        if _is_build_artifact(path):
+            violations.add(PolicyViolation(path, "build-artifact"))
 
         try:
             content = read_bytes(path)
@@ -100,6 +204,25 @@ def audit_repository(
 
         if len(content) > MAX_CONTENT_SCAN_BYTES or b"\x00" in content:
             continue
+        if _is_release_input(path):
+            if LOCAL_BUILD_PATH.search(content) is not None:
+                violations.add(PolicyViolation(path, "build-machine-path"))
+            if EMBEDDED_CREDENTIAL.search(content) is not None:
+                violations.add(PolicyViolation(path, "embedded-credential"))
+        if path == WEB_SERVER_ENTRY:
+            lowered_entry = content.lower()
+            if any(
+                marker in lowered_entry
+                for marker in WEB_SERVER_ENTRY_FORBIDDEN_MARKERS
+            ):
+                violations.add(
+                    PolicyViolation(path, "web-server-entry-launches-browser")
+                )
+        if _is_reader_component(path):
+            lowered = content.lower()
+            for rule, markers in READER_CONTENT_RULES:
+                if any(marker in lowered for marker in markers):
+                    violations.add(PolicyViolation(path, rule))
         for rule, pattern in CONTENT_RULES:
             if pattern.search(content) is not None:
                 violations.add(PolicyViolation(path, rule))
