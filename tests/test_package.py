@@ -87,6 +87,24 @@ class PackageTests(unittest.TestCase):
         self.assertIn("10-编辑稿", guide)
         self.assertNotIn(str(self.root), guide)
 
+    def test_customer_package_refreshes_stale_offline_dashboard(self) -> None:
+        dashboard = self.vault / "80-离线看板/index.html"
+        dashboard.parent.mkdir(parents=True, exist_ok=True)
+        dashboard.write_text(
+            '<!doctype html><script>const DATA={"articleCount":999}</script>',
+            encoding="utf-8",
+        )
+        output = self.root / "dist" / "fresh-dashboard.zip"
+
+        build_delivery_zip(self.vault, output)
+
+        with zipfile.ZipFile(output) as archive:
+            packaged = archive.read(
+                f"{self.vault.name}/80-离线看板/index.html"
+            ).decode("utf-8")
+        self.assertIn('"articleCount":1', packaged)
+        self.assertNotIn('"articleCount":999', packaged)
+
     def test_editable_and_dashboard_zones_have_narrow_whitelists(self) -> None:
         allowed = {
             "10-编辑稿/稿件.md": "---\ndraft_id: draft-1\n---\n\n正文",

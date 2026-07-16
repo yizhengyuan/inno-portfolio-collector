@@ -735,6 +735,18 @@ def build_delivery_zip(
         report = lint_vault(snapshot)
         if report["errors"]:
             raise DeliveryValidationError(report)
+        # The dashboard is derived from the manifest and collection report.
+        # Rebuild it inside the private snapshot so customer packages cannot
+        # carry a stale dashboard after a later collection run.
+        from .dashboard import build_dashboard
+
+        dashboard_path = build_dashboard(snapshot)
+        dashboard_relative = Path("80-离线看板/index.html")
+        dashboard_payload = _open_regular(dashboard_path)
+        snapshot_hashes[dashboard_relative] = hashlib.sha256(
+            dashboard_payload
+        ).hexdigest()
+        snapshot_directories.add(dashboard_relative.parent)
         with tempfile.NamedTemporaryFile(dir=destination_parent, prefix=".delivery-", suffix=".tmp", delete=False) as handle:
             zip_temp = Path(handle.name)
         files, directories, inventory_errors, _ = _inventory(snapshot)
