@@ -12,6 +12,10 @@ A consultant tracks ten portfolio companies across WeChat public accounts. The c
 
 That constraint set is the whole product.
 
+![The local collector web UI](docs/images/collector-ui.png)
+
+*The operator's control surface — one page for QR login, preflight, collection, package validation and delivery. Loopback only; nothing leaves the Mac.*
+
 ---
 
 ## What it actually does
@@ -23,6 +27,14 @@ That constraint set is the whole product.
 | **3 · Consume** | Client, offline | Unzip and open `80-离线看板/index.html`, or open the whole vault in Obsidian. Read, search, take notes, draft. Send back a `.inno-drafts` package. |
 
 **What ships is a plain ZIP** — no Python, no app install, no network, no account.
+
+### What the client actually opens
+
+![The offline dashboard inside the delivered ZIP](docs/images/offline-dashboard.png)
+
+*A single self-contained HTML file inside the delivered ZIP: search, project filter, and every article readable with the network switched off.*
+
+> Both screenshots use synthetic sample data. Every project, account and article in them is invented.
 
 ---
 
